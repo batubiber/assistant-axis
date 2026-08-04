@@ -2213,7 +2213,13 @@ Bu son madde Aşama 0.5'in (Plan 2) habercisidir: burada JSON çıkmıyorsa hake
 
 - [ ] **Step 1: Script'i yaz**
 
-`scripts/01_smoke_gateway.py`:
+`scripts/01_smoke_gateway.py` — brief'teki bare `main()` yerine, script daha
+önceki task'larda tekrar tekrar çıkan bir dersi izleyerek karar mantığını
+küçük saf fonksiyonlara ayırır (`scripts/00_generate_role_data.py` ile aynı
+desen): `read_budget()`, `check_cache_hit()`, `check_budget_delta()`,
+`check_json_shape()`. `main()` bunları çağıran ince bir sarmalayıcıdır;
+gözlemlenebilir stdout/stderr metni ve çıkış kodu davranışı brief'le
+birebir aynıdır.
 
 ```python
 #!/usr/bin/env python3
@@ -2231,7 +2237,7 @@ Kullanım:
 from __future__ import annotations
 
 import json
-import sys
+from pathlib import Path
 
 from aax import config
 from aax.gateway import build_default_client
@@ -2249,15 +2255,57 @@ PROBE = (
 )
 
 
-def read_budget() -> int:
-    if not config.BUDGET_PATH.exists():
+def read_budget(budget_path: Path) -> int:
+    """Bütçe dosyasındaki tüm aşama sayaçlarının toplamı.
+
+    Dosya yoksa 0 döner. Yol parametre olarak alınır ki testler gerçek
+    `config.BUDGET_PATH`'e değil, `tmp_path` altında sahte bir dosyaya
+    baksın — ağa da diskteki gerçek bütçeye de dokunmadan.
+    """
+    if not budget_path.exists():
         return 0
-    return sum(json.loads(config.BUDGET_PATH.read_text(encoding="utf-8")).values())
+    return sum(json.loads(budget_path.read_text(encoding="utf-8")).values())
+
+
+def check_cache_hit(raw: str, raw_again: str) -> bool:
+    """İkinci çağrı cache'ten dönüp ilkiyle birebir aynı yanıtı mı verdi?"""
+    return raw == raw_again
+
+
+def check_budget_delta(before: int, after: int) -> tuple[bool, int]:
+    """Bütçe tam olarak 1 mi arttı?
+
+    İkinci çağrı cache'ten karşılanmalı, yani yalnızca ilk çağrı bütçe
+    harcamalı. `spent` 0 ise ilk çağrı da bir önceki koşudan kalma cache'e
+    denk gelmiştir (bütçe hiç artmadı); 2 ise cache hiç çalışmamıştır. İkisi
+    de bu smoke testinin amacına aykırıdır, bu yüzden yalnızca `1` TAMAM
+    sayılır.
+    """
+    spent = after - before
+    return spent == 1, spent
+
+
+def check_json_shape(raw: str) -> tuple[str, object]:
+    """Ham model yanıtını JSON-şekil doğrulama kararına indirger.
+
+    Üç sonuçtan biri döner:
+      - `("ok", parsed)`   — `parsed` 3 elemanlı bir liste
+      - `("warn", parsed)` — JSON ayrıştı ama şekil beklenenden farklı
+      - `("fail", exc)`    — `extract_json` hiçbir aday metinden JSON
+        çıkaramadı (`exc` bir `JudgeParseError`)
+    """
+    try:
+        parsed = extract_json(raw)
+    except JudgeParseError as exc:
+        return "fail", exc
+    if isinstance(parsed, list) and len(parsed) == 3:
+        return "ok", parsed
+    return "warn", parsed
 
 
 def main() -> int:
     client = build_default_client()
-    before = read_budget()
+    before = read_budget(config.BUDGET_PATH)
 
     print("1) İlk çağrı gönderiliyor...")
     raw = client.chat([{"role": "user", "content": PROBE}], stage=STAGE, temperature=0.0)
@@ -2268,32 +2316,31 @@ def main() -> int:
         [{"role": "user", "content": PROBE}], stage=STAGE, temperature=0.0
     )
 
-    after = read_budget()
+    after = read_budget(config.BUDGET_PATH)
     ok = True
 
-    if raw != raw_again:
+    if check_cache_hit(raw, raw_again):
+        print("   TAMAM: cache aynı yanıtı döndürdü")
+    else:
         print("   BAŞARISIZ: cache aynı yanıtı döndürmedi")
         ok = False
-    else:
-        print("   TAMAM: cache aynı yanıtı döndürdü")
 
-    spent = after - before
-    if spent != 1:
+    budget_ok, spent = check_budget_delta(before, after)
+    if budget_ok:
+        print("   TAMAM: bütçe tam olarak 1 arttı")
+    else:
         print(f"   BAŞARISIZ: bütçe {spent} arttı, 1 beklenirdi (cache çalışmıyor)")
         ok = False
-    else:
-        print("   TAMAM: bütçe tam olarak 1 arttı")
 
     print("3) JSON ayrıştırma...")
-    try:
-        parsed = extract_json(raw)
-        if isinstance(parsed, list) and len(parsed) == 3:
-            print(f"   TAMAM: {parsed}")
-        else:
-            print(f"   UYARI: JSON çıktı ama şekil beklenenden farklı: {parsed!r}")
-            print("   → Aşama 0.5 hakem kapısında prompt düzeltmesi gerekebilir.")
-    except JudgeParseError as exc:
-        print(f"   BAŞARISIZ: {exc}")
+    verdict, payload = check_json_shape(raw)
+    if verdict == "ok":
+        print(f"   TAMAM: {payload}")
+    elif verdict == "warn":
+        print(f"   UYARI: JSON çıktı ama şekil beklenenden farklı: {payload!r}")
+        print("   → Aşama 0.5 hakem kapısında prompt düzeltmesi gerekebilir.")
+    else:
+        print(f"   BAŞARISIZ: {payload}")
         print("   → hakem-llm İngilizce JSON üretemiyor. Hakem hattı gözden geçirilmeli.")
         ok = False
 
@@ -2306,7 +2353,19 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 2: Anahtarı export et ve çalıştır**
+`tests/test_smoke_gateway.py` bu dört saf fonksiyonu (`read_budget`,
+`check_cache_hit`, `check_budget_delta`, `check_json_shape`) doğrudan
+çağırır — istemci, ağ veya anahtar gerektirmez — ve ayrıca `main()`'i sahte
+transport'lu gerçek bir `GatewayClient` ile (gerçek endpoint'e hiç
+dokunmadan) uçtan uca dener; `build_default_client` monkeypatch'lenir.
+
+- [ ] **Step 2: Anahtarı export et ve çalıştır — GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
+
+> Bu adım (ve bu Task'ın kalan tüm adımları — 2, 3, 4, 6, 7) production
+> `hakem-llm` sunucusuna gerçek istek atar ve yalnızca `APP_KEY_JAILBREAK`
+> ortam değişkeni export edildikten sonra insan operatör tarafından elle
+> koşulabilir. Bu ajan tarafından **çalıştırılmadı** — anahtar bu ortamda
+> yok ve elde edilmeye çalışılmadı.
 
 ```bash
 export APP_KEY_JAILBREAK="<dağıtım ortamının .env dosyasından>"
@@ -2317,12 +2376,12 @@ Expected: üç adım da `TAMAM`, `Toplam gönderilen istek: 1`, çıkış kodu 0
 
 Adım 3 `BAŞARISIZ` verirse **Plan 2'ye geçme** — hakem promptu stratejisi yeniden düşünülmeli (spec Aşama 0.5'in geri çekilme yolu: promptu Türkçeleştir).
 
-- [ ] **Step 3: Log ve bütçe dosyalarının yazıldığını doğrula**
+- [ ] **Step 3: Log ve bütçe dosyalarının yazıldığını doğrula — GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
 
 Run: `cd "/home/pc-8469/Asistant Axis" && cat data/gateway_budget.json && wc -l data/gateway_calls.jsonl`
 Expected: `{"smoke": 1}` ve 2 satır log (biri `cached: true`).
 
-- [ ] **Step 4: Hiçbir veri dosyasının commit'e girmediğini doğrula**
+- [ ] **Step 4: Hiçbir veri dosyasının commit'e girmediğini doğrula — GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
 
 Run: `cd "/home/pc-8469/Asistant Axis" && git status --short`
 Expected: `data/` altında hiçbir dosya listelenmemeli (`.gitignore` çalışıyor).
@@ -2330,11 +2389,11 @@ Expected: `data/` altında hiçbir dosya listelenmemeli (`.gitignore` çalışı
 - [ ] **Step 5: Commit**
 
 ```bash
-git add scripts/01_smoke_gateway.py
+git add scripts/01_smoke_gateway.py tests/test_smoke_gateway.py
 git commit -m "feat: gateway canlı smoke testi"
 ```
 
-- [ ] **Step 6: Aşama 0'ı tam koş**
+- [ ] **Step 6: Aşama 0'ı tam koş — GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
 
 Smoke geçtikten sonra 120 rolün verisini üret. Dry-run önce:
 
@@ -2348,7 +2407,7 @@ Expected: `Yazıldı: .../data/roles.json (120/120 rol, complete=True)`, `Gönde
 
 Başarısız rol sayısı **10'u aşarsa** durup üretim promptunu gözden geçir — `hakem-llm` 40 soruluk JSON'u tutturamıyor olabilir; bu durumda soru sayısı 20'ye indirilip rol başına iki çağrıya bölünür (bütçe 130'a sığar: 120 değil 240 eder, o yüzden önce prompt düzeltmesi denenir). Bu durumda `produced < requested` olacağı için script `data/roles.partial.json`/`data/questions.partial.json` yazıp çıkış kodu 1 ile döner — kanonik dosyalar oluşmaz, `--allow-partial` bilerek verilmedikçe. (Bütçe/devre kesici koşuyu erken durdurduysa `attempted` da `requested`'tan küçük kalır ve `not_attempted` denenmemiş rolleri katalog sırasıyla listeler.)
 
-- [ ] **Step 7: Üretilen veriyi gözle kontrol et**
+- [ ] **Step 7: Üretilen veriyi gözle kontrol et — GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
 
 Run: `cd "/home/pc-8469/Asistant Axis" && python3 -c "
 import json
@@ -2368,11 +2427,20 @@ Expected: `complete=True`, açıklamalar rolle uyumlu, talimatlar "You are a…"
 
 ## Plan 1 Tamamlanma Kriterleri
 
-- [ ] `uv run --extra dev pytest tests/ -v` — hepsi geçiyor (85 test: config 4, gateway 27, judge 13, roles 13, generate_role_data 28), hiçbiri ağa çıkmıyor
-- [ ] `data/roles.json` — `{"complete": true, "requested": 120, "attempted": 120, "produced": 120, "not_attempted": [], "failed": [], "roles": [120 rol, her biri description + 3 talimat + 40 soru]}`
-- [ ] `data/questions.json` — `{"complete": true, "requested": 120, "attempted": 120, "produced": 120, "shared_questions": [40 ortak soru]}`
-- [ ] `data/gateway_budget.json` — toplam ≈ 121 gönderim (1 smoke + 120 Aşama 0)
+- [ ] `uv run --extra dev pytest tests/ -v` — hepsi geçiyor (102 test: config 4, gateway 27, judge 13, roles 13, generate_role_data 28, smoke_gateway 17), hiçbiri ağa çıkmıyor
+- [ ] `data/roles.json` — `{"complete": true, "requested": 120, "attempted": 120, "produced": 120, "not_attempted": [], "failed": [], "roles": [120 rol, her biri description + 3 talimat + 40 soru]}` — **GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÜRETİLMEDİ**
+- [ ] `data/questions.json` — `{"complete": true, "requested": 120, "attempted": 120, "produced": 120, "shared_questions": [40 ortak soru]}` — **GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÜRETİLMEDİ**
+- [ ] `data/gateway_budget.json` — toplam ≈ 121 gönderim (1 smoke + 120 Aşama 0) — **GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÜRETİLMEDİ**
 - [ ] `git status --short` temiz; `data/` commit edilmemiş
-- [ ] Smoke testi adım 3 `TAMAM` — `hakem-llm` İngilizce JSON üretiyor
+- [ ] Smoke testi adım 3 `TAMAM` — `hakem-llm` İngilizce JSON üretiyor — **GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
 
 Bu kriterlerin hepsi sağlandığında Plan 2'ye (Aşama 0.5 → 3, eksen çıkarımı ve A kriteri kararı) geçilir.
+
+> **Durum (bu ajanın yaptığı iş sonunda):** `scripts/01_smoke_gateway.py` yazıldı, karar
+> mantığı `tests/test_smoke_gateway.py` ile ağsız test edildi (102/102 test geçiyor) ve
+> commit edildi. Yukarıdaki `APP_KEY_JAILBREAK` işaretli kriterlerin hiçbiri bu ajan
+> tarafından sağlanmadı — anahtar bu ortamda export edilmemişti ve bilerek elde
+> edilmeye çalışılmadı. İnsan operatör anahtarı export ettikten sonra Task 5'in 2, 3,
+> 4, 6, 7 numaralı adımlarını (script'i gerçek endpoint'e karşı koşmak, sonra
+> `scripts/00_generate_role_data.py`'ı önce `--dry-run` sonra gerçek koşuyla çalıştırmak)
+> elle tamamlamalı.
