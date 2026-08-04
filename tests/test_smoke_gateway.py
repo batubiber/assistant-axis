@@ -15,8 +15,17 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from aax import config
-from aax.gateway import GatewayClient, GatewayConfig
+from aax.gateway import (
+    BudgetCorrupted,
+    BudgetExceeded,
+    CircuitOpen,
+    GatewayClient,
+    GatewayConfig,
+    GatewayError,
+)
 from aax.judge import JudgeParseError
 
 _SCRIPT_PATH = (
@@ -66,28 +75,65 @@ def test_check_cache_hit_false_when_responses_differ():
     assert sg.check_cache_hit("birinci", "ikinci") is False
 
 
-# --- check_budget_delta ------------------------------------------------------
+# --- diagnose_budget_delta ---------------------------------------------------
 
 
-def test_check_budget_delta_ok_when_exactly_one():
-    ok, spent = sg.check_budget_delta(before=4, after=5)
-    assert ok is True
-    assert spent == 1
+def test_diagnose_budget_delta_ok_when_exactly_one():
+    verdict, message = sg.diagnose_budget_delta(
+        spent=1, first_call_sends=1, second_call_sends=0
+    )
+    assert verdict == "ok"
+    assert "tam olarak 1" in message
 
 
-def test_check_budget_delta_not_ok_when_zero():
+def test_diagnose_budget_delta_fails_when_nothing_was_spent():
     # İlk çağrı da bir önceki koşudan kalma cache'e denk gelmişse bütçe hiç
     # artmaz — bu smoke testinin amacına aykırı, TAMAM sayılmamalı.
-    ok, spent = sg.check_budget_delta(before=4, after=4)
-    assert ok is False
-    assert spent == 0
+    verdict, message = sg.diagnose_budget_delta(
+        spent=0, first_call_sends=0, second_call_sends=0
+    )
+    assert verdict == "fail"
+    assert "cache'inden geldi" in message
 
 
-def test_check_budget_delta_not_ok_when_two():
-    # Cache hiç çalışmadı: ikinci çağrı da gerçek istek attı.
-    ok, spent = sg.check_budget_delta(before=4, after=6)
-    assert ok is False
-    assert spent == 2
+def test_diagnose_budget_delta_fails_when_second_call_actually_sent():
+    """Gerçek cache arızası: ikinci çağrı da istek attı."""
+    verdict, message = sg.diagnose_budget_delta(
+        spent=2, first_call_sends=1, second_call_sends=1
+    )
+    assert verdict == "fail"
+    assert "cache çalışmıyor" in message
+
+
+def test_diagnose_budget_delta_does_not_blame_cache_for_retries():
+    """Bulgu: ilk çağrı retry ettiyse `spent` 2'dir ama cache ÇALIŞIYOR.
+
+    Eski kod her iki durumda da "cache çalışmıyor" diyordu — projenin
+    production'a ilk temasında yanlış teşhis. Ayıran ölçüm ikinci çağrının
+    gönderim sayısı, `spent` değil: iki senaryo da `spent == 2` verir.
+    """
+    verdict, message = sg.diagnose_budget_delta(
+        spent=2, first_call_sends=2, second_call_sends=0
+    )
+    assert verdict == "warn", "retry cache arızası olarak raporlanmamalı"
+    assert "cache ÇALIŞIYOR" in message
+    assert "1 kez yeniden denendi" in message
+
+
+def test_diagnose_budget_delta_reports_multiple_retries():
+    verdict, message = sg.diagnose_budget_delta(
+        spent=3, first_call_sends=3, second_call_sends=0
+    )
+    assert verdict == "warn"
+    assert "2 kez yeniden denendi" in message
+
+
+def test_diagnose_budget_delta_same_spent_two_different_verdicts():
+    """Aynı `spent` değeri, ayırt edici ölçüme göre farklı karar vermeli."""
+    retry_verdict, _ = sg.diagnose_budget_delta(2, first_call_sends=2, second_call_sends=0)
+    cache_verdict, _ = sg.diagnose_budget_delta(2, first_call_sends=1, second_call_sends=1)
+    assert retry_verdict == "warn"
+    assert cache_verdict == "fail"
 
 
 # --- check_json_shape ---------------------------------------------------------
@@ -190,6 +236,107 @@ def test_main_exit_zero_when_json_shape_only_warns(tmp_path, monkeypatch, capsys
     out = capsys.readouterr().out
     assert "UYARI" in out
     assert "BAŞARISIZ" not in out
+
+
+def test_main_retry_on_first_call_is_not_reported_as_cache_failure(
+    tmp_path, monkeypatch, capsys
+):
+    """Uçtan uca: ilk çağrı 500 alıp retry ederse teşhis "cache çalışmıyor"
+    OLMAMALI — bütçe 2 artar ama cache pekâlâ çalışıyordur."""
+    durum = {"n": 0}
+
+    def transport(payload):
+        durum["n"] += 1
+        if durum["n"] == 1:
+            return 500, {"error": "gecici"}
+        return 200, {
+            "choices": [{"message": {"content": '["factual", "opinion", "factual"]'}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+
+    cfg = GatewayConfig(
+        base_url="https://example.invalid/Jailbreak",
+        model="hakem-llm",
+        api_key="test-key",
+        stage_budgets={"smoke": 10},
+    )
+    client = GatewayClient(
+        cfg,
+        cache_dir=tmp_path / "cache",
+        budget_path=tmp_path / "budget.json",
+        log_path=tmp_path / "calls.jsonl",
+        transport=transport,
+        monotonic=lambda: 0.0,
+        sleep=lambda _s: None,
+    )
+    monkeypatch.setattr(sg, "build_default_client", lambda: client)
+    monkeypatch.setattr(config, "BUDGET_PATH", tmp_path / "budget.json")
+    monkeypatch.setattr(config, "CALL_LOG_PATH", tmp_path / "calls.jsonl")
+
+    exit_code = sg.main()
+
+    out = capsys.readouterr().out
+    assert client.sends_made == 2, "kurulum: ilk çağrı bir kez yeniden denendi"
+    assert "cache çalışmıyor" not in out, "retry cache arızası olarak raporlanmamalı"
+    assert "cache ÇALIŞIYOR" in out
+    assert exit_code == 0, "geçici retry smoke testini düşürmemeli"
+
+
+# --- main() tanı sarmalayıcısı: ham traceback yok, anlaşılır Türkçe var ------
+
+
+def test_main_reports_missing_api_key_without_traceback(monkeypatch, capsys):
+    """Operatörün en olası ilk hatası: anahtar export edilmemiş."""
+
+    def patlayan():
+        raise RuntimeError("APP_KEY_JAILBREAK ortam değişkeni tanımlı değil.")
+
+    monkeypatch.setattr(sg, "build_default_client", patlayan)
+
+    exit_code = sg.main()
+
+    assert exit_code == sg.EXIT_KOSULAMADI
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "APP_KEY_JAILBREAK" in err
+
+
+@pytest.mark.parametrize(
+    "istisna, beklenen",
+    [
+        (BudgetCorrupted("bütçe dosyası ayrıştırılamadı"), "bütçe dosyası okunamıyor"),
+        (BudgetExceeded("Global bütçe doldu: 1500/1500"), "çağrı bütçesi dolu"),
+        (CircuitOpen("Devre kesici açık"), "devre kesici açık"),
+        (GatewayError("Çağrı başarısız (HTTP 401)"), "gateway çağrısı başarısız"),
+    ],
+)
+def test_main_turns_gateway_exceptions_into_diagnostics(
+    monkeypatch, capsys, istisna, beklenen
+):
+    """Ham traceback yerine anlaşılır tanı + sıfırdan farklı çıkış."""
+
+    class PatlayanIstemci:
+        sends_made = 0
+
+        def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+            raise istisna
+
+    monkeypatch.setattr(sg, "build_default_client", PatlayanIstemci)
+
+    exit_code = sg.main()
+
+    assert exit_code == sg.EXIT_KOSULAMADI
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert beklenen in err
+    assert "Traceback" not in err
+
+
+def test_main_exit_codes_are_distinct():
+    """Kabuk pipeline'ı "koşulamadı"yı "kontrol başarısız"tan ayırabilmeli."""
+    assert sg.EXIT_OK == 0
+    assert sg.EXIT_KONTROL_BASARISIZ == 1
+    assert sg.EXIT_KOSULAMADI == 2
 
 
 def test_main_probe_prompt_matches_brief_verbatim():
