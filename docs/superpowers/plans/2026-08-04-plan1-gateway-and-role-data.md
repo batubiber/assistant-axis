@@ -15,12 +15,12 @@
 - Çalışma dizini `/home/pc-8469/Asistant Axis` — **adında boşluk var**, kabuk komutlarında yollar tırnaklanır.
 - Gateway endpoint: `https://gateway.invalid/app`, model adı `hakem-llm`.
 - API anahtarı **yalnızca** `APP_KEY_JAILBREAK` ortam değişkeninden okunur. Hiçbir dosyaya, log'a, teste veya commit'e yazılmaz.
-- Hız sınırı: **1 istek/saniye**, en fazla **2 eşzamanlı**.
-- Global bütçe tavanı: **1500** HTTP gönderimi. Aşıldığında `BudgetExceeded` fırlatılır — sessizce devam edilmez.
-- Devre kesici: üst üste **3** başarısız çağrıda koşu durur.
-- Bütçe sayacı **her HTTP gönderimini** sayar, retry'lar dahil. Bu bilinçli olarak muhafazakârdır: retry'lar tavanı gizlice aşamaz.
-- `data/` dizini `.gitignore`'dadır; hiçbir rollout, cache veya log commit edilmez.
-- Testler ağa çıkmaz. Gerçek istek atan tek şey Task 5'teki smoke script'idir ve o da 2 çağrı kullanır.
+- Hız sınırı: **1 istek/saniye**, en fazla **2 eşzamanlı**. Bu ikisi ve devre kesici **endpoint başına, süreç genelinde paylaşılır** (`base_url` ile anahtarlanan modül düzeyi kayıt defteri) — aynı süreçte kaç `GatewayClient` üretilirse üretilsin tek bütçeye uyarlar. `build_default_client()` memoize edilir.
+- Global bütçe tavanı: **1500** HTTP gönderimi. Aşıldığında `BudgetExceeded` fırlatılır — sessizce devam edilmez. Tavan hiçbir gerekçeyle yükseltilmez.
+- Devre kesici: üst üste **3** başarısız çağrıda koşu durur. Bu **taşıma** devresidir; içerik hatası (ayrışan ama kullanılamayan 200) onu tetiklemez — o kapı script düzeyindedir (`--max-parse-failures`).
+- Bütçe sayacı **her HTTP gönderimini** sayar, retry'lar dahil. Bu bilinçli olarak muhafazakârdır: retry'lar tavanı gizlice aşamaz. Bu yüzden her aşamanın bütçesi mantıksal çağrı sayısının üstünde açık bir **retry payı** taşır (spec Bölüm 6 tablosu); pay olmadan tek bir geçici 5xx aşamayı kesebilirdi.
+- `data/` dizini `.gitignore`'dadır; hiçbir rollout, cache veya log commit edilmez. `uv.lock` **commit edilir** — güvenlik açısından kritik tek kod yolunun altındaki `httpx` sürümü kaymamalı.
+- Testler ağa çıkmaz ve bu **yapıya bağlıdır**: `tests/conftest.py`'deki autouse fixture soket bağlantısını ve isim çözümlemesini tüm testler için kapatır. Gerçek istek atan tek şey Task 5'teki smoke script'idir ve o da 2 çağrı kullanır.
 
 ---
 
@@ -35,9 +35,15 @@
 | `src/aax/roles.py` | 120 rolün kanonik listesi ve veri modeli |
 | `scripts/00_generate_role_data.py` | Aşama 0: rol başına açıklama + 3 sistem promptu + 40 soru |
 | `scripts/01_smoke_gateway.py` | Gerçek endpoint'e karşı 2 çağrılık uçtan uca doğrulama |
+| `uv.lock` | Çözülmüş bağımlılık sürümleri — commit edilir |
+| `tests/conftest.py` | Ağ kilidi (autouse) + paylaşılan gateway durumunu testler arası sıfırlama |
+| `tests/test_conftest_guard.py` | Ağ kilidinin gerçekten kilitlediğini doğrulayan meta-testler |
+| `tests/test_config.py` | Bütçe tablosu ↔ spec Bölüm 6 tutarlılığı, anahtar okuma |
 | `tests/test_gateway.py` | Gateway davranış testleri (sahte transport) |
 | `tests/test_judge.py` | JSON ayrıştırma ve puanlama testleri |
 | `tests/test_roles.py` | Rol kataloğu bütünlük testleri |
+| `tests/test_generate_role_data.py` | Aşama 0 script'i: `main()` dahil uçtan uca, ağsız |
+| `tests/test_smoke_gateway.py` | Smoke script'i: karar mantığı + `main()` tanıları, ağsız |
 
 ---
 
@@ -54,7 +60,9 @@
 - Produces:
   - `aax.config.GATEWAY_BASE_URL: str`, `GATEWAY_MODEL: str`, `TARGET_MODEL: str`
   - `aax.config.DATA_DIR: Path`, `RESULTS_DIR: Path`, `CACHE_DIR: Path`, `BUDGET_PATH: Path`, `CALL_LOG_PATH: Path`
-  - `aax.config.STAGE_BUDGETS: dict[str, int]`, `GLOBAL_BUDGET: int`
+  - `aax.config.STAGE_BUDGETS: dict[str, int]` — **HTTP gönderimi** cinsinden aşama tavanları (retry payı dahil); toplamı 1.320
+  - `aax.config.STAGE_LOGICAL_CALLS: dict[str, int]` — aynı aşamaların **mantıksal çağrı** sayıları (spec Bölüm 6); toplamı 1.082. Yalnızca belgelendirme/test için; hiçbir koruma buna bakmaz
+  - `aax.config.GLOBAL_BUDGET: int` — 1500, sert tavan
   - `aax.config.api_key() -> str` — `APP_KEY_JAILBREAK` yoksa `RuntimeError`
 
 - [ ] **Step 1: `pyproject.toml` oluştur**
@@ -96,6 +104,58 @@ from aax import config
 
 def test_stage_budgets_sum_below_global_cap():
     assert sum(config.STAGE_BUDGETS.values()) <= config.GLOBAL_BUDGET
+
+
+def test_global_cap_is_the_approved_number():
+    """1500 kullanıcının onayladığı tavan — kod içinde kaymamalı."""
+    assert config.GLOBAL_BUDGET == 1500
+
+
+def test_every_stage_has_retry_headroom():
+    """Hiçbir aşama mantıksal çağrı sayısına eşit bütçeyle koşmamalı.
+
+    Bütçe HTTP gönderimi sayar, mantıksal çağrı değil. `stage5_drift` 320
+    çağrılık bir aşama için 320 gönderim bütçesiyle koşuyordu: tek bir geçici
+    5xx aşamayı sonuna varmadan kesiyordu.
+    """
+    assert set(config.STAGE_LOGICAL_CALLS) == set(config.STAGE_BUDGETS)
+    for stage, logical in config.STAGE_LOGICAL_CALLS.items():
+        budget = config.STAGE_BUDGETS[stage]
+        pay = budget - logical
+        assert pay >= 8, f"'{stage}' retry payı yok: {budget} bütçe, {logical} çağrı"
+        assert pay >= min(10, logical) or pay >= 0.2 * logical, (
+            f"'{stage}' payı kurala uymuyor: {pay}"
+        )
+
+
+def test_stage_budget_table_matches_spec_bolum_6():
+    """config.py ile spec Bölüm 6 tablosu aynı sayıları söylemeli.
+
+    Sayılar sürüklendiğinde (stage0 130 vs 120, stage05 10 vs 5, spec'te hiç
+    olmayan `smoke: 10`) hangi belgenin doğru olduğu belirsizleşiyordu.
+    """
+    assert config.STAGE_LOGICAL_CALLS == {
+        "smoke": 2,
+        "stage0_roles": 120,
+        "stage05_judge_gate": 5,
+        "stage2_probe_labels": 250,
+        "stage4_steering": 175,
+        "stage5_drift": 320,
+        "stage6_capping": 150,
+        "stage7_turkish": 60,
+    }
+    assert config.STAGE_BUDGETS == {
+        "smoke": 10,
+        "stage0_roles": 145,
+        "stage05_judge_gate": 15,
+        "stage2_probe_labels": 300,
+        "stage4_steering": 210,
+        "stage5_drift": 385,
+        "stage6_capping": 180,
+        "stage7_turkish": 75,
+    }
+    assert sum(config.STAGE_LOGICAL_CALLS.values()) == 1082
+    assert sum(config.STAGE_BUDGETS.values()) == 1320
 
 
 def test_api_key_raises_when_env_missing(monkeypatch):
@@ -146,10 +206,48 @@ GATEWAY_MODEL = "hakem-llm"
 TARGET_MODEL = "Qwen/Qwen3-1.7B"
 
 # Spec Bölüm 6'daki bütçe dağılımı. Her aşama kendi anahtarını kullanır.
+#
+# BİRİM: bu sayaçlar **HTTP gönderimi** sayar, mantıksal çağrı değil. Bir
+# mantıksal çağrı retry'larla 1, 2 veya 3 gönderim harcayabilir (MAX_RETRIES).
+# Spec'in Bölüm 6 tablosu mantıksal çağrıları sayar; oradaki 1.082'lik toplam
+# ile buradaki 1.320'lik toplamın farkı bilinçli **retry payıdır**.
+#
+# Neden pay şart: pay yokken `stage5_drift` 320 gönderim / ~320 mantıksal
+# çağrıydı — tek bir geçici 5xx bile aşamayı sonuna varmadan kesiyordu.
+# Kural: pay ≈ tabanın %20'si, küçük aşamalarda en az 10 gönderim, 5'in
+# katına yuvarlanır.
+#
+# | Aşama              | Mantıksal | Pay | Bütçe |
+# |--------------------|----------:|----:|------:|
+# | smoke              |         2 |   8 |    10 |
+# | stage0_roles       |       120 |  25 |   145 |
+# | stage05_judge_gate |         5 |  10 |    15 |
+# | stage2_probe_labels|       250 |  50 |   300 |
+# | stage4_steering    |       175 |  35 |   210 |
+# | stage5_drift       |       320 |  65 |   385 |
+# | stage6_capping     |       150 |  30 |   180 |
+# | stage7_turkish     |        60 |  15 |    75 |
+# | TOPLAM             |     1.082 | 238 | 1.320 |
+#
+# Toplam GLOBAL_BUDGET'ın (1500) altında kalmak ZORUNDA — tavan kullanıcının
+# onayladığı sayıdır ve yükseltilmez. Bir aşama sığmıyorsa batch küçültülür.
 STAGE_BUDGETS: dict[str, int] = {
     "smoke": 10,
-    "stage0_roles": 130,
-    "stage05_judge_gate": 10,
+    "stage0_roles": 145,
+    "stage05_judge_gate": 15,
+    "stage2_probe_labels": 300,
+    "stage4_steering": 210,
+    "stage5_drift": 385,
+    "stage6_capping": 180,
+    "stage7_turkish": 75,
+}
+
+# Aşama tablosunun dayandığı mantıksal çağrı sayıları (spec Bölüm 6).
+# Yalnızca belgelendirme ve test içindir; hiçbir koruma buna bakmaz.
+STAGE_LOGICAL_CALLS: dict[str, int] = {
+    "smoke": 2,
+    "stage0_roles": 120,
+    "stage05_judge_gate": 5,
     "stage2_probe_labels": 250,
     "stage4_steering": 175,
     "stage5_drift": 320,
@@ -157,6 +255,7 @@ STAGE_BUDGETS: dict[str, int] = {
     "stage7_turkish": 60,
 }
 
+# Sert tavan. Kullanıcının onayladığı sayı — hiçbir gerekçeyle yükseltilmez.
 GLOBAL_BUDGET = 1500
 
 RATE_LIMIT_RPS = 1.0
@@ -183,7 +282,7 @@ def api_key() -> str:
 - [ ] **Step 5: Testlerin geçtiğini doğrula**
 
 Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_config.py -v`
-Expected: PASS, 4 passed
+Expected: PASS, 7 passed
 
 - [ ] **Step 6: Commit**
 
@@ -209,17 +308,22 @@ Bu planın güvenlik açısından kritik parçası. Production sunucusunu koruya
   - `aax.gateway.GatewayClient(config, *, cache_dir, budget_path, log_path, transport=None, monotonic=time.monotonic, sleep=time.sleep)`
   - `GatewayClient.chat(messages: list[dict], *, stage: str, temperature: float = 0.0, max_tokens: int = 1024) -> str`
   - `GatewayClient.would_call(messages, *, temperature=0.0, max_tokens=1024) -> bool` — cache miss mi? İstek atmaz.
-  - `GatewayClient.sends_made: int`
+  - `GatewayClient.remaining_budget(stage) -> tuple[int, int]` — `(aşama için kalan, global kalan)`. Salt okunur, istek atmaz, bütçe harcamaz; `--dry-run` ön kontrolünün baktığı sayı. Bilinmeyen aşama `ValueError`.
+  - `GatewayClient.sends_made: int` — bu istemcinin attığı gönderim sayısı. Bilinçli olarak istemci başınadır (tanı sayacı, koruma değil).
   - `GatewayClient.close()` — taşıma katmanının kaynaklarını bırakır; `with GatewayClient(...) as client:` da desteklenir
-  - İstisnalar: `BudgetExceeded`, `BudgetCorrupted`, `CircuitOpen`, `GatewayError`
+  - `aax.gateway.reset_shared_state()` — paylaşılan durumu (kayıt defteri + `build_default_client` memo'su) sıfırlar. **Yalnızca testler için**; `tests/conftest.py` her testten önce/sonra çağırır. Üretimde çağrılmaz: devre kesiciyi sıfırlamak, onu açtıran sunucuyu yeniden dövmektir.
+  - İstisnalar: `BudgetExceeded`, `BudgetCorrupted`, `CircuitOpen`, `GatewayError` — dördü de `RuntimeError`'dan **bağımsız olarak** türer, hiçbiri diğerinin alt sınıfı değildir. Çağıran taraf dördünü de ayrı ayrı yakalamalı (bkz. Task 4 döngüsü).
   - Transport tipi: `Callable[[dict], tuple[int, dict]]` — payload alır, `(status_code, json_body)` döner
 
 **Kapalı yönde (fail-closed) davranış — çağıran tarafın bilmesi gerekenler:**
 - `stage` `stage_budgets` içinde yoksa `ValueError` yükselir ve hiç istek gitmez. Yazım hatası yapan bir aşama adı alt bütçesiz kalıp global 1500'ü yiyemez.
-- Bütçe dosyası bozuk/JSON değil/sözlük değilse `BudgetCorrupted` yükselir; sayaç sıfır kabul edilmez.
+- Bütçe dosyası bozuk/JSON değil/sözlük değilse `BudgetCorrupted` yükselir; sayaç sıfır kabul edilmez. Değerler **negatif olmayan gerçek `int`** olmalı: `bool` (Python'da `int`'in alt sınıfı) ve negatifler reddedilir — `{"a": true, "b": -1000}` toplamı küçültüp tavanı fiilen genişletirdi.
 - Bütçe kontrolü + harcaması her denemede tek kilit altında yapılır; retry ortasında tavan dolarsa `BudgetExceeded` `GatewayError`'a dönüşmeden yükselir.
 - Retry yalnızca 429, 5xx ve taşıma istisnalarında yapılır. 4xx tek gönderimde biter.
-- Hız sınırlayıcı ve devre kesici süreç içidir; bütçe ise `fcntl.flock` ile korunan disk dosyasıdır (süreçler arası). İki süreç aynı anda koşarsa sunucuya 2 istek/sn gider.
+- **Hız sınırlayıcı, eşzamanlılık semaforu ve devre kesici `base_url` başına, SÜREÇ GENELİNDE paylaşılır** — modül düzeyinde bir kayıt defterinde tutulur, `GatewayClient` örneğinde değil. Aynı endpoint'e bakan kaç istemci üretilirse üretilsin tek 1 istek/sn bütçesine, tek semafora ve tek devre kesiciye uyar; `build_default_client()` ayrıca memoize edilir. Uyuşmazlıkta kapalı yönde: farklı `max_concurrency` → `ValueError`; farklı hız aralığı → **en katısı** kazanır.
+- Süreçler arası paylaşım yoktur: iki ayrı süreç çalıştırırsan sunucuya 2 istek/sn gider ve devre kesici paylaşılmaz. Süreçler arası tek sert garanti `fcntl.flock` ile korunan disk bütçesidir. Koşuları tek süreçte tut.
+- `GatewayConfig.api_key` alanı `repr=False`'tur: `print(config)` anahtarı basmaz (Plan 2-4 notebook dostu).
+- JSONL çağrı log'unun şeması **tek tiptir**: cache isabet satırı da gönderim satırıyla aynı anahtarları taşır (`ts`, `stage`, `status`, `cached`, `attempt`, `latency`, `prompt_tokens`, `completion_tokens`), anlamsız alanlar açık `None`.
 
 - [ ] **Step 1: Failing test'leri yaz**
 
@@ -285,10 +389,25 @@ def ok_body(text: str = "merhaba"):
     }
 
 
-def make_client(tmp_path, transport, *, global_budget=10, stage_budget=10, rps=1.0):
-    clock = FakeClock()
+def make_client(
+    tmp_path,
+    transport,
+    *,
+    global_budget=10,
+    stage_budget=10,
+    rps=1.0,
+    base_url="https://example.invalid/Jailbreak",
+    clock=None,
+):
+    """Sahte transport'lu istemci.
+
+    `clock` verilirse iki istemci AYNI sahte saati paylaşır — paylaşılan hız
+    sınırlayıcının gerçekten tek bütçeye uyduğunu ölçebilmek için şart.
+    `base_url` verilirse istemci ayrı bir paylaşılan durum kovasına düşer.
+    """
+    clock = clock if clock is not None else FakeClock()
     cfg = GatewayConfig(
-        base_url="https://example.invalid/Jailbreak",
+        base_url=base_url,
         model="hakem-llm",
         api_key="test-key",
         requests_per_second=rps,
@@ -465,6 +584,67 @@ def test_would_call_reports_cache_state_without_sending(tmp_path):
     assert client.would_call(MSG) is False
 
 
+def test_remaining_budget_reports_untouched_caps(tmp_path):
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=20, stage_budget=5)
+    assert client.remaining_budget("test") == (5, 20)
+
+
+def test_remaining_budget_shrinks_as_budget_is_spent(tmp_path):
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=20, stage_budget=5)
+    client.chat([{"role": "user", "content": "a"}], stage="test")
+    client.chat([{"role": "user", "content": "b"}], stage="test")
+    assert client.remaining_budget("test") == (3, 18)
+
+
+def test_remaining_budget_counts_other_stages_against_global_only(tmp_path):
+    """Başka aşamaların harcaması globali düşürür, aşama kalanını değil."""
+
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=20, stage_budget=5)
+    (tmp_path / "budget.json").write_text('{"baska": 12}', encoding="utf-8")
+    assert client.remaining_budget("test") == (5, 8)
+
+
+def test_remaining_budget_never_goes_negative(tmp_path):
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=20, stage_budget=5)
+    (tmp_path / "budget.json").write_text('{"test": 99}', encoding="utf-8")
+    assert client.remaining_budget("test") == (0, 0)
+
+
+def test_remaining_budget_rejects_unknown_stage(tmp_path):
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport)
+    with pytest.raises(ValueError):
+        client.remaining_budget("tesst")
+
+
+def test_remaining_budget_sends_nothing(tmp_path):
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport)
+    client.remaining_budget("test")
+    assert calls == []
+    assert client.sends_made == 0
+    assert not (tmp_path / "budget.json").exists(), "salt okunur olmalı"
+
+
 def test_circuit_opens_after_three_consecutive_failures(tmp_path):
     calls = []
 
@@ -520,12 +700,20 @@ def test_retries_on_429_then_succeeds(tmp_path):
             return 429, {"error": "cok hizli"}
         return 200, ok_body("nihayet")
 
-    client, clock = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    # `rps` bilerek çok yüksek: hız sınırlayıcı hiç uyumaz, `clock.slept`
+    # SAF backoff dizisi olur. Varsayılan 1 istek/sn ile bu ayrım imkânsızdı —
+    # backoff tamamen kaldırıldığında hız sınırlayıcı aynı 1.0'ı yazdığı için
+    # `assert clock.slept == [1.0]` bile yeşil kalıyordu (mutasyonla doğrulandı).
+    # Hız sınırlayıcının kendi testleri ayrı: test_rate_limiter_* .
+    client, clock = make_client(
+        tmp_path, transport, global_budget=99, stage_budget=99, rps=1000.0
+    )
     assert client.chat(MSG, stage="test") == "nihayet"
     assert attempts["n"] == 2
     assert client.sends_made == 2, "retry de bütçeden sayılmalı"
     assert budget_counts(tmp_path)["test"] == 2, "tavanı zorlayan sayaç disktekidir"
-    assert clock.slept, "retry öncesi backoff uygulanmalı"
+    # Tek retry → tek backoff → 2.0**0 = 1.0.
+    assert clock.slept == [1.0], f"backoff dizisi beklenenden farklı: {clock.slept}"
 
 
 def test_client_error_status_is_not_retried(tmp_path):
@@ -564,12 +752,16 @@ def test_transport_exception_is_retried_and_logged(tmp_path):
             raise SahteAgHatasi("sunucuya ulasilamadi")
         return 200, ok_body("nihayet")
 
-    client, clock = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    # `rps` yüksek → `clock.slept` saf backoff dizisi (bkz. 429 testindeki not).
+    client, clock = make_client(
+        tmp_path, transport, global_budget=99, stage_budget=99, rps=1000.0
+    )
     assert client.chat(MSG, stage="test") == "nihayet"
     assert attempts["n"] == 3
     assert client.sends_made == 3, "istisna atan gönderim de bütçeden sayılmalı"
     assert budget_counts(tmp_path)["test"] == 3
-    assert clock.slept, "istisna sonrası backoff uygulanmalı"
+    # İki retry → iki backoff → 2.0**0, 2.0**1.
+    assert clock.slept == [1.0, 2.0], f"backoff dizisi beklenenden farklı: {clock.slept}"
 
     lines = (tmp_path / "calls.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 3, "her deneme için bir log satırı olmalı"
@@ -657,6 +849,51 @@ def test_non_dict_budget_file_is_fatal(tmp_path):
     with pytest.raises(BudgetCorrupted):
         client.chat(MSG, stage="test")
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "govde",
+    [
+        '{"test": true}',  # bool, Python'da int'in alt sınıfı
+        '{"test": false}',
+        '{"test": -1000}',  # negatif sayaç toplamı küçültür
+        '{"test": 1, "smoke": true, "diger": -1000}',  # 1500 tavanını genişletirdi
+        '{"test": 1.5}',
+        '{"test": "3"}',
+    ],
+)
+def test_out_of_domain_budget_values_are_fatal(tmp_path, govde):
+    """Sayaç yalnızca negatif olmayan gerçek int olabilir.
+
+    `{"a": true, "b": -1000}` eski kontrolü geçip -999 topluyordu, yani
+    global tavanı sessizce genişletiyordu. `_read_budget` operatöre bu dosyayı
+    elle onarmasını söylüyor — bu değerler erişilebilir.
+    """
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=2, stage_budget=99)
+    (tmp_path / "budget.json").write_text(govde, encoding="utf-8")
+
+    with pytest.raises(BudgetCorrupted):
+        client.chat(MSG, stage="test")
+    assert calls == [], "alan dışı sayaç tek bir istek bile attırmamalı"
+
+
+def test_zero_budget_value_is_accepted(tmp_path):
+    """0 geçerli bir sayaçtır — negatif olmayan int kuralı 0'ı dışlamamalı."""
+
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    (tmp_path / "budget.json").write_text('{"test": 0}', encoding="utf-8")
+
+    assert client.chat(MSG, stage="test") == "merhaba"
+    assert budget_counts(tmp_path)["test"] == 1
 
 
 def test_concurrent_callers_never_exceed_global_budget(tmp_path):
@@ -780,6 +1017,332 @@ def test_rate_limiter_spaces_requests(tmp_path):
     assert clock.now - t_after_first >= 1.0, "iki istek arasında en az 1 sn olmalı"
 
 
+# --- paylaşılan süreç içi durum (hız sınırlayıcı + semafor + devre kesici) ---
+
+
+def test_rate_limiter_is_shared_across_clients(tmp_path):
+    """İki ayrı istemci TEK bir 1 istek/sn bütçesine uymalı.
+
+    Regresyon: durum `__init__`'te tutulurken (istemci başına) iki istemci
+    aynı süreçte 1.00 sn içinde 4 istek gönderiyordu — `build_default_client()`
+    her çağrıda taze bir istemci ürettiği için bu Plan 2'nin doğal şekliydi.
+    """
+    sent = []
+
+    def transport(payload):
+        sent.append(payload)
+        return 200, ok_body()
+
+    clock = FakeClock()
+    client_a, _ = make_client(
+        tmp_path, transport, global_budget=99, stage_budget=99, clock=clock
+    )
+    client_b, _ = make_client(
+        tmp_path, transport, global_budget=99, stage_budget=99, clock=clock
+    )
+
+    for index, client in enumerate((client_a, client_b, client_a, client_b)):
+        client.chat([{"role": "user", "content": f"m{index}"}], stage="test")
+
+    assert len(sent) == 4
+    # 4 gönderim, 1 istek/sn → aralarında tam 3 tane 1 sn'lik bekleme olmalı.
+    assert clock.slept == [1.0, 1.0, 1.0], (
+        f"paylaşılan hız sınırlayıcı devrede değil: {clock.slept}"
+    )
+    assert clock.now >= 3.0
+
+
+def test_concurrency_semaphore_is_shared_across_clients(tmp_path):
+    """Semafor da paylaşılır: iki istemci TOPLAMDA 2 eşzamanlı gönderim yapar.
+
+    Buluşma noktası bilerek 3 kişilik: paylaşılan semafor (2) altında hiçbir
+    zaman dolamaz ve zaman aşımıyla kırılır. İstemci başına semaforla (2+2=4)
+    üç iş parçacığı buluşur ve `max_in_flight` 3'e çıkar — regresyon budur.
+    """
+    state = {"in_flight": 0, "max_in_flight": 0}
+    guard = threading.Lock()
+    ucler = threading.Barrier(3, timeout=0.5)
+
+    def transport(payload):
+        with guard:
+            state["in_flight"] += 1
+            state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+        try:
+            ucler.wait()
+        except threading.BrokenBarrierError:
+            pass  # beklenen: paylaşılan semafor 3. gönderimi hiç başlatmıyor
+        finally:
+            with guard:
+                state["in_flight"] -= 1
+        return 200, ok_body()
+
+    client_a, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    client_b, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+
+    raised: list[BaseException] = []
+
+    def worker(index):
+        client = client_a if index % 2 == 0 else client_b
+
+        def run():
+            try:
+                client.chat([{"role": "user", "content": f"m{index}"}], stage="test")
+            except BaseException as exc:  # noqa: BLE001
+                with guard:
+                    raised.append(exc)
+
+        return run
+
+    run_in_threads([worker(i) for i in range(4)])
+
+    assert raised == [], f"eşzamanlı çağrılar hata verdi: {raised}"
+    assert state["max_in_flight"] == 2, (
+        f"iki istemci semaforu paylaşmalı, görülen eşzamanlılık: {state['max_in_flight']}"
+    )
+
+
+def test_separate_endpoints_get_separate_semaphores(tmp_path):
+    """Kayıt defteri anahtarı gerçekten `base_url`: ayrı endpoint, ayrı semafor."""
+    state = {"in_flight": 0, "max_in_flight": 0}
+    guard = threading.Lock()
+    dortler = threading.Barrier(4, timeout=10.0)
+
+    def transport(payload):
+        with guard:
+            state["in_flight"] += 1
+            state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+        try:
+            dortler.wait()
+        finally:
+            with guard:
+                state["in_flight"] -= 1
+        return 200, ok_body()
+
+    client_a, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    client_b, _ = make_client(
+        tmp_path,
+        transport,
+        global_budget=99,
+        stage_budget=99,
+        base_url="https://baska.invalid/Jailbreak",
+    )
+
+    raised: list[BaseException] = []
+
+    def worker(index):
+        client = client_a if index % 2 == 0 else client_b
+
+        def run():
+            try:
+                client.chat([{"role": "user", "content": f"m{index}"}], stage="test")
+            except BaseException as exc:  # noqa: BLE001
+                with guard:
+                    raised.append(exc)
+
+        return run
+
+    run_in_threads([worker(i) for i in range(4)])
+
+    assert raised == [], f"eşzamanlı çağrılar hata verdi: {raised}"
+    assert state["max_in_flight"] == 4, (
+        "iki farklı endpoint 2+2 eşzamanlılık vermeli, görülen: "
+        f"{state['max_in_flight']}"
+    )
+
+
+def test_circuit_opened_by_one_client_is_seen_by_another(tmp_path):
+    """Bir istemcinin açtığı devre kesici diğerini de durdurur."""
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 500, {"error": "bozuk"}
+
+    client_a, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    client_b, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+
+    for i in range(3):
+        with pytest.raises(GatewayError):
+            client_a.chat([{"role": "user", "content": f"m{i}"}], stage="test")
+
+    sends_before = len(calls)
+    with pytest.raises(CircuitOpen):
+        client_b.chat([{"role": "user", "content": "b-den"}], stage="test")
+    assert len(calls) == sends_before, (
+        "devre A tarafından açıldı; B tek bir istek bile atmamalı"
+    )
+
+
+def test_failure_counter_is_shared_across_clients(tmp_path):
+    """Ardışık hata sayacı istemciler arasında birikir."""
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 500, {"error": "bozuk"}
+
+    client_a, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    client_b, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+
+    # Hatalar ikiye bölünüyor: A'da 2, B'de 1 → eşik (3) yine dolmalı.
+    with pytest.raises(GatewayError):
+        client_a.chat([{"role": "user", "content": "a"}], stage="test")
+    with pytest.raises(GatewayError):
+        client_b.chat([{"role": "user", "content": "b"}], stage="test")
+    with pytest.raises(GatewayError):
+        client_a.chat([{"role": "user", "content": "c"}], stage="test")
+
+    with pytest.raises(CircuitOpen):
+        client_b.chat([{"role": "user", "content": "d"}], stage="test")
+
+
+def test_separate_endpoints_do_not_share_state(tmp_path):
+    """Kayıt defteri `base_url` ile anahtarlanır: farklı endpoint, farklı devre."""
+
+    def transport(payload):
+        return 500, {"error": "bozuk"}
+
+    def ok_transport(payload):
+        return 200, ok_body("baska-endpoint")
+
+    client_a, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    client_b, _ = make_client(
+        tmp_path,
+        ok_transport,
+        global_budget=99,
+        stage_budget=99,
+        base_url="https://baska.invalid/Jailbreak",
+    )
+
+    for i in range(3):
+        with pytest.raises(GatewayError):
+            client_a.chat([{"role": "user", "content": f"m{i}"}], stage="test")
+
+    with pytest.raises(CircuitOpen):
+        client_a.chat([{"role": "user", "content": "yine-a"}], stage="test")
+    # B başka bir endpoint: A'nın devresi onu bağlamaz.
+    assert client_b.chat([{"role": "user", "content": "b"}], stage="test") == (
+        "baska-endpoint"
+    )
+
+
+def test_conflicting_max_concurrency_is_rejected(tmp_path):
+    """Canlı semafor güvenle küçültülemez — uyuşmazlık sessizce yutulmaz."""
+
+    def transport(payload):
+        return 200, ok_body()
+
+    make_client(tmp_path, transport)
+
+    cfg = GatewayConfig(
+        base_url="https://example.invalid/Jailbreak",
+        model="hakem-llm",
+        api_key="test-key",
+        max_concurrency=5,
+        stage_budgets={"test": 10},
+    )
+    with pytest.raises(ValueError, match="eşzamanlılık"):
+        GatewayClient(
+            cfg,
+            cache_dir=tmp_path / "cache",
+            budget_path=tmp_path / "budget.json",
+            log_path=tmp_path / "calls.jsonl",
+            transport=transport,
+        )
+
+
+def test_strictest_rate_limit_wins_across_clients(tmp_path):
+    """Daha gevşek bir ikinci istemci ortak hız bütçesini gevşetemez."""
+    sent = []
+
+    def transport(payload):
+        sent.append(payload)
+        return 200, ok_body()
+
+    clock = FakeClock()
+    # Önce gevşek (10/sn), sonra katı (1/sn) — katı olan kazanmalı.
+    client_gevsek, _ = make_client(
+        tmp_path, transport, global_budget=99, stage_budget=99, rps=10.0, clock=clock
+    )
+    client_kati, _ = make_client(
+        tmp_path, transport, global_budget=99, stage_budget=99, rps=1.0, clock=clock
+    )
+
+    client_gevsek.chat([{"role": "user", "content": "a"}], stage="test")
+    client_gevsek.chat([{"role": "user", "content": "b"}], stage="test")
+
+    assert clock.slept == [1.0], (
+        f"gevşek istemci de katı aralığa uymalı: {clock.slept}"
+    )
+    assert client_kati is not client_gevsek
+
+
+def _fake_default_env(tmp_path, monkeypatch):
+    """`build_default_client()`'ı gerçek yollara ve gerçek HTTP'ye dokunmadan kur."""
+    from aax import config as cfg
+    from aax import gateway
+
+    monkeypatch.setenv("APP_KEY_JAILBREAK", "test-key")
+    monkeypatch.setattr(cfg, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(cfg, "BUDGET_PATH", tmp_path / "budget.json")
+    monkeypatch.setattr(cfg, "CALL_LOG_PATH", tmp_path / "calls.jsonl")
+    monkeypatch.setattr(
+        gateway, "_httpx_transport", lambda *a, **k: (lambda payload: (200, ok_body()))
+    )
+
+
+def test_build_default_client_is_memoized(tmp_path, monkeypatch):
+    """Tekrarlanan çağrı AYNI istemciyi döndürmeli — her seferinde taze değil.
+
+    Regresyon: her çağrıda yeni istemci üretmek, koruma durumu istemci başına
+    tutulduğunda hız sınırını ve devre kesiciyi sessizce sıfırlıyordu.
+    """
+    from aax.gateway import build_default_client, reset_shared_state
+
+    _fake_default_env(tmp_path, monkeypatch)
+
+    first = build_default_client()
+    second = build_default_client()
+    assert first is second
+
+    # Farklı aşama bütçeleri ayrı bir istemci demektir (bilinçli).
+    ozel = build_default_client({"test": 3})
+    assert ozel is not first
+
+    reset_shared_state()
+    assert build_default_client() is not first, "sıfırlama memo'yu da temizlemeli"
+
+
+def test_build_default_client_shares_state_with_manual_client(tmp_path, monkeypatch):
+    """`build_default_client()` ile elle kurulan istemci aynı devreyi paylaşır."""
+    from aax import config as cfg
+    from aax.gateway import build_default_client
+
+    _fake_default_env(tmp_path, monkeypatch)
+
+    varsayilan = build_default_client()
+    elle, _ = make_client(
+        tmp_path,
+        lambda payload: (200, ok_body()),
+        global_budget=99,
+        stage_budget=99,
+        base_url=cfg.GATEWAY_BASE_URL,
+    )
+    assert varsayilan._state is elle._state
+
+
+def test_api_key_is_not_in_config_repr():
+    """`repr(config)` anahtarı basmamalı — Plan 2-4 notebook dostu."""
+    cfg = GatewayConfig(
+        base_url="https://example.invalid/Jailbreak",
+        model="hakem-llm",
+        api_key="cok-gizli-anahtar",
+        stage_budgets={"test": 1},
+    )
+    assert "cok-gizli-anahtar" not in repr(cfg)
+    assert "example.invalid" in repr(cfg), "diğer alanlar hâlâ görünmeli"
+
+
 def test_call_log_written_as_jsonl(tmp_path):
     def transport(payload):
         return 200, ok_body()
@@ -794,6 +1357,47 @@ def test_call_log_written_as_jsonl(tmp_path):
     assert entry["status"] == 200
     assert entry["cached"] is False
     assert "api_key" not in json.dumps(entry), "anahtar log'a sızmamalı"
+
+
+def test_cache_hit_log_row_has_same_schema_as_send_row(tmp_path):
+    """Cache satırı ile gönderim satırı aynı anahtar kümesini taşımalı.
+
+    Bu JSONL projenin planlar arası TEK denetim izi. Cache satırı `attempt`,
+    `prompt_tokens` ve `completion_tokens`'ı hiç yazmıyordu; satır satır
+    değişen bir şema onu okuyan her aracı `.get()` savunmasına zorlardı.
+    """
+
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport)
+    client.chat(MSG, stage="test")  # gönderim satırı
+    client.chat(MSG, stage="test")  # cache satırı
+
+    lines = (tmp_path / "calls.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    gonderim, cache = json.loads(lines[0]), json.loads(lines[1])
+
+    assert gonderim["cached"] is False and cache["cached"] is True
+    assert set(cache) == set(gonderim), (
+        f"şema uyuşmuyor — yalnızca gönderimde: {set(gonderim) - set(cache)}, "
+        f"yalnızca cache'te: {set(cache) - set(gonderim)}"
+    )
+    assert set(gonderim) == {
+        "ts",
+        "stage",
+        "status",
+        "cached",
+        "attempt",
+        "latency",
+        "prompt_tokens",
+        "completion_tokens",
+    }
+    # Cache satırında bu alanlar anlamsız ama açıkça None olarak var olmalı.
+    assert cache["attempt"] is None
+    assert cache["prompt_tokens"] is None
+    assert cache["completion_tokens"] is None
+    assert gonderim["prompt_tokens"] == 5
 
 
 def test_api_key_never_appears_in_cache_files(tmp_path):
@@ -852,10 +1456,18 @@ Kapsam farkı — bilerek böyle:
 * **Bütçe disktedir ve süreçler arasıdır.** `fcntl.flock` ile korunan
   oku-değiştir-yaz sayesinde aynı `budget_path`'i paylaşan farklı istemciler
   (ve farklı süreçler) birbirinin güncellemesini ezmez. Tavan globaldir.
-* **Hız sınırlayıcı ve devre kesici süreç içi bellektedir.** Yani aynı anda
-  iki ayrı süreç çalıştırırsan sunucuya giden hız 1 değil 2 istek/sn olur ve
-  devre kesici süreçler arası paylaşılmaz. Ortak vLLM sunucusunu koruyan tek
-  sert garanti bütçedir; koşuları tek süreçte tut.
+* **Hız sınırlayıcı, eşzamanlılık semaforu ve devre kesici SÜREÇ İÇİNDE
+  paylaşılır — istemci başına değil.** Durum, `base_url` ile anahtarlanan
+  modül düzeyinde bir kayıt defterinde tutulur (`_ENDPOINT_STATE`). Aynı
+  endpoint'e bakan kaç `GatewayClient` üretirsen üret hepsi TEK bir 1 istek/sn
+  bütçesine, TEK bir semafora ve TEK bir devre kesiciye uyar. Bu bilinçli:
+  Plan 2'nin doğal şekli aşama başına bir istemci ya da eşzamanlı yakalama +
+  hakemlik; istemci başına durum o kurulumda sunucuya giden hızı sessizce
+  ikiye katlardı.
+* **Süreçler arası paylaşım yoktur.** İki ayrı süreç çalıştırırsan sunucuya
+  giden hız 1 değil 2 istek/sn olur ve devre kesici paylaşılmaz. Süreçler
+  arasında sert garanti veren tek şey disktedeki bütçedir; koşuları tek
+  süreçte tut.
 """
 from __future__ import annotations
 
@@ -898,7 +1510,9 @@ class CircuitOpen(RuntimeError):
 class GatewayConfig:
     base_url: str
     model: str
-    api_key: str
+    # `repr=False`: Plan 2-4 notebook dostu. `print(config)` ya da bir hücre
+    # çıktısı anahtarı `.ipynb`'ye gömerdi; anahtar hiçbir dosyaya yazılmaz.
+    api_key: str = field(repr=False)
     requests_per_second: float = 1.0
     max_concurrency: int = 2
     global_budget: int = 1500
@@ -906,6 +1520,93 @@ class GatewayConfig:
     max_retries: int = 3
     circuit_threshold: int = 3
     timeout_seconds: float = 120.0
+
+
+@dataclass
+class _EndpointState:
+    """Bir endpoint için süreç genelinde paylaşılan koruma durumu.
+
+    Bu alanlar bilerek `GatewayClient` örneğinde DEĞİL burada: aynı sunucuya
+    bakan iki istemci tek bir hız bütçesine ve tek bir devre kesiciye uymalı.
+    `lock` bu alanların tamamını korur; `semaphore` aynı anda uçuşta olan
+    gönderim sayısını sınırlar.
+    """
+
+    lock: threading.Lock
+    semaphore: threading.Semaphore
+    max_concurrency: int
+    min_interval: float
+    last_send_at: float | None = None
+    consecutive_failures: int = 0
+    circuit_open: bool = False
+
+
+_REGISTRY_LOCK = threading.Lock()
+_ENDPOINT_STATE: dict[str, _EndpointState] = {}
+_DEFAULT_CLIENTS: dict[tuple, "GatewayClient"] = {}
+
+
+def _endpoint_state(
+    base_url: str, max_concurrency: int, min_interval: float
+) -> _EndpointState:
+    """`base_url` için paylaşılan durumu getir, yoksa oluştur.
+
+    İki uyuşmazlık kuralı — ikisi de kapalı yönde:
+
+    * `max_concurrency` farklıysa `ValueError`. Canlı bir semaforu güvenle
+      küçültemeyiz; farkı sessizce yutmak daha katı olan ayarı kaybettirirdi.
+    * `min_interval` farklıysa **en katısı** (en büyüğü) kazanır. Daha gevşek
+      bir ikinci istemci ortak hız bütçesini gevşetemez.
+    """
+    with _REGISTRY_LOCK:
+        state = _ENDPOINT_STATE.get(base_url)
+        if state is None:
+            state = _EndpointState(
+                lock=threading.Lock(),
+                semaphore=threading.Semaphore(max_concurrency),
+                max_concurrency=max_concurrency,
+                min_interval=min_interval,
+            )
+            _ENDPOINT_STATE[base_url] = state
+            return state
+        if state.max_concurrency != max_concurrency:
+            raise ValueError(
+                f"'{base_url}' için eşzamanlılık sınırı zaten "
+                f"{state.max_concurrency} olarak kuruldu; {max_concurrency} istendi. "
+                "Aynı endpoint'e bakan istemciler tek bir semaforu paylaşır — "
+                "aynı max_concurrency ile kur."
+            )
+        if min_interval > state.min_interval:
+            state.min_interval = min_interval
+        return state
+
+
+def reset_shared_state() -> None:
+    """Modül düzeyindeki paylaşılan durumu sıfırla — YALNIZCA testler için.
+
+    Üretim kodunda çağrılmaz: devre kesiciyi sıfırlamak, tam da onu açtıran
+    sunucuyu yeniden dövmek demektir. Testler arası sızıntıyı önlemek için
+    `tests/conftest.py` bunu her testten önce ve sonra çağırır.
+    """
+    with _REGISTRY_LOCK:
+        _ENDPOINT_STATE.clear()
+        _DEFAULT_CLIENTS.clear()
+
+
+def _is_valid_count(value: object) -> bool:
+    """Bütçe sayacı olarak kabul edilebilir mi?
+
+    `isinstance(value, int)` tek başına yetmez, iki ayrı sızıntısı var:
+
+    * `bool` Python'da `int`'in alt sınıfıdır — `{"a": true}` sayaç 1 olurdu.
+      Bu, `judge.py:96`'da zaten kapatılmış hata sınıfının kardeşidir.
+    * Negatif değer TOPLAMI küçültür: `{"a": true, "b": -1000}` doğrulamayı
+      geçip -999 toplar, yani 1500'lük global tavanı fiilen genişletirdi.
+
+    `_read_budget` docstring'i operatöre bu dosyayı elle onarmasını söylüyor,
+    yani ikisi de erişilebilir senaryolar.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 class _HttpxTransport:
@@ -960,11 +1661,17 @@ class GatewayClient:
         self.budget_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._lock = threading.Lock()
-        self._semaphore = threading.Semaphore(config.max_concurrency)
-        self._last_send_at: float | None = None
-        self._consecutive_failures = 0
-        self._circuit_open = False
+        # Hız sınırlayıcı / semafor / devre kesici durumu istemcide DEĞİL,
+        # `base_url` ile anahtarlanan modül düzeyindeki kayıt defterinde:
+        # aynı sunucuya bakan kaç istemci olursa olsun tek bütçeye uyar.
+        self._state = _endpoint_state(
+            config.base_url,
+            config.max_concurrency,
+            1.0 / config.requests_per_second,
+        )
+        # `sends_made` bilinçli olarak istemci başınadır: "bu istemci kaç
+        # istek attı?" bir tanı sorusudur, koruma değil. Koruma disktedeki
+        # bütçe sayacı ve paylaşılan devre kesicidir.
         self.sends_made = 0
 
     # --- yaşam döngüsü ---------------------------------------------------
@@ -1049,10 +1756,11 @@ class GatewayClient:
                 "Sayaç sıfırlanmış sayılmaz — dosyayı elle onar veya bilinçli olarak sil."
             ) from exc
         if not isinstance(counts, dict) or not all(
-            isinstance(key, str) and isinstance(value, int) for key, value in counts.items()
+            isinstance(key, str) and _is_valid_count(value) for key, value in counts.items()
         ):
             raise BudgetCorrupted(
-                f"Bütçe dosyası beklenen şekilde değil (str->int sözlük): {self.budget_path}."
+                f"Bütçe dosyası beklenen şekilde değil "
+                f"(str -> negatif olmayan int sözlük): {self.budget_path}."
             )
         return counts
 
@@ -1113,20 +1821,21 @@ class GatewayClient:
     # --- hız sınırlama --------------------------------------------------
 
     def _wait_for_slot(self) -> None:
-        min_interval = 1.0 / self.config.requests_per_second
-        if self._last_send_at is not None:
-            elapsed = self._monotonic() - self._last_send_at
+        """Paylaşılan hız penceresini bekle. Çağıran `self._state.lock`'u tutar."""
+        min_interval = self._state.min_interval
+        if self._state.last_send_at is not None:
+            elapsed = self._monotonic() - self._state.last_send_at
             if elapsed < min_interval:
                 self._sleep(min_interval - elapsed)
-        self._last_send_at = self._monotonic()
+        self._state.last_send_at = self._monotonic()
 
     # --- devre kesici ----------------------------------------------------
 
     def _record_failure(self) -> None:
-        with self._lock:
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= self.config.circuit_threshold:
-                self._circuit_open = True
+        with self._state.lock:
+            self._state.consecutive_failures += 1
+            if self._state.consecutive_failures >= self.config.circuit_threshold:
+                self._state.circuit_open = True
 
     @staticmethod
     def _is_retriable(status: int | None) -> bool:
@@ -1142,9 +1851,27 @@ class GatewayClient:
     # --- log ------------------------------------------------------------
 
     def _log(self, entry: dict) -> None:
-        entry = {"ts": time.time(), **entry}
+        """JSONL denetim izine tek satır yaz.
+
+        Şema tek tiptir: her satırda aynı anahtarlar bulunur. Cache isabetinde
+        `attempt` / `prompt_tokens` / `completion_tokens` anlamsızdır ama
+        anahtarlar açıkça `None` olarak yazılır — bu JSONL projenin planlar
+        arası TEK denetim izi ve satır satır değişen bir şema, onu okuyan her
+        aracı `.get()` savunmasına zorlardı.
+        """
+        row = {
+            "ts": time.time(),
+            "stage": None,
+            "status": None,
+            "cached": None,
+            "attempt": None,
+            "latency": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+        }
+        row.update(entry)
         with self.log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     # --- kamuya açık API -------------------------------------------------
 
@@ -1154,6 +1881,29 @@ class GatewayClient:
         """Bu çağrı bütçe harcar mıydı? Hiçbir istek atmaz."""
         payload = self._payload(messages, temperature, max_tokens)
         return self._cache_read(self._cache_key(payload)) is None
+
+    def remaining_budget(self, stage: str) -> tuple[int, int]:
+        """`(aşama için kalan, global kalan)` — istek atmaz, bütçe harcamaz.
+
+        `--dry-run` ön kontrolünün ihtiyacı olan sayı budur. Planlanan çağrıyı
+        `config.STAGE_BUDGETS[stage]` ile kıyaslamak yanıltıcıdır: aşama
+        bütçesinin çoğu önceki bir koşuda harcanmış olabilir ve tavana ne
+        kadar KALDIĞI diskteki sayaca bağlıdır.
+
+        Bilinmeyen aşama adı `chat()` ile aynı şekilde `ValueError`'dır:
+        `--dry-run`, yazım hatası yüzünden temiz bir 0 dönmemeli.
+        """
+        stage_cap = self.config.stage_budgets.get(stage)
+        if stage_cap is None:
+            raise ValueError(
+                f"Bilinmeyen aşama adı: {stage!r}. "
+                f"Tanımlı aşamalar: {sorted(self.config.stage_budgets)}"
+            )
+        with self._budget_file_lock():
+            counts = self._read_budget()
+        stage_remaining = max(0, stage_cap - counts.get(stage, 0))
+        global_remaining = max(0, self.config.global_budget - sum(counts.values()))
+        return stage_remaining, global_remaining
 
     def chat(
         self,
@@ -1171,8 +1921,8 @@ class GatewayClient:
             self._log({"stage": stage, "status": 200, "cached": True, "latency": 0.0})
             return cached
 
-        with self._lock:
-            if self._circuit_open:
+        with self._state.lock:
+            if self._state.circuit_open:
                 raise CircuitOpen(
                     f"Devre kesici açık ({self.config.circuit_threshold} ardışık hata). "
                     "Koşu durduruldu — sunucuyu zorlamıyoruz."
@@ -1185,8 +1935,8 @@ class GatewayClient:
         last_error: BaseException | None = None
 
         for attempt in range(self.config.max_retries):
-            with self._semaphore:
-                with self._lock:
+            with self._state.semaphore:
+                with self._state.lock:
                     self._wait_for_slot()
                     # Her denemede yeniden kontrol + harcama, tek kilit altında.
                     # Buradan çıkan BudgetExceeded bilinçli olarak yakalanmaz:
@@ -1225,8 +1975,8 @@ class GatewayClient:
                     # sonsuza dek çağrılıp bütçeyi yakar, devre hiç açılmaz.
                     self._record_failure()
                     raise GatewayError(f"Beklenmeyen yanıt şekli: {body}") from exc
-                with self._lock:
-                    self._consecutive_failures = 0
+                with self._state.lock:
+                    self._state.consecutive_failures = 0
                 self._cache_write(key, content)
                 return content
 
@@ -1246,8 +1996,21 @@ class GatewayClient:
 
 
 def build_default_client(stage_budgets: dict[str, int] | None = None) -> GatewayClient:
-    """Gerçek endpoint'e bağlı istemci. Anahtarı ortamdan okur."""
+    """Gerçek endpoint'e bağlı istemci. Anahtarı ortamdan okur.
+
+    **Memoize edilir.** Aynı aşama bütçeleriyle tekrar çağırmak AYNI istemciyi
+    döndürür; her çağrıda yeni bir istemci (ve yeni bir httpx bağlantı havuzu)
+    üretmek gereksizdi. Koruma açısından zaten fark etmez — hız sınırlayıcı,
+    semafor ve devre kesici `base_url` üzerinden süreç genelinde paylaşılıyor —
+    ama bağlantı havuzunu ve `sends_made` tanısını tek yerde tutar.
+    """
     from aax import config as cfg
+
+    resolved = cfg.STAGE_BUDGETS if stage_budgets is None else stage_budgets
+    memo_key = (cfg.GATEWAY_BASE_URL, cfg.GATEWAY_MODEL, tuple(sorted(resolved.items())))
+    cached_client = _DEFAULT_CLIENTS.get(memo_key)
+    if cached_client is not None:
+        return cached_client
 
     gateway_config = GatewayConfig(
         base_url=cfg.GATEWAY_BASE_URL,
@@ -1258,22 +2021,24 @@ def build_default_client(stage_budgets: dict[str, int] | None = None) -> Gateway
         global_budget=cfg.GLOBAL_BUDGET,
         # Bilinçli olarak `is None`: açıkça verilen boş sözlük "hiçbir aşamaya
         # izin yok" demektir, "varsayılana dön" değil.
-        stage_budgets=cfg.STAGE_BUDGETS if stage_budgets is None else stage_budgets,
+        stage_budgets=resolved,
         max_retries=cfg.MAX_RETRIES,
         circuit_threshold=cfg.CIRCUIT_THRESHOLD,
     )
-    return GatewayClient(
+    client = GatewayClient(
         gateway_config,
         cache_dir=cfg.CACHE_DIR,
         budget_path=cfg.BUDGET_PATH,
         log_path=cfg.CALL_LOG_PATH,
     )
+    _DEFAULT_CLIENTS[memo_key] = client
+    return client
 ```
 
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
 Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_gateway.py -v`
-Expected: PASS, 27 passed
+Expected: PASS, 52 passed
 
 - [ ] **Step 5: Hiçbir testin ağa çıkmadığını doğrula**
 
@@ -1586,21 +2351,27 @@ git commit -m "feat: hakem modülü ve dayanıklı JSON ayrıştırma"
   - `aax.roles.parse_generation_response(role: str, raw: str) -> dict` — `{"role", "description", "instructions": [3 str], "questions": [40 str]}`; her öğe string olmalı, olmayan öğe `JudgeParseError` (coerce edilmez)
   - `scripts/00_generate_role_data.py` içindeki yardımcılar (fail-closed davranışın çekirdeği, ağsız test edilebilir):
     - `select_roles(limit: int | None) -> tuple[str, ...]` — `limit=0` "sınırsız" değil "sıfır rol" demek (`is not None`, falsy değil)
-    - `run_generation_loop(roles, client, *, stage=STAGE, max_tokens=4096) -> tuple[records, failures, attempted]` — rolleri sırayla gönderir; `attempted` döngünün fiilen ulaştığı rol sayısıdır (`len(roles)` ile karıştırılmamalı). Bütçe/devre kesici koşuyu durdurursa tetikleyici rol de, nedenini açıkça "tetikleyici" olarak işaretleyen bir mesajla `failures`'a eklenir — kaybolmaz.
-    - `build_roles_payload(records, failures, requested, attempted, not_attempted) -> dict`, `build_questions_payload(records, requested, attempted) -> dict` — üç ayrı sayaç: `requested` (istenen batch büyüklüğü), `attempted` (döngünün ulaştığı rol sayısı), `produced` (başarıyla ayrıştırılan kayıt sayısı)
+    - `run_generation_loop(roles, client, *, stage=STAGE, max_tokens=CHAT_MAX_TOKENS, max_consecutive_parse_failures=10) -> tuple[records, failures, attempted, stop_reason]` — rolleri sırayla gönderir; `attempted` döngünün fiilen ulaştığı rol sayısıdır (`len(roles)` ile karıştırılmamalı), `stop_reason` koşuyu durduran nedendir (durmadıysa `None`). **Hiçbir istisna bu döngüden dışarı sızmaz** — `BudgetCorrupted`, bilinmeyen aşama `ValueError`'ı ve `KeyboardInterrupt` dahil; ne çıkarsa çıksın `failures`'a kaydedilir, döngü kırılır ve o ana kadarki iş `main()` tarafından diske yazılır. Durdurma nedenleri üç türlüdür ve `failed` içinde ayırt edilebilir kalır: bütçe/devre kesici tetikleyicisi, üst üste `max_consecutive_parse_failures` ayrıştırma hatası, beklenmeyen istisna.
+    - `run_dry_run(client, roles) -> int` — istek atmadan planı **kalan** aşama ve **kalan** global bütçeyle kıyaslar, ikisini de raporlar, biri aşılırsa `1` döner
+    - `compute_run_id(records) -> str` — üretilen rol adlarından (katalog sırasıyla) türetilen 16 haneli koşu kimliği. Saatten değil içerikten türetilir: aynı roller başarırsa aynı kimlik, dolayısıyla aynı `shared_questions`.
+    - `build_roles_payload(records, failures, requested, attempted, not_attempted) -> dict`, `build_questions_payload(records, requested, attempted) -> dict` — üç ayrı sayaç: `requested` (istenen batch büyüklüğü), `attempted` (döngünün ulaştığı rol sayısı), `produced` (başarıyla ayrıştırılan kayıt sayısı). **Değişmez:** `requested == produced + len(failed) + len(not_attempted)`.
     - `resolve_artifact_paths(data_dir, complete, allow_partial) -> tuple[Path, Path]`
-    - `write_artifacts(data_dir, roles, records, failures, attempted, allow_partial) -> tuple[int, Path, Path, dict, dict]` — `not_attempted`'ı `roles[attempted:]`'ten türetir (rolleri her zaman katalog sırasıyla, aradan atlamadan işleyen `run_generation_loop` sayesinde bu her zaman doğru bir kuyruktur); `--allow-partial` eksik bir sonucu kanonik dosyalara terfi ettirdiğinde stderr'e açık bir `UYARI` yazar
+    - `write_artifacts(data_dir, roles, records, failures, attempted, allow_partial) -> tuple[int, Path, Path, dict, dict]` — `not_attempted`'ı `roles[attempted:]`'ten türetir (rolleri her zaman katalog sırasıyla, aradan atlamadan işleyen `run_generation_loop` sayesinde bu her zaman doğru bir kuyruktur); iki artifact'ı geçici dosya + `os.replace` ile yayımlar (ikisi de tam yazılmadan hiçbiri yerine konmaz); `--allow-partial` eksik bir sonucu kanonik dosyalara terfi ettirdiğinde stderr'e açık bir `UYARI` yazar
+    - `main(argv: list[str] | None = None) -> int` — `argv` verilebilir olması `sys.argv`'ye dokunmadan uçtan uca test edilebilmesi içindir
+    - `CHAT_TEMPERATURE` / `CHAT_MAX_TOKENS` — cache anahtarının parçası olan çağrı parametreleri. `chat` ve `would_call` yolları bu sabitleri **paylaşmak zorunda**: ayrışırlarsa `--dry-run` cache'teki kayıtları göremez ve her şeyi "planlanan" sayar.
   - Artifact (tam koşu): `data/roles.json` —
     ```json
-    {"complete": true, "requested": 120, "attempted": 120, "produced": 120, "not_attempted": [], "failed": [], "roles": [ {...120 rol} ]}
+    {"run_id": "3f2a…", "complete": true, "requested": 120, "attempted": 120, "produced": 120, "not_attempted": [], "failed": [], "roles": [ {...120 rol} ]}
     ```
   - Artifact (tam koşu): `data/questions.json` —
     ```json
-    {"complete": true, "requested": 120, "attempted": 120, "produced": 120, "shared_questions": [40 str]}
+    {"run_id": "3f2a…", "complete": true, "requested": 120, "attempted": 120, "produced": 120,
+     "seed": 20260804, "role_count": 120, "pool_size": 4800, "shared_questions": [40 str]}
     ```
+    `run_id` iki artifact'ta **aynıdır** ve üretilen rol adlarından türetilir. Amacı: `shared_questions` determinizmi tohuma DEĞİL, hangi rollerin başardığına da bağlıdır — `--allow-partial` ile yazılan kısmi bir soru kümesi sonradan tam bir koşuyla farklı 40 soruya takas edilebilir. Spec Aşama 1'in 14.400 rollout'u bu dosyaya bağlı olduğundan takasın diskten görülebilir olması şart.
   - Artifact (kesik koşu, ör. bütçe 45. rolde tetiklendi): `data/roles.partial.json` —
     ```json
-    {"complete": false, "requested": 120, "attempted": 45, "produced": 44,
+    {"run_id": "9c81…", "complete": false, "requested": 120, "attempted": 45, "produced": 44,
      "not_attempted": ["...kalan 75 rol, katalog sırasıyla..."],
      "failed": [{"role": "...", "reason": "DURDURULDU — koşuyu durduran bütçe/devre kesici tetikleyicisi: ..."}],
      "roles": [ {...44 rol} ]}
@@ -1879,9 +2650,12 @@ Kullanım:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import random
 import sys
+import tempfile
 from pathlib import Path
 
 from aax import config
@@ -1891,9 +2665,50 @@ from aax.roles import ROLE_NAMES, build_generation_prompt, parse_generation_resp
 
 STAGE = "stage0_roles"
 SHARED_QUESTION_COUNT = 40
+
+# Cache anahtarının parçası olan çağrı parametreleri TEK yerde tanımlıdır.
+# `run_generation_loop` (chat) ile `run_dry_run` (would_call) bu sabitleri
+# paylaşmak zorunda: değerler ayrışırsa iki yol farklı cache anahtarı üretir
+# ve --dry-run cache'te hazır duran kayıtları göremeyip her şeyi "planlanan"
+# sayar. Eskiden ikisinde de elle yazılıydı ve bu kırılganlık bir yorumla
+# işaretlenmişti; artık yapıyla bağlı ve testle sabitleniyor.
+CHAT_TEMPERATURE = 0.0
+CHAT_MAX_TOKENS = 4096
+
 # Sabit tohum: ortak soru kümesi her koşuda aynı çıkmalı, yoksa farklı
 # koşulardan gelen rol vektörleri birbiriyle kıyaslanabilir olmaktan çıkar.
+#
+# DETERMİNİZM KOŞULLUDUR. Tohum sabittir ama örnekleme havuzu `records`'tan
+# kurulur, yani hangi rollerin BAŞARDIĞINA bağlıdır. Aynı tohum + farklı rol
+# kümesi = farklı 40 soru. Bu yüzden her iki artifact da içerikten türetilen
+# bir `run_id` ile damgalanır (bkz. `compute_run_id`): Aşama 1'in 14.400
+# rollout'u `questions.json`'a bağlıdır, sessiz bir takas diskteki işi
+# geçersiz kılardı.
 SEED = 20260804
+
+# Üst üste bu kadar rolde ayrıştırma hatası olursa koşu durur. `hakem-llm`'nin
+# 40 soruluk JSON'u üretip üretemediği tam da Aşama 0.5 kapısının test ettiği
+# belirsizlik. Gövdesi ayrışan ama kullanılamayan bir 200 devre kesiciyi
+# SIFIRLAR (taşıma katmanı açısından başarılıdır), bu yüzden gateway burada
+# hiçbir şey yapmaz: aşama bütçesinin tamamını yakıp sıfır kayıt üretmeyi
+# engelleyen tek şey bu script düzeyindeki sayaçtır.
+MAX_CONSECUTIVE_PARSE_FAILURES = 10
+
+
+def compute_run_id(records: list[dict]) -> str:
+    """Üretilen rol adlarından (katalog sırasıyla) türetilen koşu kimliği.
+
+    Saatten değil İÇERİKTEN türetilir: bu repoda saate bağlı hiçbir kimlik
+    yok ve yeniden üretilebilirlik asıl mesele. Aynı roller başarırsa aynı
+    kimlik çıkar, yani aynı `shared_questions` da çıkar.
+
+    Tüketici tarafı için sözleşme: `roles.json` ve `questions.json` aynı
+    `run_id`'yi taşıyorsa aynı koşudandırlar. `questions.json`'ın `run_id`'si
+    bir Aşama 1 rollout setinin beklediğinden farklıysa soru kümesi değişmiş
+    demektir ve o rollout'lar artık o soru kümesine ait değildir.
+    """
+    blob = "\n".join(record["role"] for record in records)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 def build_roles_payload(
@@ -1913,15 +2728,20 @@ def build_roles_payload(
       koşuyu erken durdurursa `requested`'tan küçük kalır.
     * `produced`   — başarıyla ayrıştırılan kayıt sayısı (`len(records)`).
 
+    Değişmez: `requested == produced + len(failed) + len(not_attempted)` —
+    denenen her rol ya bir kayıt ya bir hata üretir, denenmeyen her rol
+    `not_attempted`'tadır.
+
     `complete` alanı `produced == requested` olup olmadığını taşır; downstream
     bir script'in kısmi bir katalogu tam sanmasını engellemek için bu zarf
     gereklidir. `not_attempted`, döngünün hiç ulaşamadığı rolleri katalog
     sırasıyla listeler — bir operatörün "hangi roller kaldı?" sorusuna
     `ROLE_NAMES` ile set-diff almaya gerek kalmadan doğrudan bu dosyadan cevap
-    bulabilmesi için.
+    bulabilmesi için. `run_id`, `questions.json` ile eşleştirme içindir.
     """
     produced = len(records)
     return {
+        "run_id": compute_run_id(records),
         "complete": produced == requested,
         "requested": requested,
         "attempted": attempted,
@@ -1933,7 +2753,11 @@ def build_roles_payload(
 
 
 def sample_shared_questions(records: list[dict]) -> list[str]:
-    """Üretilen tüm sorulardan `SEED` ile deterministik bir ortak alt küme seç."""
+    """Üretilen tüm sorulardan `SEED` ile deterministik bir ortak alt küme seç.
+
+    Determinizm KOŞULLUDUR: havuz `records`'tan kurulur, yani aynı rollerin
+    başarmasına bağlıdır (bkz. `SEED` notu).
+    """
     pool = [question for record in records for question in record["questions"]]
     rng = random.Random(SEED)
     return rng.sample(pool, min(SHARED_QUESTION_COUNT, len(pool)))
@@ -1943,13 +2767,25 @@ def build_questions_payload(records: list[dict], requested: int, attempted: int)
     """`questions.json`/`questions.partial.json` içeriği.
 
     Sayaç anlamları `build_roles_payload` ile birebir aynıdır (bkz. orada).
+
+    Örnekleme girdileri (`seed`, `role_count`, `pool_size`) ve `run_id` de
+    yazılır. Neden: `--allow-partial` ile koşan bir koşu kısmi bir havuzdan
+    kanonik `questions.json`'ı yazabilir; sonraki tam bir koşu onu FARKLI 40
+    soruyla ezer. Spec Aşama 1 bu dosyaya bağlı 14.400 rollout üretiyor —
+    sessiz takas diskteki işi geçersiz kılardı. Bu alanlar sayesinde tüketici
+    soru kümesinin değiştiğini görebilir.
     """
     produced = len(records)
+    pool = [question for record in records for question in record["questions"]]
     return {
+        "run_id": compute_run_id(records),
         "complete": produced == requested,
         "requested": requested,
         "attempted": attempted,
         "produced": produced,
+        "seed": SEED,
+        "role_count": produced,
+        "pool_size": len(pool),
         "shared_questions": sample_shared_questions(records),
     }
 
@@ -1969,6 +2805,49 @@ def resolve_artifact_paths(
     if complete or allow_partial:
         return data_dir / "roles.json", data_dir / "questions.json"
     return data_dir / "roles.partial.json", data_dir / "questions.partial.json"
+
+
+def _stage_temp_file(path: Path, text: str) -> str:
+    """`path`'in yanında tam yazılmış, fsync'lenmiş geçici dosya bırak."""
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+    return tmp_name
+
+
+def _publish_atomically(payloads: list[tuple[Path, dict]]) -> None:
+    """İki artifact'ı geçici dosya + `os.replace` ile yayımla.
+
+    `gateway.py`'nin bütçe dosyası için kullandığı standardın aynısı: yazım
+    ortasında bir çökme yarım bir `roles.json` bırakamaz. Ek olarak HER İKİ
+    geçici dosya da diske tam yazılmadan hiçbiri yerine konmaz, yani "roles
+    yazıldı ama questions yarım kaldı" durumu oluşmaz.
+
+    Dürüst sınır: iki `os.replace` ardışıktır, aralarında (mikrosaniyelik) bir
+    pencere vardır. POSIX'te iki dosyayı tek işlemde takas etmenin yolu yok.
+    O pencerede çökülürse eski `questions.json` yeni `roles.json` ile eşleşir —
+    ama ikisi farklı `run_id` taşıyacağı için tüketici bunu GÖREBİLİR
+    (bkz. `compute_run_id`). Yarım/kırpık dosya hiçbir durumda oluşmaz.
+    """
+    staged: list[tuple[str, Path]] = []
+    try:
+        for path, payload in payloads:
+            text = json.dumps(payload, ensure_ascii=False, indent=2)
+            staged.append((_stage_temp_file(path, text), path))
+        for tmp_name, path in staged:
+            os.replace(tmp_name, path)
+    except BaseException:
+        for tmp_name, _ in staged:
+            Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 def write_artifacts(
@@ -1999,11 +2878,8 @@ def write_artifacts(
 
     roles_path, questions_path = resolve_artifact_paths(data_dir, complete, allow_partial)
     data_dir.mkdir(parents=True, exist_ok=True)
-    roles_path.write_text(
-        json.dumps(roles_payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    questions_path.write_text(
-        json.dumps(questions_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    _publish_atomically(
+        [(roles_path, roles_payload), (questions_path, questions_payload)]
     )
 
     if allow_partial and not complete:
@@ -2012,7 +2888,9 @@ def write_artifacts(
         print(
             f"UYARI: kısmi koşu ({roles_payload['produced']}/{roles_payload['requested']} "
             f"rol) kanonik dosya adlarına terfi ettirildi — {roles_path.name} / "
-            f"{questions_path.name}. Önceki tam artifact varsa üzerine yazıldı.",
+            f"{questions_path.name}. Önceki tam artifact varsa üzerine yazıldı. "
+            f"Yeni run_id: {roles_payload['run_id']} — bu koşunun ortak soru "
+            f"kümesi öncekinden FARKLI olabilir.",
             file=sys.stderr,
         )
 
@@ -2032,6 +2910,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "yaz (varsayılan: kapalı — fail-closed, .partial.json'a yazılır)"
         ),
     )
+    parser.add_argument(
+        "--max-parse-failures",
+        type=int,
+        default=MAX_CONSECUTIVE_PARSE_FAILURES,
+        help=(
+            "üst üste bu kadar ayrıştırma hatasında koşuyu durdur "
+            f"(varsayılan: {MAX_CONSECUTIVE_PARSE_FAILURES})"
+        ),
+    )
     return parser
 
 
@@ -2047,85 +2934,164 @@ def select_roles(limit: int | None) -> tuple[str, ...]:
 
 
 def run_generation_loop(
-    roles: tuple[str, ...], client, *, stage: str = STAGE, max_tokens: int = 4096
-) -> tuple[list[dict], list[tuple[str, str]], int]:
+    roles: tuple[str, ...],
+    client,
+    *,
+    stage: str = STAGE,
+    max_tokens: int = CHAT_MAX_TOKENS,
+    max_consecutive_parse_failures: int = MAX_CONSECUTIVE_PARSE_FAILURES,
+) -> tuple[list[dict], list[tuple[str, str]], int, str | None]:
     """`roles`'u sırayla gateway'e gönder, yanıtları ayrıştır.
 
-    Döndürür: `(records, failures, attempted)`. `attempted`, döngünün fiilen
-    ulaştığı rol sayısıdır — `len(roles)` (istenen batch büyüklüğü) ile
-    KARIŞTIRILMAMALI: bütçe/devre kesici koşuyu erken durdurursa küçük kalır.
+    Döndürür: `(records, failures, attempted, stop_reason)`. `attempted`,
+    döngünün fiilen ulaştığı rol sayısıdır — `len(roles)` (istenen batch
+    büyüklüğü) ile KARIŞTIRILMAMALI: koşu erken durursa küçük kalır.
+    `stop_reason` koşuyu durduran nedendir, durmadıysa `None`.
 
-    Bütçe/devre kesici koşuyu durdurduğunda, o anki rol de "denendi VE
-    başarısız oldu" sayılır — atlanmaz, nedeni açıkça tetikleyici olduğunu
-    söyleyen bir mesajla `failures`'a eklenir. Böylece bir ayrıştırma/gateway
-    hatasından ayırt edilebilir kalır ve `roles.partial.json` "koşuyu hangi
-    rol durdurdu?" sorusuna kendi başına cevap verebilir.
+    **Hiçbir istisna bu döngüden dışarı sızmaz.** Bu bilinçli: sızan bir hata
+    `main()`'in `write_artifacts`'e hiç ulaşamamasına, yani o ana kadar
+    üretilmiş TÜM kayıtların çöpe gitmesine yol açıyordu. `BudgetCorrupted`,
+    bilinmeyen aşama `ValueError`'ı ve `KeyboardInterrupt` — yani en olası
+    başarısızlık kipleri — `.partial.json` makinesini tamamen atlıyordu.
+    Artık ne çıkarsa çıksın `failures`'a kaydedilir, döngü kırılır ve o ana
+    kadarki iş diske yazılır.
+
+    Durdurma nedenleri üç türlüdür ve `failed` içinde ayırt edilebilir kalır:
+
+    * bütçe / devre kesici tetikleyicisi,
+    * üst üste `max_consecutive_parse_failures` ayrıştırma hatası,
+    * beklenmeyen istisna (kesinti dahil).
+
+    Değişmez: denenen her rol için TAM OLARAK bir sonuç kaydedilir — ya
+    `records`'a bir kayıt ya `failures`'a bir satır. Durdurma anında ikinci
+    bir `failures` satırı EKLENMEZ, mevcut satırın nedeni zenginleştirilir.
     """
     records: list[dict] = []
     failures: list[tuple[str, str]] = []
     attempted = 0
+    stop_reason: str | None = None
+    consecutive_parse_failures = 0
 
     for index, role in enumerate(roles, start=1):
         attempted = index
-        prompt = build_generation_prompt(role)
         try:
+            prompt = build_generation_prompt(role)
             raw = client.chat(
-                [{"role": "user", "content": prompt}], stage=stage, max_tokens=max_tokens
+                [{"role": "user", "content": prompt}],
+                stage=stage,
+                temperature=CHAT_TEMPERATURE,
+                max_tokens=max_tokens,
             )
             records.append(parse_generation_response(role, raw))
+            consecutive_parse_failures = 0
         except JudgeParseError as exc:
+            consecutive_parse_failures += 1
+            if consecutive_parse_failures >= max_consecutive_parse_failures:
+                stop_reason = (
+                    f"DURDURULDU — üst üste {consecutive_parse_failures} rolde "
+                    f"ayrıştırma hatası (sınır: {max_consecutive_parse_failures}). "
+                    "hakem-llm istenen JSON'u üretemiyor olabilir; aşama bütçesini "
+                    f"sıfır kayıt için yakmamak adına durduruldu. Son hata: {exc}"
+                )
+                print(f"\n{stop_reason}", file=sys.stderr)
+                failures.append((role, stop_reason))
+                break
             failures.append((role, str(exc)))
         except (BudgetExceeded, CircuitOpen) as exc:
-            print(f"\nDURDURULDU: {exc}", file=sys.stderr)
-            failures.append(
-                (role, f"DURDURULDU — koşuyu durduran bütçe/devre kesici tetikleyicisi: {exc}")
+            stop_reason = (
+                f"DURDURULDU — koşuyu durduran bütçe/devre kesici tetikleyicisi: {exc}"
             )
+            print(f"\nDURDURULDU: {exc}", file=sys.stderr)
+            failures.append((role, stop_reason))
             break
         except GatewayError as exc:
             failures.append((role, str(exc)))
+        except BaseException as exc:  # noqa: BLE001 — bkz. docstring
+            stop_reason = (
+                f"DURDURULDU — beklenmeyen hata ({type(exc).__name__}): {exc}. "
+                "O ana kadar üretilen kayıtlar kısmi artifact olarak yazıldı."
+            )
+            print(f"\n{stop_reason}", file=sys.stderr)
+            failures.append((role, stop_reason))
+            break
         print(f"\r{index}/{len(roles)} — {role:<16} hata: {len(failures)}", end="")
 
-    return records, failures, attempted
+    return records, failures, attempted, stop_reason
 
 
-def main() -> int:
-    args = build_arg_parser().parse_args()
+def run_dry_run(client, roles: tuple[str, ...]) -> int:
+    """İstek atmadan planı KALAN bütçeyle kıyasla.
+
+    Aşama TAVANIYLA (`STAGE_BUDGETS[STAGE]`) kıyaslamak yanıltıcıydı: tavanın
+    çoğunu önceki bir koşuda harcamış bir operatör temiz bir 0 görüp koşuyu
+    başlatıyor, kalan bütçe biter bitmez ortasında kesiliyordu. Spec Bölüm 6
+    `--dry-run`'ı zorunlu ön kontrol yapıyor; ön kontrolün baktığı sayı tavan
+    değil diskteki sayaca göre KALAN olmalı. Global tavan da ayrıca kontrol
+    edilir: aşama bütçesi bol olsa bile 1500 dolmuş olabilir.
+    """
+    planned = sum(
+        1
+        for role in roles
+        if client.would_call(
+            [{"role": "user", "content": build_generation_prompt(role)}],
+            temperature=CHAT_TEMPERATURE,
+            max_tokens=CHAT_MAX_TOKENS,
+        )
+    )
+    stage_remaining, global_remaining = client.remaining_budget(STAGE)
+    stage_cap = config.STAGE_BUDGETS[STAGE]
+
+    print(f"Planlanan çağrı:      {planned} (cache'te: {len(roles) - planned})")
+    print(f"Aşama bütçesi:        {stage_cap} (kalan: {stage_remaining})")
+    print(f"Global tavan:         {config.GLOBAL_BUDGET} (kalan: {global_remaining})")
+
+    sorunlar = []
+    if planned > stage_remaining:
+        sorunlar.append(
+            f"aşama bütçesi: {planned} planlandı, yalnızca {stage_remaining} kaldı "
+            f"({stage_cap} tavanın {stage_cap - stage_remaining}'i harcanmış)"
+        )
+    if planned > global_remaining:
+        sorunlar.append(
+            f"global tavan: {planned} planlandı, yalnızca {global_remaining} kaldı "
+            f"({config.GLOBAL_BUDGET} tavanın {config.GLOBAL_BUDGET - global_remaining}'i "
+            "harcanmış)"
+        )
+    if sorunlar:
+        for sorun in sorunlar:
+            print(f"HATA: {sorun}", file=sys.stderr)
+        print(
+            "Koşu başlatılmadı — batch'i --limit ile küçült. Tavan yükseltilmez.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
 
     roles = select_roles(args.limit)
     client = build_default_client()
 
     if args.dry_run:
-        # max_tokens cache anahtarının parçası — chat() ile birebir aynı olmalı,
-        # yoksa dry-run cache'teki kayıtları göremez.
-        planned = sum(
-            1
-            for role in roles
-            if client.would_call(
-                [{"role": "user", "content": build_generation_prompt(role)}],
-                max_tokens=4096,
-            )
-        )
-        cap = config.STAGE_BUDGETS[STAGE]
-        print(f"Planlanan çağrı: {planned} (cache'te: {len(roles) - planned})")
-        print(f"Aşama bütçesi:   {cap}")
-        if planned > cap:
-            print("HATA: plan aşama bütçesini aşıyor — batch'i küçült.", file=sys.stderr)
-            return 1
-        return 0
+        return run_dry_run(client, roles)
 
-    records, failures, attempted = run_generation_loop(roles, client)
+    records, failures, attempted, stop_reason = run_generation_loop(
+        roles, client, max_consecutive_parse_failures=args.max_parse_failures
+    )
 
     print()
     exit_code, roles_path, questions_path, roles_payload, questions_payload = write_artifacts(
         config.DATA_DIR, roles, records, failures, attempted, args.allow_partial
     )
 
-    pool_size = sum(len(record["questions"]) for record in records)
+    pool_size = questions_payload["pool_size"]
     shared = questions_payload["shared_questions"]
     print(
         f"Yazıldı: {roles_path} "
         f"({roles_payload['produced']}/{roles_payload['requested']} rol, "
-        f"complete={roles_payload['complete']})"
+        f"complete={roles_payload['complete']}, run_id={roles_payload['run_id']})"
     )
     print(f"Ortak soru havuzu: {pool_size} → {len(shared)} seçildi → {questions_path}")
     print(f"Gönderilen istek: {client.sends_made}")
@@ -2134,12 +3100,17 @@ def main() -> int:
         for role, reason in failures[:10]:
             print(f"  {role}: {reason[:100]}")
 
+    if stop_reason is not None:
+        # Yarıda kesilmiş bir koşu asla "başarı" değildir — `--allow-partial`
+        # dosya adlarını terfi ettirse bile çıkış kodu sıfır olmamalı.
+        print(f"\n{stop_reason}", file=sys.stderr)
+        exit_code = exit_code or 1
+
     if exit_code != 0:
         print(
             f"\nHATA: koşu eksik kaldı ({roles_payload['produced']}/"
-            f"{roles_payload['requested']}) ve --allow-partial verilmedi — "
-            f"kanonik dosyalara DOKUNULMADI, bunun yerine {roles_path.name} / "
-            f"{questions_path.name} yazıldı.",
+            f"{roles_payload['requested']}) — yazılan dosyalar: {roles_path.name} / "
+            f"{questions_path.name}.",
             file=sys.stderr,
         )
 
@@ -2153,15 +3124,17 @@ if __name__ == "__main__":
 - [ ] **Step 5b: Script'in yazma/isimlendirme mantığı için failing test'leri yaz**
 
 Ağa çıkmadan test edilebilmesi için dosya yazma mantığı ve gönderim döngüsü
-yukarıdaki pure/ağsız-test-edilebilir fonksiyonlara (`select_roles`,
-`run_generation_loop`, `build_roles_payload`, `build_questions_payload`,
-`resolve_artifact_paths`, `write_artifacts`, `build_arg_parser`) ayrıştırıldı.
+pure/ağsız-test-edilebilir fonksiyonlara (`select_roles`,
+`run_generation_loop`, `run_dry_run`, `compute_run_id`, `build_roles_payload`,
+`build_questions_payload`, `resolve_artifact_paths`, `write_artifacts`,
+`build_arg_parser`) ayrıştırıldı ve `main(argv)` de uçtan uca test edilir.
 `scripts/00_generate_role_data.py` bir rakamla başladığı için normal `import`
 ile içe aktarılamaz; `tests/test_generate_role_data.py`
 `importlib.util.spec_from_file_location` ile dosya yolundan yükler.
-`run_generation_loop` gerçek `GatewayClient` yerine `.chat()` çağrılarını
-sırayla önceden hazırlanmış yanıt/istisna listesinden karşılayan sahte bir
-`StubClient` ile test edilir — ağa hiç çıkılmaz. Testler şunları kapsar:
+Döngü testleri `.chat()` çağrılarını sırayla önceden hazırlanmış yanıt/istisna
+listesinden karşılayan sahte bir `StubClient` kullanır; cache/bütçe davranışı
+gerektiren testler ise **sahte transport'lu gerçek `GatewayClient`** kullanır —
+her iki yolda da ağa hiç çıkılmaz. Testler şunları kapsar:
 
 - tam bir koşu (`produced == requested`) kanonik `roles.json`/`questions.json`
   dosyalarını `complete: true` ile yazar,
@@ -2171,23 +3144,42 @@ sırayla önceden hazırlanmış yanıt/istisna listesinden karşılayan sahte b
 - `not_attempted` döngünün hiç ulaşamadığı rolleri katalog sırasıyla listeler,
   ve `attempted` batch büyüklüğü (`requested`) değil döngünün fiilen ulaştığı
   rol sayısını yansıtır,
+- `requested == produced + len(failed) + len(not_attempted)` değişmezi, üç
+  bileşen de aynı anda sıfırdan farklıyken hem bellekte hem diskte tutar,
 - bütçe/devre kesici koşuyu durdurduğunda tetikleyici rol de, nedenini açıkça
   "tetikleyici" olarak işaretleyen bir mesajla `failed`'a eklenir,
+- **döngüden sızan hiçbir istisna işi kaybettirmez**: `BudgetCorrupted`,
+  bilinmeyen aşama `ValueError`'ı ve `KeyboardInterrupt` sonrası da o ana kadar
+  üretilen kayıtlar kısmi artifact olarak yazılır ve neden `failed`'a girer,
+- üst üste `--max-parse-failures` (varsayılan 10) ayrıştırma hatasında koşu
+  durur, araya giren bir başarı sayacı sıfırlar, `GatewayError` bu kapıyı
+  tetiklemez,
+- `--dry-run` **kalan** aşama ve **kalan** global bütçeye bakar; ikisinden
+  biri yetmiyorsa sıfırdan farklı çıkar,
+- `would_call` ile `chat` aynı cache anahtarını üretir (gerçek koşudan sonra
+  `--dry-run` "planlanan 0" der),
+- `run_id` içerikten türetilir, üretilen rol kümesi değişince değişir, ve
+  `roles.json`/`questions.json` aynı `run_id`'yi taşır,
+- iki artifact atomik yayımlanır: ikincisi yazılamazsa birincisi de yerine
+  konmaz ve geçici dosya artığı kalmaz,
 - `--allow-partial` eksik sonucu kanonik dosya adlarına terfi ettirir (zarf
-  yine de `complete: false` der) VE stderr'e kaç rol/kaç istenen ve önceki tam
-  artifact'ın üzerine yazıldığını söyleyen bir `UYARI` basar — tam bir koşuda
-  bu uyarı basılmaz,
+  yine de `complete: false` der) VE stderr'e kaç rol/kaç istenen, önceki tam
+  artifact'ın üzerine yazıldığı ve yeni `run_id` bilgisini içeren bir `UYARI`
+  basar — tam bir koşuda bu uyarı basılmaz; kesilmiş bir koşu ise
+  `--allow-partial` verilse bile sıfırdan farklı çıkar,
 - `--limit 0` tam 0 rol seçer (`--limit` verilmemesinden farklı).
 
 Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_generate_role_data.py -v`
-Expected: FAIL — script henüz yukarıdaki fonksiyonları içermiyorsa `AttributeError`/`ImportError`.
+Expected: PASS, 59 passed
 
 - [ ] **Step 6: Script'in dry-run modunu doğrula**
 
 Anahtar gerektirir ama istek atmaz.
 
 Run: `cd "/home/pc-8469/Asistant Axis" && uv run python scripts/00_generate_role_data.py --dry-run`
-Expected: `Planlanan çağrı: 120 (cache'te: 0)` ve `Aşama bütçesi: 130`, çıkış kodu 0.
+Expected: `Planlanan çağrı:      120 (cache'te: 0)`, `Aşama bütçesi:        145 (kalan: 145)`,
+`Global tavan:         1500 (kalan: ~1499)`, çıkış kodu 0. (Smoke testi zaten koşulduysa
+global kalan 1499'dur.)
 
 - [ ] **Step 7: Commit**
 
@@ -2216,10 +3208,23 @@ Bu son madde Aşama 0.5'in (Plan 2) habercisidir: burada JSON çıkmıyorsa hake
 `scripts/01_smoke_gateway.py` — brief'teki bare `main()` yerine, script daha
 önceki task'larda tekrar tekrar çıkan bir dersi izleyerek karar mantığını
 küçük saf fonksiyonlara ayırır (`scripts/00_generate_role_data.py` ile aynı
-desen): `read_budget()`, `check_cache_hit()`, `check_budget_delta()`,
-`check_json_shape()`. `main()` bunları çağıran ince bir sarmalayıcıdır;
-gözlemlenebilir stdout/stderr metni ve çıkış kodu davranışı brief'le
-birebir aynıdır.
+desen): `read_budget()`, `check_cache_hit()`, `diagnose_budget_delta()`,
+`check_json_shape()`. `run_probe()` bunları çağıran ince bir sarmalayıcıdır.
+
+`main()` ise **tanı sarmalayıcısıdır**: bu script projenin production
+`hakem-llm` sunucusuna ilk temasıdır ve onu çoğunlukla anahtarı yeni export
+etmiş bir operatör koşar. `build_default_client()`'ın eksik anahtar
+`RuntimeError`'ı ile `BudgetCorrupted` / `BudgetExceeded` / `CircuitOpen` /
+`GatewayError` yakalanıp ham traceback yerine anlaşılır Türkçe tanıya
+çevrilir. Üç ayrı çıkış kodu: `0` TAMAM, `1` bağlantı kuruldu ama bir kontrol
+BAŞARISIZ, `2` koşu hiç yapılamadı.
+
+`diagnose_budget_delta()` bilerek `spent`'ten fazlasına bakar. İlk çağrı
+geçici bir 5xx yüzünden yeniden denendiyse bütçe 2 artar — ama cache pekâlâ
+çalışıyordur; cache hiç çalışmasaydı da bütçe 2 artardı. İki senaryoyu ayıran
+tek ölçüm **ikinci çağrının kaç gönderim yaptığı** (`client.sends_made`
+farkı). Sadece `spent`'e bakmak, tam da ilk temasta "cache çalışmıyor" diye
+yanlış teşhis koyardı.
 
 ```python
 #!/usr/bin/env python3
@@ -2237,13 +3242,28 @@ Kullanım:
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from aax import config
-from aax.gateway import build_default_client
+from aax.gateway import (
+    BudgetCorrupted,
+    BudgetExceeded,
+    CircuitOpen,
+    GatewayError,
+    build_default_client,
+)
 from aax.judge import JudgeParseError, extract_json
 
 STAGE = "smoke"
+
+# Çıkış kodları — bir kabuk pipeline'ının ayırt edebilmesi için:
+#   0  her şey TAMAM
+#   1  bağlantı kuruldu ama bir kontrol BAŞARISIZ (ör. JSON üretilemiyor)
+#   2  koşu hiç yapılamadı (anahtar yok, bütçe doldu, devre açık, taşıma hatası)
+EXIT_OK = 0
+EXIT_KONTROL_BASARISIZ = 1
+EXIT_KOSULAMADI = 2
 
 PROBE = (
     "Classify each of the following statements as either \"factual\" or "
@@ -2258,9 +3278,9 @@ PROBE = (
 def read_budget(budget_path: Path) -> int:
     """Bütçe dosyasındaki tüm aşama sayaçlarının toplamı.
 
-    Dosya yoksa 0 döner. Yol parametre olarak alınır ki testler gerçek
-    `config.BUDGET_PATH`'e değil, `tmp_path` altında sahte bir dosyaya
-    baksın — ağa da diskteki gerçek bütçeye de dokunmadan.
+    Dosya yoksa 0 döner (hiç istek atılmamış demektir). Yol parametre olarak
+    alınır ki testler gerçek `config.BUDGET_PATH`'e değil, `tmp_path` altında
+    sahte bir dosyaya baksın — ağa da diskteki gerçek bütçeye de dokunmadan.
     """
     if not budget_path.exists():
         return 0
@@ -2272,17 +3292,39 @@ def check_cache_hit(raw: str, raw_again: str) -> bool:
     return raw == raw_again
 
 
-def check_budget_delta(before: int, after: int) -> tuple[bool, int]:
-    """Bütçe tam olarak 1 mi arttı?
+def diagnose_budget_delta(
+    spent: int, first_call_sends: int, second_call_sends: int
+) -> tuple[str, str]:
+    """Bütçe artışını DOĞRU teşhise indirger. `(karar, mesaj)` döner.
 
-    İkinci çağrı cache'ten karşılanmalı, yani yalnızca ilk çağrı bütçe
-    harcamalı. `spent` 0 ise ilk çağrı da bir önceki koşudan kalma cache'e
-    denk gelmiştir (bütçe hiç artmadı); 2 ise cache hiç çalışmamıştır. İkisi
-    de bu smoke testinin amacına aykırıdır, bu yüzden yalnızca `1` TAMAM
-    sayılır.
+    Karar `"ok"`, `"warn"` veya `"fail"`.
+
+    Neden `spent` tek başına yetmiyor: ilk çağrı geçici bir 5xx yüzünden bir
+    kez yeniden denendiyse `spent` 2 olur — ama cache PEKÂLÂ çalışıyordur.
+    Cache hiç çalışmasaydı da `spent` 2 olurdu. İki senaryo aynı sayıyı verir.
+    Ayıran ölçüm `client.sends_made`: ikinci çağrı hiç gönderim yapmadıysa
+    (`second_call_sends == 0`) cache çalışıyor demektir, `spent` ne olursa
+    olsun. Eski kod bu ayrımı yapmadan "cache çalışmıyor" diyordu — projenin
+    production'a ilk temasında yanlış teşhis.
     """
-    spent = after - before
-    return spent == 1, spent
+    if second_call_sends > 0:
+        return "fail", (
+            f"bütçe {spent} arttı ve İKİNCİ çağrı {second_call_sends} gerçek istek "
+            "attı — cache çalışmıyor."
+        )
+    if spent == 0:
+        return "fail", (
+            "bütçe hiç artmadı — ilk çağrı da önceki bir koşunun cache'inden geldi. "
+            "Bu smoke testi gerçek bir istek doğrulayamadı; "
+            "data/gateway_cache/ temizlenip tekrar denenmeli."
+        )
+    if spent == 1:
+        return "ok", "bütçe tam olarak 1 arttı"
+    return "warn", (
+        f"bütçe {spent} arttı: cache ÇALIŞIYOR (ikinci çağrı hiç istek atmadı) "
+        f"ama ilk çağrı {first_call_sends - 1} kez yeniden denendi — sunucuda "
+        "geçici hata olmuş olabilir."
+    )
 
 
 def check_json_shape(raw: str) -> tuple[str, object]:
@@ -2303,18 +3345,22 @@ def check_json_shape(raw: str) -> tuple[str, object]:
     return "warn", parsed
 
 
-def main() -> int:
-    client = build_default_client()
+def run_probe(client) -> int:
+    """İki çağrılık asıl doğrulama. Gateway istisnalarını `main()`'e bırakır."""
     before = read_budget(config.BUDGET_PATH)
 
     print("1) İlk çağrı gönderiliyor...")
     raw = client.chat([{"role": "user", "content": PROBE}], stage=STAGE, temperature=0.0)
+    # İki çağrının gönderimlerini AYRI ölç: retry ile cache arızasını ancak
+    # bu ayırır (bkz. `diagnose_budget_delta`).
+    first_call_sends = client.sends_made
     print(f"   Ham yanıt:\n   {raw[:400]}\n")
 
     print("2) Aynı çağrı tekrar (cache'ten dönmeli)...")
     raw_again = client.chat(
         [{"role": "user", "content": PROBE}], stage=STAGE, temperature=0.0
     )
+    second_call_sends = client.sends_made - first_call_sends
 
     after = read_budget(config.BUDGET_PATH)
     ok = True
@@ -2325,11 +3371,15 @@ def main() -> int:
         print("   BAŞARISIZ: cache aynı yanıtı döndürmedi")
         ok = False
 
-    budget_ok, spent = check_budget_delta(before, after)
-    if budget_ok:
-        print("   TAMAM: bütçe tam olarak 1 arttı")
+    verdict, message = diagnose_budget_delta(
+        after - before, first_call_sends, second_call_sends
+    )
+    if verdict == "ok":
+        print(f"   TAMAM: {message}")
+    elif verdict == "warn":
+        print(f"   UYARI: {message}")
     else:
-        print(f"   BAŞARISIZ: bütçe {spent} arttı, 1 beklenirdi (cache çalışmıyor)")
+        print(f"   BAŞARISIZ: {message}")
         ok = False
 
     print("3) JSON ayrıştırma...")
@@ -2346,7 +3396,55 @@ def main() -> int:
 
     print(f"\nToplam gönderilen istek: {client.sends_made}")
     print(f"Log: {config.CALL_LOG_PATH}")
-    return 0 if ok else 1
+    return EXIT_OK if ok else EXIT_KONTROL_BASARISIZ
+
+
+def main() -> int:
+    """Tanı sarmalayıcısı.
+
+    Bu script projenin production `hakem-llm` sunucusuna İLK temasıdır ve onu
+    çoğunlukla anahtarı yeni export etmiş bir operatör koşar. Ham bir traceback
+    (eksik `APP_KEY_JAILBREAK`, dolmuş bütçe, açık devre kesici, bozuk bütçe
+    dosyası) tam da o anda en faydasız çıktıdır — hepsi anlaşılır bir Türkçe
+    tanı ve sıfırdan farklı bir çıkış koduna çevrilir.
+    """
+    try:
+        client = build_default_client()
+    except RuntimeError as exc:
+        print(f"BAŞARISIZ: gateway istemcisi kurulamadı.\n  {exc}", file=sys.stderr)
+        return EXIT_KOSULAMADI
+
+    try:
+        return run_probe(client)
+    except BudgetCorrupted as exc:
+        print(
+            f"BAŞARISIZ: bütçe dosyası okunamıyor — hiç istek atılmadı.\n  {exc}\n"
+            f"  Dosya: {config.BUDGET_PATH}\n"
+            "  Sayaç sıfırlanmış sayılmaz: dosyayı elle onar ya da bilinçli olarak sil.",
+            file=sys.stderr,
+        )
+    except BudgetExceeded as exc:
+        print(
+            f"BAŞARISIZ: çağrı bütçesi dolu — hiç istek atılmadı.\n  {exc}\n"
+            f"  Sayaç: {config.BUDGET_PATH}. Tavan yükseltilmez; "
+            "önceki koşuların harcamasını gözden geçir.",
+            file=sys.stderr,
+        )
+    except CircuitOpen as exc:
+        print(
+            f"BAŞARISIZ: devre kesici açık — koşu durduruldu.\n  {exc}\n"
+            "  Ortak production sunucusunu zorlamıyoruz. Sunucunun durumunu "
+            "kontrol et ve süreci yeniden başlat.",
+            file=sys.stderr,
+        )
+    except GatewayError as exc:
+        print(
+            f"BAŞARISIZ: gateway çağrısı başarısız oldu.\n  {exc}\n"
+            "  401/403 ise APP_KEY_JAILBREAK yanlış; 5xx ise sunucu şu an sorunlu.\n"
+            f"  Ayrıntılı log: {config.CALL_LOG_PATH}",
+            file=sys.stderr,
+        )
+    return EXIT_KOSULAMADI
 
 
 if __name__ == "__main__":
@@ -2354,10 +3452,17 @@ if __name__ == "__main__":
 ```
 
 `tests/test_smoke_gateway.py` bu dört saf fonksiyonu (`read_budget`,
-`check_cache_hit`, `check_budget_delta`, `check_json_shape`) doğrudan
+`check_cache_hit`, `diagnose_budget_delta`, `check_json_shape`) doğrudan
 çağırır — istemci, ağ veya anahtar gerektirmez — ve ayrıca `main()`'i sahte
 transport'lu gerçek bir `GatewayClient` ile (gerçek endpoint'e hiç
 dokunmadan) uçtan uca dener; `build_default_client` monkeypatch'lenir.
+Kapsanan uçtan uca senaryolar: her şeyin TAMAM olduğu koşu, JSON
+ayrıştırılamayan koşu, şekli farklı ama ayrışan JSON, **ilk çağrının retry
+ettiği koşu** (cache arızasıyla karıştırılmamalı), eksik anahtar ve dört
+gateway istisnasının her biri için tanı metni + çıkış kodu.
+
+Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_smoke_gateway.py -v`
+Expected: PASS, 27 passed
 
 - [ ] **Step 2: Anahtarı export et ve çalıştır — GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
 
@@ -2405,7 +3510,9 @@ Sonra gerçek koşu (1 istek/sn'de ~2 dakika):
 Run: `cd "/home/pc-8469/Asistant Axis" && uv run python scripts/00_generate_role_data.py`
 Expected: `Yazıldı: .../data/roles.json (120/120 rol, complete=True)`, `Gönderilen istek: 120`, çıkış kodu 0.
 
-Başarısız rol sayısı **10'u aşarsa** durup üretim promptunu gözden geçir — `hakem-llm` 40 soruluk JSON'u tutturamıyor olabilir; bu durumda soru sayısı 20'ye indirilip rol başına iki çağrıya bölünür (bütçe 130'a sığar: 120 değil 240 eder, o yüzden önce prompt düzeltmesi denenir). Bu durumda `produced < requested` olacağı için script `data/roles.partial.json`/`data/questions.partial.json` yazıp çıkış kodu 1 ile döner — kanonik dosyalar oluşmaz, `--allow-partial` bilerek verilmedikçe. (Bütçe/devre kesici koşuyu erken durdurduysa `attempted` da `requested`'tan küçük kalır ve `not_attempted` denenmemiş rolleri katalog sırasıyla listeler.)
+Üst üste **10** rolde ayrıştırma hatası olursa script **kendiliğinden durur** (`--max-parse-failures`, varsayılan 10) — bu artık elle uygulanan bir talimat değil, kodun uyguladığı bir kapıdır. Neden gerekli: gövdesi ayrışan ama kullanılamayan bir 200 taşıma devre kesicisini **sıfırlar**, yani `hakem-llm` istenen JSON'u üretemiyorsa aşama bütçesinin tamamı sıfır kayıt için yanardı.
+
+Bu durumda üretim promptunu gözden geçir — `hakem-llm` 40 soruluk JSON'u tutturamıyor olabilir; çare olarak soru sayısı 20'ye indirilip rol başına iki çağrıya bölünebilir (240 gönderim, 145'lik aşama bütçesine **sığmaz** — bu yüzden önce prompt düzeltmesi denenir, bütçe yükseltilmez). `produced < requested` olacağı için script `data/roles.partial.json`/`data/questions.partial.json` yazıp çıkış kodu 1 ile döner — kanonik dosyalar oluşmaz, `--allow-partial` bilerek verilmedikçe. (Bütçe/devre kesici koşuyu erken durdurduysa `attempted` da `requested`'tan küçük kalır ve `not_attempted` denenmemiş rolleri katalog sırasıyla listeler.)
 
 - [ ] **Step 7: Üretilen veriyi gözle kontrol et — GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
 
@@ -2427,20 +3534,29 @@ Expected: `complete=True`, açıklamalar rolle uyumlu, talimatlar "You are a…"
 
 ## Plan 1 Tamamlanma Kriterleri
 
-- [ ] `uv run --extra dev pytest tests/ -v` — hepsi geçiyor (102 test: config 4, gateway 27, judge 13, roles 13, generate_role_data 28, smoke_gateway 17), hiçbiri ağa çıkmıyor
-- [ ] `data/roles.json` — `{"complete": true, "requested": 120, "attempted": 120, "produced": 120, "not_attempted": [], "failed": [], "roles": [120 rol, her biri description + 3 talimat + 40 soru]}` — **GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÜRETİLMEDİ**
-- [ ] `data/questions.json` — `{"complete": true, "requested": 120, "attempted": 120, "produced": 120, "shared_questions": [40 ortak soru]}` — **GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÜRETİLMEDİ**
-- [ ] `data/gateway_budget.json` — toplam ≈ 121 gönderim (1 smoke + 120 Aşama 0) — **GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÜRETİLMEDİ**
-- [ ] `git status --short` temiz; `data/` commit edilmemiş
+- [ ] `uv run --extra dev pytest tests/ -v` — hepsi geçiyor (**176 test**: config 7, conftest_guard 5, gateway 52, judge 13, roles 13, generate_role_data 59, smoke_gateway 27), hiçbiri ağa çıkmıyor — ve bu artık disipline değil `tests/conftest.py`'deki soket kilidine dayanıyor
+- [ ] `data/roles.json` — `{"run_id": "…", "complete": true, "requested": 120, "attempted": 120, "produced": 120, "not_attempted": [], "failed": [], "roles": [120 rol, her biri description + 3 talimat + 40 soru]}` — **GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÜRETİLMEDİ**
+- [ ] `data/questions.json` — `{"run_id": "…", "complete": true, "requested": 120, "attempted": 120, "produced": 120, "seed": 20260804, "role_count": 120, "pool_size": 4800, "shared_questions": [40 ortak soru]}`; `run_id` `roles.json`'daki ile **aynı** olmalı — **GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÜRETİLMEDİ**
+- [ ] `data/gateway_budget.json` — toplam ≈ 121 gönderim (1 smoke + 120 Aşama 0); retry olduysa biraz daha fazla, aşama payları içinde kalmalı — **GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÜRETİLMEDİ**
+- [ ] `git status --short` temiz; `data/` commit edilmemiş, `uv.lock` commit edilmiş
 - [ ] Smoke testi adım 3 `TAMAM` — `hakem-llm` İngilizce JSON üretiyor — **GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
 
 Bu kriterlerin hepsi sağlandığında Plan 2'ye (Aşama 0.5 → 3, eksen çıkarımı ve A kriteri kararı) geçilir.
 
-> **Durum (bu ajanın yaptığı iş sonunda):** `scripts/01_smoke_gateway.py` yazıldı, karar
-> mantığı `tests/test_smoke_gateway.py` ile ağsız test edildi (102/102 test geçiyor) ve
-> commit edildi. Yukarıdaki `APP_KEY_JAILBREAK` işaretli kriterlerin hiçbiri bu ajan
-> tarafından sağlanmadı — anahtar bu ortamda export edilmemişti ve bilerek elde
-> edilmeye çalışılmadı. İnsan operatör anahtarı export ettikten sonra Task 5'in 2, 3,
-> 4, 6, 7 numaralı adımlarını (script'i gerçek endpoint'e karşı koşmak, sonra
-> `scripts/00_generate_role_data.py`'ı önce `--dry-run` sonra gerçek koşuyla çalıştırmak)
-> elle tamamlamalı.
+> **Durum (dal genelinde kod inceleme düzeltmeleri sonrası):** Plan 1'in tüm kodu
+> yazıldı ve **176/176 test geçiyor**, hiçbiri ağa çıkmıyor. Dal genelinde yapılan
+> incelemenin bulguları uygulandı: hız sınırlayıcı/semafor/devre kesici artık endpoint
+> başına süreç genelinde paylaşılıyor (C1); kesilen bir koşu üretilmiş işi kaybetmiyor
+> (I1); üst üste ayrıştırma hatasında koşu kapalı yönde duruyor (I2); `--dry-run`
+> harcanmış bütçeyi ve global tavanı okuyor (I3); Aşama 0 script'inin `main()`'i uçtan
+> uca test ediliyor (I4); bütçe tablosu spec ile hizalandı ve her aşamaya retry payı
+> verildi (I7+I8); artifact'lar `run_id` ile damgalanıyor (I10); test paketi soket
+> kilidiyle yapıya bağlandı (I11). Ayrıca: `api_key` repr sızıntısı, bütçe değer alanı,
+> boş backoff iddiaları, log şeması, artifact atomikliği, smoke tanıları ve `uv.lock`.
+>
+> Yukarıdaki `APP_KEY_JAILBREAK` işaretli kriterlerin hiçbiri hâlâ sağlanmadı — anahtar
+> bu ortamda export edilmemişti ve bilerek elde edilmeye çalışılmadı. **Bu kodun hiçbir
+> parçası canlı endpoint'e karşı koşmadı.** İnsan operatör anahtarı export ettikten
+> sonra Task 5'in 2, 3, 4, 6, 7 numaralı adımlarını (script'i gerçek endpoint'e karşı
+> koşmak, sonra `scripts/00_generate_role_data.py`'ı önce `--dry-run` sonra gerçek
+> koşuyla çalıştırmak) elle tamamlamalı.
