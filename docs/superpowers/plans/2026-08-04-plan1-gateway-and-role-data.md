@@ -210,8 +210,16 @@ Bu planın güvenlik açısından kritik parçası. Production sunucusunu koruya
   - `GatewayClient.chat(messages: list[dict], *, stage: str, temperature: float = 0.0, max_tokens: int = 1024) -> str`
   - `GatewayClient.would_call(messages, *, temperature=0.0, max_tokens=1024) -> bool` — cache miss mi? İstek atmaz.
   - `GatewayClient.sends_made: int`
-  - İstisnalar: `BudgetExceeded`, `CircuitOpen`, `GatewayError`
+  - `GatewayClient.close()` — taşıma katmanının kaynaklarını bırakır; `with GatewayClient(...) as client:` da desteklenir
+  - İstisnalar: `BudgetExceeded`, `BudgetCorrupted`, `CircuitOpen`, `GatewayError`
   - Transport tipi: `Callable[[dict], tuple[int, dict]]` — payload alır, `(status_code, json_body)` döner
+
+**Kapalı yönde (fail-closed) davranış — çağıran tarafın bilmesi gerekenler:**
+- `stage` `stage_budgets` içinde yoksa `ValueError` yükselir ve hiç istek gitmez. Yazım hatası yapan bir aşama adı alt bütçesiz kalıp global 1500'ü yiyemez.
+- Bütçe dosyası bozuk/JSON değil/sözlük değilse `BudgetCorrupted` yükselir; sayaç sıfır kabul edilmez.
+- Bütçe kontrolü + harcaması her denemede tek kilit altında yapılır; retry ortasında tavan dolarsa `BudgetExceeded` `GatewayError`'a dönüşmeden yükselir.
+- Retry yalnızca 429, 5xx ve taşıma istisnalarında yapılır. 4xx tek gönderimde biter.
+- Hız sınırlayıcı ve devre kesici süreç içidir; bütçe ise `fcntl.flock` ile korunan disk dosyasıdır (süreçler arası). İki süreç aynı anda koşarsa sunucuya 2 istek/sn gider.
 
 - [ ] **Step 1: Failing test'leri yaz**
 
@@ -219,10 +227,12 @@ Bu planın güvenlik açısından kritik parçası. Production sunucusunu koruya
 
 ```python
 import json
+import threading
 
 import pytest
 
 from aax.gateway import (
+    BudgetCorrupted,
     BudgetExceeded,
     CircuitOpen,
     GatewayClient,
@@ -232,18 +242,40 @@ from aax.gateway import (
 
 
 class FakeClock:
-    """Testlerin gerçek zamanda beklememesi için enjekte edilen saat."""
+    """Testlerin gerçek zamanda beklememesi için enjekte edilen saat.
+
+    Çok iş parçacıklı testlerde de kullanıldığı için mutasyonlar kilitlidir.
+    """
 
     def __init__(self) -> None:
         self.now = 0.0
         self.slept: list[float] = []
+        self._lock = threading.Lock()
 
     def monotonic(self) -> float:
         return self.now
 
     def sleep(self, seconds: float) -> None:
-        self.slept.append(seconds)
-        self.now += seconds
+        with self._lock:
+            self.slept.append(seconds)
+            self.now += seconds
+
+
+class SahteAgHatasi(OSError):
+    """Gerçek transport'un fırlatabileceği ağ hatasını taklit eder."""
+
+
+class KapanabilirTransport:
+    """`close()` sunan sahte transport — kaynak bırakmayı doğrulamak için."""
+
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def __call__(self, payload):
+        return 200, ok_body()
+
+    def close(self) -> None:
+        self.closed += 1
 
 
 def ok_body(text: str = "merhaba"):
@@ -274,6 +306,20 @@ def make_client(tmp_path, transport, *, global_budget=10, stage_budget=10, rps=1
         sleep=clock.sleep,
     )
     return client, clock
+
+
+def budget_counts(tmp_path) -> dict:
+    return json.loads((tmp_path / "budget.json").read_text(encoding="utf-8"))
+
+
+def run_in_threads(targets):
+    """Verilen çağrılabilirleri paralel çalıştır, hepsinin bitmesini bekle."""
+    threads = [threading.Thread(target=target) for target in targets]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads), "iş parçacıkları takıldı"
 
 
 MSG = [{"role": "user", "content": "selam"}]
@@ -332,6 +378,46 @@ def test_budget_persists_across_client_instances(tmp_path):
     client_b.chat([{"role": "user", "content": "b"}], stage="test")
     with pytest.raises(BudgetExceeded):
         client_b.chat([{"role": "user", "content": "c"}], stage="test")
+
+    assert budget_counts(tmp_path) == {"test": 2}
+    assert list(tmp_path.glob(".budget-*")) == [], "atomik yazımdan artık kalmamalı"
+
+
+def test_retry_storm_never_exceeds_global_budget(tmp_path):
+    """Kritik: kalıcı sayaç tavanı retry fırtınasında bile aşmamalı.
+
+    Eski kod bütçeyi döngü ÖNCESİ bir kez kontrol edip her denemede harcıyordu;
+    global_budget=2 ile 3 gönderim yapıp diske {'test': 3} yazıyordu.
+    """
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 500, {"error": "bozuk"}
+
+    client, _ = make_client(tmp_path, transport, global_budget=2, stage_budget=99)
+
+    with pytest.raises(BudgetExceeded):
+        client.chat(MSG, stage="test")
+
+    assert len(calls) == 2, "tavan 2 iken 2'den fazla gönderim olmamalı"
+    assert client.sends_made == 2
+    counts = budget_counts(tmp_path)
+    assert sum(counts.values()) == 2, f"diskteki sayaç tavanı aştı: {counts}"
+
+
+def test_stage_budget_also_holds_mid_retry(tmp_path):
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 503, {"error": "mesgul"}
+
+    client, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=2)
+    with pytest.raises(BudgetExceeded):
+        client.chat(MSG, stage="test")
+    assert len(calls) == 2
+    assert budget_counts(tmp_path)["test"] == 2
 
 
 def test_cache_hit_avoids_second_request(tmp_path):
@@ -438,7 +524,249 @@ def test_retries_on_429_then_succeeds(tmp_path):
     assert client.chat(MSG, stage="test") == "nihayet"
     assert attempts["n"] == 2
     assert client.sends_made == 2, "retry de bütçeden sayılmalı"
+    assert budget_counts(tmp_path)["test"] == 2, "tavanı zorlayan sayaç disktekidir"
     assert clock.slept, "retry öncesi backoff uygulanmalı"
+
+
+def test_client_error_status_is_not_retried(tmp_path):
+    """401/400/404 retry ile düzelmez: tek gönderim, ama hata olarak sayılır."""
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 401, {"error": "yetkisiz"}
+
+    client, clock = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+
+    with pytest.raises(GatewayError):
+        client.chat([{"role": "user", "content": "a"}], stage="test")
+    assert len(calls) == 1, "başarısız olacağı kesin istek yeniden denenmemeli"
+    assert client.sends_made == 1
+    assert budget_counts(tmp_path)["test"] == 1
+    assert clock.slept == [], "backoff beklemesi olmamalı"
+
+    with pytest.raises(GatewayError):
+        client.chat([{"role": "user", "content": "b"}], stage="test")
+    with pytest.raises(GatewayError):
+        client.chat([{"role": "user", "content": "c"}], stage="test")
+    with pytest.raises(CircuitOpen):
+        client.chat([{"role": "user", "content": "d"}], stage="test")
+    assert len(calls) == 3
+
+
+def test_transport_exception_is_retried_and_logged(tmp_path):
+    """Taşıma istisnası (ağ hatası) log'lanmalı ve yeniden denenmeli."""
+    attempts = {"n": 0}
+
+    def transport(payload):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise SahteAgHatasi("sunucuya ulasilamadi")
+        return 200, ok_body("nihayet")
+
+    client, clock = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    assert client.chat(MSG, stage="test") == "nihayet"
+    assert attempts["n"] == 3
+    assert client.sends_made == 3, "istisna atan gönderim de bütçeden sayılmalı"
+    assert budget_counts(tmp_path)["test"] == 3
+    assert clock.slept, "istisna sonrası backoff uygulanmalı"
+
+    lines = (tmp_path / "calls.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 3, "her deneme için bir log satırı olmalı"
+    first = json.loads(lines[0])
+    assert first["status"] is None
+    assert first["error"] == "SahteAgHatasi"
+
+
+def test_transport_exception_opens_circuit(tmp_path):
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        raise SahteAgHatasi("sunucuya ulasilamadi")
+
+    client, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    for i in range(3):
+        with pytest.raises(GatewayError):
+            client.chat([{"role": "user", "content": f"m{i}"}], stage="test")
+
+    sends_before = len(calls)
+    with pytest.raises(CircuitOpen):
+        client.chat([{"role": "user", "content": "sonraki"}], stage="test")
+    assert len(calls) == sends_before, "devre açıkken hiç istek gitmemeli"
+
+
+def test_malformed_200_body_counts_as_failure(tmp_path):
+    """HTTP 200 ama gövde bozuk: sonsuza dek çağrılmamalı, devre açılmalı."""
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 200, {"tuhaf": "govde"}
+
+    client, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    for i in range(3):
+        with pytest.raises(GatewayError):
+            client.chat([{"role": "user", "content": f"m{i}"}], stage="test")
+    assert len(calls) == 3, "şekil hatası yeniden denenmemeli"
+
+    with pytest.raises(CircuitOpen):
+        client.chat([{"role": "user", "content": "sonraki"}], stage="test")
+    assert len(calls) == 3
+
+
+def test_unknown_stage_is_rejected_before_sending(tmp_path):
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport)
+    with pytest.raises(ValueError):
+        client.chat(MSG, stage="tesst")
+    assert calls == [], "tanımsız aşama tek bir istek bile atmamalı"
+
+
+def test_truncated_budget_file_is_fatal(tmp_path):
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=2, stage_budget=99)
+    # Yazım ortasında çökmüş gibi kırpılmış dosya
+    (tmp_path / "budget.json").write_text('{"test": 14', encoding="utf-8")
+
+    with pytest.raises(BudgetCorrupted):
+        client.chat(MSG, stage="test")
+    assert calls == [], "bozuk bütçe dosyası sayacı sıfırlamış sayılmamalı"
+
+
+def test_non_dict_budget_file_is_fatal(tmp_path):
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=2, stage_budget=99)
+    (tmp_path / "budget.json").write_text("null", encoding="utf-8")
+
+    with pytest.raises(BudgetCorrupted):
+        client.chat(MSG, stage="test")
+    assert calls == []
+
+
+def test_concurrent_callers_never_exceed_global_budget(tmp_path):
+    guard = threading.Lock()
+    calls = []
+
+    def transport(payload):
+        with guard:
+            calls.append(payload)
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=5, stage_budget=99)
+
+    raised: list[BaseException] = []
+
+    def worker(index):
+        def run():
+            try:
+                client.chat([{"role": "user", "content": f"m{index}"}], stage="test")
+            except BaseException as exc:  # noqa: BLE001 — testte sınıfı doğruluyoruz
+                with guard:
+                    raised.append(exc)
+
+        return run
+
+    run_in_threads([worker(i) for i in range(12)])
+
+    assert len(calls) == 5, f"eşzamanlı çağrılar tavanı deldi: {len(calls)}"
+    assert budget_counts(tmp_path) == {"test": 5}
+    assert len(raised) == 7
+    assert all(isinstance(exc, BudgetExceeded) for exc in raised), raised
+
+
+def test_concurrent_sends_never_exceed_max_concurrency(tmp_path):
+    state = {"in_flight": 0, "max_in_flight": 0}
+    guard = threading.Lock()
+    # İkili buluşma noktası: aynı anda 2 gönderim olamıyorsa burada kırılır.
+    pair = threading.Barrier(2, timeout=10.0)
+
+    def transport(payload):
+        with guard:
+            state["in_flight"] += 1
+            state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+        try:
+            pair.wait()
+        finally:
+            with guard:
+                state["in_flight"] -= 1
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+
+    raised: list[BaseException] = []
+
+    def worker(index):
+        def run():
+            try:
+                client.chat([{"role": "user", "content": f"m{index}"}], stage="test")
+            except BaseException as exc:  # noqa: BLE001
+                with guard:
+                    raised.append(exc)
+
+        return run
+
+    run_in_threads([worker(i) for i in range(4)])
+
+    assert raised == [], f"eşzamanlı çağrılar hata verdi: {raised}"
+    assert state["max_in_flight"] == 2, (
+        f"aynı anda uçuşta olan istek sayısı 2 olmalı, görülen: {state['max_in_flight']}"
+    )
+
+
+def test_shared_budget_file_survives_concurrent_clients(tmp_path):
+    """İki ayrı istemci aynı bütçe dosyasını paylaşır: kayıp güncelleme olmamalı.
+
+    `self._lock` istemci başınadır; süreçler arası korumayı `fcntl.flock`
+    sağlar. flock kilitleri açık dosya tanımına bağlıdır, bu yüzden aynı süreç
+    içindeki iki ayrı `open()` de birbirini bekler.
+    """
+    guard = threading.Lock()
+    calls = []
+
+    def transport(payload):
+        with guard:
+            calls.append(payload)
+        return 200, ok_body()
+
+    client_a, _ = make_client(tmp_path, transport, global_budget=6, stage_budget=99)
+    client_b, _ = make_client(tmp_path, transport, global_budget=6, stage_budget=99)
+
+    raised: list[BaseException] = []
+
+    def worker(index):
+        client = client_a if index % 2 == 0 else client_b
+
+        def run():
+            try:
+                client.chat([{"role": "user", "content": f"m{index}"}], stage="test")
+            except BaseException as exc:  # noqa: BLE001
+                with guard:
+                    raised.append(exc)
+
+        return run
+
+    run_in_threads([worker(i) for i in range(14)])
+
+    assert len(calls) == 6, f"paylaşılan tavan delindi: {len(calls)}"
+    assert budget_counts(tmp_path) == {"test": 6}, "kayıp güncelleme var"
+    assert len(raised) == 8
+    assert all(isinstance(exc, BudgetExceeded) for exc in raised), raised
 
 
 def test_rate_limiter_spaces_requests(tmp_path):
@@ -478,6 +806,27 @@ def test_api_key_never_appears_in_cache_files(tmp_path):
     for path in (tmp_path / "cache").rglob("*"):
         if path.is_file():
             assert "test-key" not in path.read_text()
+
+
+def test_close_releases_transport_and_context_manager_works(tmp_path):
+    transport = KapanabilirTransport()
+    client, _ = make_client(tmp_path, transport)
+
+    with client as entered:
+        assert entered is client
+        assert client.chat(MSG, stage="test") == "merhaba"
+    assert transport.closed == 1, "context manager çıkışında transport kapanmalı"
+
+    client.close()
+    assert transport.closed == 2, "close() tekrar çağrılabilir olmalı"
+
+
+def test_close_is_noop_for_plain_callable_transport(tmp_path):
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport)
+    client.close()  # close()'u olmayan transport ile de patlamamalı
 ```
 
 - [ ] **Step 2: Test'lerin başarısız olduğunu doğrula**
@@ -494,17 +843,33 @@ Bu modül dışarı giden TEK HTTP noktasıdır. Hız sınırlama, disk cache'i,
 kalıcı bütçe ve devre kesici burada kapalıdır; çağıran taraf hiçbirini bilmez.
 
 Bütçe her HTTP gönderimini sayar (retry'lar dahil) — retry'ların tavanı
-gizlice aşamaması için bilinçli olarak muhafazakâr.
+gizlice aşamaması için bilinçli olarak muhafazakâr. Bütçe kontrolü ve harcaması
+HER denemede aynı kilit bloğunda yapılır; tavan aşılırsa retry döngüsünün
+ortasında bile `BudgetExceeded` yükselir ve `GatewayError` içine yutulmaz.
+
+Kapsam farkı — bilerek böyle:
+
+* **Bütçe disktedir ve süreçler arasıdır.** `fcntl.flock` ile korunan
+  oku-değiştir-yaz sayesinde aynı `budget_path`'i paylaşan farklı istemciler
+  (ve farklı süreçler) birbirinin güncellemesini ezmez. Tavan globaldir.
+* **Hız sınırlayıcı ve devre kesici süreç içi bellektedir.** Yani aynı anda
+  iki ayrı süreç çalıştırırsan sunucuya giden hız 1 değil 2 istek/sn olur ve
+  devre kesici süreçler arası paylaşılmaz. Ortak vLLM sunucusunu koruyan tek
+  sert garanti bütçedir; koşuları tek süreçte tut.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable, Iterator
 
 Transport = Callable[[dict], tuple[int, dict]]
 
@@ -515,6 +880,14 @@ class GatewayError(RuntimeError):
 
 class BudgetExceeded(RuntimeError):
     """Aşama veya global çağrı tavanı doldu."""
+
+
+class BudgetCorrupted(RuntimeError):
+    """Bütçe dosyası okunamıyor — sayaç sıfırlanmış sayılamaz.
+
+    Bütçe koruması kapalı yönde (fail-closed) hata verir: bozuk dosyayı boş
+    sözlük kabul etmek 1500'lük tavanı sessizce kaldırırdı.
+    """
 
 
 class CircuitOpen(RuntimeError):
@@ -535,22 +908,30 @@ class GatewayConfig:
     timeout_seconds: float = 120.0
 
 
-def _httpx_transport(base_url: str, api_key: str, timeout: float) -> Transport:
-    import httpx
+class _HttpxTransport:
+    """Gerçek HTTP taşıması. `close()` ile bağlantı havuzu kapatılır."""
 
-    url = f"{base_url.rstrip('/')}/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    client = httpx.Client(timeout=timeout)
+    def __init__(self, base_url: str, api_key: str, timeout: float) -> None:
+        import httpx
 
-    def send(payload: dict) -> tuple[int, dict]:
-        response = client.post(url, json=payload, headers=headers)
+        self._url = f"{base_url.rstrip('/')}/v1/chat/completions"
+        self._headers = {"Authorization": f"Bearer {api_key}"}
+        self._client = httpx.Client(timeout=timeout)
+
+    def __call__(self, payload: dict) -> tuple[int, dict]:
+        response = self._client.post(self._url, json=payload, headers=self._headers)
         try:
             body = response.json()
         except ValueError:
             body = {"error": response.text[:500]}
         return response.status_code, body
 
-    return send
+    def close(self) -> None:
+        self._client.close()
+
+
+def _httpx_transport(base_url: str, api_key: str, timeout: float) -> Transport:
+    return _HttpxTransport(base_url, api_key, timeout)
 
 
 class GatewayClient:
@@ -585,6 +966,20 @@ class GatewayClient:
         self._consecutive_failures = 0
         self._circuit_open = False
         self.sends_made = 0
+
+    # --- yaşam döngüsü ---------------------------------------------------
+
+    def close(self) -> None:
+        """Taşıma katmanının kaynaklarını bırak. Birden fazla çağrı güvenli."""
+        closer = getattr(self._transport, "close", None)
+        if callable(closer):
+            closer()
+
+    def __enter__(self) -> "GatewayClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     # --- payload ve cache anahtarı -------------------------------------
 
@@ -621,31 +1016,99 @@ class GatewayClient:
 
     # --- bütçe ----------------------------------------------------------
 
+    @contextmanager
+    def _budget_file_lock(self) -> Iterator[None]:
+        """Bütçe dosyası için süreçler arası karşılıklı dışlama.
+
+        Kilit `budget.json` üzerinde değil, yanındaki `.lock` dosyası üzerinde
+        tutulur: bütçe dosyası her yazımda `os.replace` ile değiştiği için
+        (inode değişir) onun üzerindeki flock süreçler arası anlamını
+        kaybederdi. Ayrı ve hiç yer değiştirmeyen bir kilit dosyası şart.
+        """
+        lock_path = self.budget_path.with_name(self.budget_path.name + ".lock")
+        handle = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            os.close(handle)
+
     def _read_budget(self) -> dict[str, int]:
+        """Bütçe sayaçlarını oku. Bozuk dosya ÖLÜMCÜLDÜR, sıfır değildir."""
         if not self.budget_path.exists():
             return {}
+        raw = self.budget_path.read_text(encoding="utf-8")
         try:
-            return json.loads(self.budget_path.read_text(encoding="utf-8"))
-        except ValueError:
-            return {}
+            counts = json.loads(raw)
+        except ValueError as exc:
+            raise BudgetCorrupted(
+                f"Bütçe dosyası ayrıştırılamadı: {self.budget_path}. "
+                "Sayaç sıfırlanmış sayılmaz — dosyayı elle onar veya bilinçli olarak sil."
+            ) from exc
+        if not isinstance(counts, dict) or not all(
+            isinstance(key, str) and isinstance(value, int) for key, value in counts.items()
+        ):
+            raise BudgetCorrupted(
+                f"Bütçe dosyası beklenen şekilde değil (str->int sözlük): {self.budget_path}."
+            )
+        return counts
 
-    def _check_budget(self, stage: str) -> None:
-        counts = self._read_budget()
+    def _write_budget(self, counts: dict[str, int]) -> None:
+        """Atomik yazım: geçici dosya + `os.replace`.
+
+        Yazım ortasında çökme `budget.json`'ı kırpamaz; ya eski ya yeni içerik
+        görünür. Kırpılmış dosya tavanı sessizce sıfırlardı.
+        """
+        directory = self.budget_path.parent
+        fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=".budget-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(counts, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, self.budget_path)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+
+    def _assert_budget_available(self, stage: str, counts: dict[str, int]) -> None:
+        stage_cap = self.config.stage_budgets.get(stage)
+        if stage_cap is None:
+            # Kapalı yönde hata: tanımsız aşama adı (tipik olarak yazım hatası)
+            # alt bütçesiz kalıp global 1500'ün tamamını yiyebilirdi.
+            raise ValueError(
+                f"Bilinmeyen aşama adı: {stage!r}. "
+                f"Tanımlı aşamalar: {sorted(self.config.stage_budgets)}"
+            )
         total = sum(counts.values())
         if total >= self.config.global_budget:
             raise BudgetExceeded(
                 f"Global bütçe doldu: {total}/{self.config.global_budget}"
             )
-        stage_cap = self.config.stage_budgets.get(stage)
-        if stage_cap is not None and counts.get(stage, 0) >= stage_cap:
+        if counts.get(stage, 0) >= stage_cap:
             raise BudgetExceeded(
                 f"'{stage}' aşama bütçesi doldu: {counts.get(stage, 0)}/{stage_cap}"
             )
 
-    def _spend_budget(self, stage: str) -> None:
-        counts = self._read_budget()
-        counts[stage] = counts.get(stage, 0) + 1
-        self.budget_path.write_text(json.dumps(counts, indent=2), encoding="utf-8")
+    def _check_budget(self, stage: str) -> None:
+        """Salt okunur ön kontrol — ilk gönderimden önce hızlı hata için."""
+        with self._budget_file_lock():
+            self._assert_budget_available(stage, self._read_budget())
+
+    def _check_and_spend_budget(self, stage: str) -> None:
+        """Kontrol ve harcamayı AYNI kilit altında yap.
+
+        İkisini ayırmak tavanı delerdi: retry döngüsünde her deneme kontrolsüz
+        harcarsa tek iş parçacığı bile tavanı `max_retries - 1` kadar aşar.
+        """
+        with self._budget_file_lock():
+            counts = self._read_budget()
+            self._assert_budget_available(stage, counts)
+            counts[stage] = counts.get(stage, 0) + 1
+            self._write_budget(counts)
 
     # --- hız sınırlama --------------------------------------------------
 
@@ -656,6 +1119,25 @@ class GatewayClient:
             if elapsed < min_interval:
                 self._sleep(min_interval - elapsed)
         self._last_send_at = self._monotonic()
+
+    # --- devre kesici ----------------------------------------------------
+
+    def _record_failure(self) -> None:
+        with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.config.circuit_threshold:
+                self._circuit_open = True
+
+    @staticmethod
+    def _is_retriable(status: int | None) -> bool:
+        """Yalnızca 429 ve 5xx yeniden denenir.
+
+        401/400/404 gibi durumlar retry ile düzelmez; üç kez denemek hem bütçe
+        yakar hem ortak sunucuya boşuna yük bindirir.
+        """
+        if status is None:  # taşıma istisnası — geçici kabul edilir
+            return True
+        return status == 429 or 500 <= status < 600
 
     # --- log ------------------------------------------------------------
 
@@ -695,53 +1177,71 @@ class GatewayClient:
                     f"Devre kesici açık ({self.config.circuit_threshold} ardışık hata). "
                     "Koşu durduruldu — sunucuyu zorlamıyoruz."
                 )
+            # Ön kontrol: tavan zaten doluysa tek bir gönderim bile yapmadan çık.
             self._check_budget(stage)
 
-        last_status = None
+        last_status: int | None = None
         last_body: dict = {}
+        last_error: BaseException | None = None
 
         for attempt in range(self.config.max_retries):
             with self._semaphore:
                 with self._lock:
                     self._wait_for_slot()
-                    self._spend_budget(stage)
+                    # Her denemede yeniden kontrol + harcama, tek kilit altında.
+                    # Buradan çıkan BudgetExceeded bilinçli olarak yakalanmaz:
+                    # retry ortasında bile GatewayError'a dönüşmeden yükselir.
+                    self._check_and_spend_budget(stage)
                     self.sends_made += 1
                 started = self._monotonic()
-                status, body = self._transport(payload)
+                try:
+                    status, body = self._transport(payload)
+                except Exception as exc:  # ağ/zaman aşımı/havuz hataları
+                    transport_error: BaseException | None = exc
+                    status, body = None, {}
+                else:
+                    transport_error = None
                 latency = self._monotonic() - started
 
             usage = body.get("usage", {}) if isinstance(body, dict) else {}
-            self._log(
-                {
-                    "stage": stage,
-                    "status": status,
-                    "cached": False,
-                    "attempt": attempt + 1,
-                    "latency": latency,
-                    "prompt_tokens": usage.get("prompt_tokens"),
-                    "completion_tokens": usage.get("completion_tokens"),
-                }
-            )
+            entry = {
+                "stage": stage,
+                "status": status,
+                "cached": False,
+                "attempt": attempt + 1,
+                "latency": latency,
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+            }
+            if transport_error is not None:
+                entry["error"] = type(transport_error).__name__
+            self._log(entry)
 
-            if status == 200:
+            if transport_error is None and status == 200:
                 try:
                     content = body["choices"][0]["message"]["content"]
                 except (KeyError, IndexError, TypeError) as exc:
+                    # Bozuk gövdeli 200 de bir hatadır: saymazsak sunucu
+                    # sonsuza dek çağrılıp bütçeyi yakar, devre hiç açılmaz.
+                    self._record_failure()
                     raise GatewayError(f"Beklenmeyen yanıt şekli: {body}") from exc
                 with self._lock:
                     self._consecutive_failures = 0
                 self._cache_write(key, content)
                 return content
 
-            last_status, last_body = status, body
+            last_status, last_body, last_error = status, body, transport_error
+
+            if not self._is_retriable(status):
+                break
             if attempt + 1 < self.config.max_retries:
                 self._sleep(2.0 ** attempt)
 
-        with self._lock:
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= self.config.circuit_threshold:
-                self._circuit_open = True
-
+        self._record_failure()
+        if last_error is not None:
+            raise GatewayError(
+                f"Taşıma katmanı hatası ({type(last_error).__name__}): {last_error}"
+            ) from last_error
         raise GatewayError(f"Çağrı başarısız (HTTP {last_status}): {last_body}")
 
 
@@ -756,7 +1256,9 @@ def build_default_client(stage_budgets: dict[str, int] | None = None) -> Gateway
         requests_per_second=cfg.RATE_LIMIT_RPS,
         max_concurrency=cfg.MAX_CONCURRENCY,
         global_budget=cfg.GLOBAL_BUDGET,
-        stage_budgets=stage_budgets or cfg.STAGE_BUDGETS,
+        # Bilinçli olarak `is None`: açıkça verilen boş sözlük "hiçbir aşamaya
+        # izin yok" demektir, "varsayılana dön" değil.
+        stage_budgets=cfg.STAGE_BUDGETS if stage_budgets is None else stage_budgets,
         max_retries=cfg.MAX_RETRIES,
         circuit_threshold=cfg.CIRCUIT_THRESHOLD,
     )
@@ -771,7 +1273,7 @@ def build_default_client(stage_budgets: dict[str, int] | None = None) -> Gateway
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
 Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_gateway.py -v`
-Expected: PASS, 13 passed
+Expected: PASS, 27 passed
 
 - [ ] **Step 5: Hiçbir testin ağa çıkmadığını doğrula**
 

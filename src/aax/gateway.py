@@ -4,17 +4,33 @@ Bu modül dışarı giden TEK HTTP noktasıdır. Hız sınırlama, disk cache'i,
 kalıcı bütçe ve devre kesici burada kapalıdır; çağıran taraf hiçbirini bilmez.
 
 Bütçe her HTTP gönderimini sayar (retry'lar dahil) — retry'ların tavanı
-gizlice aşamaması için bilinçli olarak muhafazakâr.
+gizlice aşamaması için bilinçli olarak muhafazakâr. Bütçe kontrolü ve harcaması
+HER denemede aynı kilit bloğunda yapılır; tavan aşılırsa retry döngüsünün
+ortasında bile `BudgetExceeded` yükselir ve `GatewayError` içine yutulmaz.
+
+Kapsam farkı — bilerek böyle:
+
+* **Bütçe disktedir ve süreçler arasıdır.** `fcntl.flock` ile korunan
+  oku-değiştir-yaz sayesinde aynı `budget_path`'i paylaşan farklı istemciler
+  (ve farklı süreçler) birbirinin güncellemesini ezmez. Tavan globaldir.
+* **Hız sınırlayıcı ve devre kesici süreç içi bellektedir.** Yani aynı anda
+  iki ayrı süreç çalıştırırsan sunucuya giden hız 1 değil 2 istek/sn olur ve
+  devre kesici süreçler arası paylaşılmaz. Ortak vLLM sunucusunu koruyan tek
+  sert garanti bütçedir; koşuları tek süreçte tut.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable, Iterator
 
 Transport = Callable[[dict], tuple[int, dict]]
 
@@ -25,6 +41,14 @@ class GatewayError(RuntimeError):
 
 class BudgetExceeded(RuntimeError):
     """Aşama veya global çağrı tavanı doldu."""
+
+
+class BudgetCorrupted(RuntimeError):
+    """Bütçe dosyası okunamıyor — sayaç sıfırlanmış sayılamaz.
+
+    Bütçe koruması kapalı yönde (fail-closed) hata verir: bozuk dosyayı boş
+    sözlük kabul etmek 1500'lük tavanı sessizce kaldırırdı.
+    """
 
 
 class CircuitOpen(RuntimeError):
@@ -45,22 +69,30 @@ class GatewayConfig:
     timeout_seconds: float = 120.0
 
 
-def _httpx_transport(base_url: str, api_key: str, timeout: float) -> Transport:
-    import httpx
+class _HttpxTransport:
+    """Gerçek HTTP taşıması. `close()` ile bağlantı havuzu kapatılır."""
 
-    url = f"{base_url.rstrip('/')}/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    client = httpx.Client(timeout=timeout)
+    def __init__(self, base_url: str, api_key: str, timeout: float) -> None:
+        import httpx
 
-    def send(payload: dict) -> tuple[int, dict]:
-        response = client.post(url, json=payload, headers=headers)
+        self._url = f"{base_url.rstrip('/')}/v1/chat/completions"
+        self._headers = {"Authorization": f"Bearer {api_key}"}
+        self._client = httpx.Client(timeout=timeout)
+
+    def __call__(self, payload: dict) -> tuple[int, dict]:
+        response = self._client.post(self._url, json=payload, headers=self._headers)
         try:
             body = response.json()
         except ValueError:
             body = {"error": response.text[:500]}
         return response.status_code, body
 
-    return send
+    def close(self) -> None:
+        self._client.close()
+
+
+def _httpx_transport(base_url: str, api_key: str, timeout: float) -> Transport:
+    return _HttpxTransport(base_url, api_key, timeout)
 
 
 class GatewayClient:
@@ -95,6 +127,20 @@ class GatewayClient:
         self._consecutive_failures = 0
         self._circuit_open = False
         self.sends_made = 0
+
+    # --- yaşam döngüsü ---------------------------------------------------
+
+    def close(self) -> None:
+        """Taşıma katmanının kaynaklarını bırak. Birden fazla çağrı güvenli."""
+        closer = getattr(self._transport, "close", None)
+        if callable(closer):
+            closer()
+
+    def __enter__(self) -> "GatewayClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     # --- payload ve cache anahtarı -------------------------------------
 
@@ -131,31 +177,99 @@ class GatewayClient:
 
     # --- bütçe ----------------------------------------------------------
 
+    @contextmanager
+    def _budget_file_lock(self) -> Iterator[None]:
+        """Bütçe dosyası için süreçler arası karşılıklı dışlama.
+
+        Kilit `budget.json` üzerinde değil, yanındaki `.lock` dosyası üzerinde
+        tutulur: bütçe dosyası her yazımda `os.replace` ile değiştiği için
+        (inode değişir) onun üzerindeki flock süreçler arası anlamını
+        kaybederdi. Ayrı ve hiç yer değiştirmeyen bir kilit dosyası şart.
+        """
+        lock_path = self.budget_path.with_name(self.budget_path.name + ".lock")
+        handle = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            os.close(handle)
+
     def _read_budget(self) -> dict[str, int]:
+        """Bütçe sayaçlarını oku. Bozuk dosya ÖLÜMCÜLDÜR, sıfır değildir."""
         if not self.budget_path.exists():
             return {}
+        raw = self.budget_path.read_text(encoding="utf-8")
         try:
-            return json.loads(self.budget_path.read_text(encoding="utf-8"))
-        except ValueError:
-            return {}
+            counts = json.loads(raw)
+        except ValueError as exc:
+            raise BudgetCorrupted(
+                f"Bütçe dosyası ayrıştırılamadı: {self.budget_path}. "
+                "Sayaç sıfırlanmış sayılmaz — dosyayı elle onar veya bilinçli olarak sil."
+            ) from exc
+        if not isinstance(counts, dict) or not all(
+            isinstance(key, str) and isinstance(value, int) for key, value in counts.items()
+        ):
+            raise BudgetCorrupted(
+                f"Bütçe dosyası beklenen şekilde değil (str->int sözlük): {self.budget_path}."
+            )
+        return counts
 
-    def _check_budget(self, stage: str) -> None:
-        counts = self._read_budget()
+    def _write_budget(self, counts: dict[str, int]) -> None:
+        """Atomik yazım: geçici dosya + `os.replace`.
+
+        Yazım ortasında çökme `budget.json`'ı kırpamaz; ya eski ya yeni içerik
+        görünür. Kırpılmış dosya tavanı sessizce sıfırlardı.
+        """
+        directory = self.budget_path.parent
+        fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=".budget-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(counts, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, self.budget_path)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+
+    def _assert_budget_available(self, stage: str, counts: dict[str, int]) -> None:
+        stage_cap = self.config.stage_budgets.get(stage)
+        if stage_cap is None:
+            # Kapalı yönde hata: tanımsız aşama adı (tipik olarak yazım hatası)
+            # alt bütçesiz kalıp global 1500'ün tamamını yiyebilirdi.
+            raise ValueError(
+                f"Bilinmeyen aşama adı: {stage!r}. "
+                f"Tanımlı aşamalar: {sorted(self.config.stage_budgets)}"
+            )
         total = sum(counts.values())
         if total >= self.config.global_budget:
             raise BudgetExceeded(
                 f"Global bütçe doldu: {total}/{self.config.global_budget}"
             )
-        stage_cap = self.config.stage_budgets.get(stage)
-        if stage_cap is not None and counts.get(stage, 0) >= stage_cap:
+        if counts.get(stage, 0) >= stage_cap:
             raise BudgetExceeded(
                 f"'{stage}' aşama bütçesi doldu: {counts.get(stage, 0)}/{stage_cap}"
             )
 
-    def _spend_budget(self, stage: str) -> None:
-        counts = self._read_budget()
-        counts[stage] = counts.get(stage, 0) + 1
-        self.budget_path.write_text(json.dumps(counts, indent=2), encoding="utf-8")
+    def _check_budget(self, stage: str) -> None:
+        """Salt okunur ön kontrol — ilk gönderimden önce hızlı hata için."""
+        with self._budget_file_lock():
+            self._assert_budget_available(stage, self._read_budget())
+
+    def _check_and_spend_budget(self, stage: str) -> None:
+        """Kontrol ve harcamayı AYNI kilit altında yap.
+
+        İkisini ayırmak tavanı delerdi: retry döngüsünde her deneme kontrolsüz
+        harcarsa tek iş parçacığı bile tavanı `max_retries - 1` kadar aşar.
+        """
+        with self._budget_file_lock():
+            counts = self._read_budget()
+            self._assert_budget_available(stage, counts)
+            counts[stage] = counts.get(stage, 0) + 1
+            self._write_budget(counts)
 
     # --- hız sınırlama --------------------------------------------------
 
@@ -166,6 +280,25 @@ class GatewayClient:
             if elapsed < min_interval:
                 self._sleep(min_interval - elapsed)
         self._last_send_at = self._monotonic()
+
+    # --- devre kesici ----------------------------------------------------
+
+    def _record_failure(self) -> None:
+        with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.config.circuit_threshold:
+                self._circuit_open = True
+
+    @staticmethod
+    def _is_retriable(status: int | None) -> bool:
+        """Yalnızca 429 ve 5xx yeniden denenir.
+
+        401/400/404 gibi durumlar retry ile düzelmez; üç kez denemek hem bütçe
+        yakar hem ortak sunucuya boşuna yük bindirir.
+        """
+        if status is None:  # taşıma istisnası — geçici kabul edilir
+            return True
+        return status == 429 or 500 <= status < 600
 
     # --- log ------------------------------------------------------------
 
@@ -205,53 +338,71 @@ class GatewayClient:
                     f"Devre kesici açık ({self.config.circuit_threshold} ardışık hata). "
                     "Koşu durduruldu — sunucuyu zorlamıyoruz."
                 )
+            # Ön kontrol: tavan zaten doluysa tek bir gönderim bile yapmadan çık.
             self._check_budget(stage)
 
-        last_status = None
+        last_status: int | None = None
         last_body: dict = {}
+        last_error: BaseException | None = None
 
         for attempt in range(self.config.max_retries):
             with self._semaphore:
                 with self._lock:
                     self._wait_for_slot()
-                    self._spend_budget(stage)
+                    # Her denemede yeniden kontrol + harcama, tek kilit altında.
+                    # Buradan çıkan BudgetExceeded bilinçli olarak yakalanmaz:
+                    # retry ortasında bile GatewayError'a dönüşmeden yükselir.
+                    self._check_and_spend_budget(stage)
                     self.sends_made += 1
                 started = self._monotonic()
-                status, body = self._transport(payload)
+                try:
+                    status, body = self._transport(payload)
+                except Exception as exc:  # ağ/zaman aşımı/havuz hataları
+                    transport_error: BaseException | None = exc
+                    status, body = None, {}
+                else:
+                    transport_error = None
                 latency = self._monotonic() - started
 
             usage = body.get("usage", {}) if isinstance(body, dict) else {}
-            self._log(
-                {
-                    "stage": stage,
-                    "status": status,
-                    "cached": False,
-                    "attempt": attempt + 1,
-                    "latency": latency,
-                    "prompt_tokens": usage.get("prompt_tokens"),
-                    "completion_tokens": usage.get("completion_tokens"),
-                }
-            )
+            entry = {
+                "stage": stage,
+                "status": status,
+                "cached": False,
+                "attempt": attempt + 1,
+                "latency": latency,
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+            }
+            if transport_error is not None:
+                entry["error"] = type(transport_error).__name__
+            self._log(entry)
 
-            if status == 200:
+            if transport_error is None and status == 200:
                 try:
                     content = body["choices"][0]["message"]["content"]
                 except (KeyError, IndexError, TypeError) as exc:
+                    # Bozuk gövdeli 200 de bir hatadır: saymazsak sunucu
+                    # sonsuza dek çağrılıp bütçeyi yakar, devre hiç açılmaz.
+                    self._record_failure()
                     raise GatewayError(f"Beklenmeyen yanıt şekli: {body}") from exc
                 with self._lock:
                     self._consecutive_failures = 0
                 self._cache_write(key, content)
                 return content
 
-            last_status, last_body = status, body
+            last_status, last_body, last_error = status, body, transport_error
+
+            if not self._is_retriable(status):
+                break
             if attempt + 1 < self.config.max_retries:
                 self._sleep(2.0 ** attempt)
 
-        with self._lock:
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= self.config.circuit_threshold:
-                self._circuit_open = True
-
+        self._record_failure()
+        if last_error is not None:
+            raise GatewayError(
+                f"Taşıma katmanı hatası ({type(last_error).__name__}): {last_error}"
+            ) from last_error
         raise GatewayError(f"Çağrı başarısız (HTTP {last_status}): {last_body}")
 
 
@@ -266,7 +417,9 @@ def build_default_client(stage_budgets: dict[str, int] | None = None) -> Gateway
         requests_per_second=cfg.RATE_LIMIT_RPS,
         max_concurrency=cfg.MAX_CONCURRENCY,
         global_budget=cfg.GLOBAL_BUDGET,
-        stage_budgets=stage_budgets or cfg.STAGE_BUDGETS,
+        # Bilinçli olarak `is None`: açıkça verilen boş sözlük "hiçbir aşamaya
+        # izin yok" demektir, "varsayılana dön" değil.
+        stage_budgets=cfg.STAGE_BUDGETS if stage_budgets is None else stage_budgets,
         max_retries=cfg.MAX_RETRIES,
         circuit_threshold=cfg.CIRCUIT_THRESHOLD,
     )
