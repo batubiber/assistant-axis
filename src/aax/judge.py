@@ -93,7 +93,7 @@ def score_role_expression(
                 f"Hakem yanıtı uzunluk uyuşmazlığı: {len(parsed)} != {len(batch)}"
             )
         for value in parsed:
-            if not isinstance(value, int) or not 0 <= value <= 3:
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 3:
                 raise JudgeParseError(f"Puan 0-3 aralığı dışında: {value!r}")
         scores.extend(parsed)
     return scores
