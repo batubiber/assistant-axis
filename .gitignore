@@ -19,3 +19,4 @@ venv/
 
 # Kaynak makale (4.2 MB, arXiv'den alınabilir)
 *.pdf
+.superpowers/
