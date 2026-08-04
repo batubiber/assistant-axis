@@ -1,0 +1,21 @@
+# Deney verisi — asla commit edilmez
+data/
+*.npy
+*.npz
+*.safetensors
+
+# Sırlar
+.env
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Kaynak makale (4.2 MB, arXiv'den alınabilir)
+*.pdf
