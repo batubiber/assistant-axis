@@ -57,10 +57,25 @@ def ok_body(text: str = "merhaba"):
     }
 
 
-def make_client(tmp_path, transport, *, global_budget=10, stage_budget=10, rps=1.0):
-    clock = FakeClock()
+def make_client(
+    tmp_path,
+    transport,
+    *,
+    global_budget=10,
+    stage_budget=10,
+    rps=1.0,
+    base_url="https://example.invalid/Jailbreak",
+    clock=None,
+):
+    """Sahte transport'lu istemci.
+
+    `clock` verilirse iki istemci AYNI sahte saati paylaşır — paylaşılan hız
+    sınırlayıcının gerçekten tek bütçeye uyduğunu ölçebilmek için şart.
+    `base_url` verilirse istemci ayrı bir paylaşılan durum kovasına düşer.
+    """
+    clock = clock if clock is not None else FakeClock()
     cfg = GatewayConfig(
-        base_url="https://example.invalid/Jailbreak",
+        base_url=base_url,
         model="hakem-llm",
         api_key="test-key",
         requests_per_second=rps,
@@ -550,6 +565,332 @@ def test_rate_limiter_spaces_requests(tmp_path):
     t_after_first = clock.now
     client.chat([{"role": "user", "content": "b"}], stage="test")
     assert clock.now - t_after_first >= 1.0, "iki istek arasında en az 1 sn olmalı"
+
+
+# --- paylaşılan süreç içi durum (hız sınırlayıcı + semafor + devre kesici) ---
+
+
+def test_rate_limiter_is_shared_across_clients(tmp_path):
+    """İki ayrı istemci TEK bir 1 istek/sn bütçesine uymalı.
+
+    Regresyon: durum `__init__`'te tutulurken (istemci başına) iki istemci
+    aynı süreçte 1.00 sn içinde 4 istek gönderiyordu — `build_default_client()`
+    her çağrıda taze bir istemci ürettiği için bu Plan 2'nin doğal şekliydi.
+    """
+    sent = []
+
+    def transport(payload):
+        sent.append(payload)
+        return 200, ok_body()
+
+    clock = FakeClock()
+    client_a, _ = make_client(
+        tmp_path, transport, global_budget=99, stage_budget=99, clock=clock
+    )
+    client_b, _ = make_client(
+        tmp_path, transport, global_budget=99, stage_budget=99, clock=clock
+    )
+
+    for index, client in enumerate((client_a, client_b, client_a, client_b)):
+        client.chat([{"role": "user", "content": f"m{index}"}], stage="test")
+
+    assert len(sent) == 4
+    # 4 gönderim, 1 istek/sn → aralarında tam 3 tane 1 sn'lik bekleme olmalı.
+    assert clock.slept == [1.0, 1.0, 1.0], (
+        f"paylaşılan hız sınırlayıcı devrede değil: {clock.slept}"
+    )
+    assert clock.now >= 3.0
+
+
+def test_concurrency_semaphore_is_shared_across_clients(tmp_path):
+    """Semafor da paylaşılır: iki istemci TOPLAMDA 2 eşzamanlı gönderim yapar.
+
+    Buluşma noktası bilerek 3 kişilik: paylaşılan semafor (2) altında hiçbir
+    zaman dolamaz ve zaman aşımıyla kırılır. İstemci başına semaforla (2+2=4)
+    üç iş parçacığı buluşur ve `max_in_flight` 3'e çıkar — regresyon budur.
+    """
+    state = {"in_flight": 0, "max_in_flight": 0}
+    guard = threading.Lock()
+    ucler = threading.Barrier(3, timeout=0.5)
+
+    def transport(payload):
+        with guard:
+            state["in_flight"] += 1
+            state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+        try:
+            ucler.wait()
+        except threading.BrokenBarrierError:
+            pass  # beklenen: paylaşılan semafor 3. gönderimi hiç başlatmıyor
+        finally:
+            with guard:
+                state["in_flight"] -= 1
+        return 200, ok_body()
+
+    client_a, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    client_b, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+
+    raised: list[BaseException] = []
+
+    def worker(index):
+        client = client_a if index % 2 == 0 else client_b
+
+        def run():
+            try:
+                client.chat([{"role": "user", "content": f"m{index}"}], stage="test")
+            except BaseException as exc:  # noqa: BLE001
+                with guard:
+                    raised.append(exc)
+
+        return run
+
+    run_in_threads([worker(i) for i in range(4)])
+
+    assert raised == [], f"eşzamanlı çağrılar hata verdi: {raised}"
+    assert state["max_in_flight"] == 2, (
+        f"iki istemci semaforu paylaşmalı, görülen eşzamanlılık: {state['max_in_flight']}"
+    )
+
+
+def test_separate_endpoints_get_separate_semaphores(tmp_path):
+    """Kayıt defteri anahtarı gerçekten `base_url`: ayrı endpoint, ayrı semafor."""
+    state = {"in_flight": 0, "max_in_flight": 0}
+    guard = threading.Lock()
+    dortler = threading.Barrier(4, timeout=10.0)
+
+    def transport(payload):
+        with guard:
+            state["in_flight"] += 1
+            state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+        try:
+            dortler.wait()
+        finally:
+            with guard:
+                state["in_flight"] -= 1
+        return 200, ok_body()
+
+    client_a, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    client_b, _ = make_client(
+        tmp_path,
+        transport,
+        global_budget=99,
+        stage_budget=99,
+        base_url="https://baska.invalid/Jailbreak",
+    )
+
+    raised: list[BaseException] = []
+
+    def worker(index):
+        client = client_a if index % 2 == 0 else client_b
+
+        def run():
+            try:
+                client.chat([{"role": "user", "content": f"m{index}"}], stage="test")
+            except BaseException as exc:  # noqa: BLE001
+                with guard:
+                    raised.append(exc)
+
+        return run
+
+    run_in_threads([worker(i) for i in range(4)])
+
+    assert raised == [], f"eşzamanlı çağrılar hata verdi: {raised}"
+    assert state["max_in_flight"] == 4, (
+        "iki farklı endpoint 2+2 eşzamanlılık vermeli, görülen: "
+        f"{state['max_in_flight']}"
+    )
+
+
+def test_circuit_opened_by_one_client_is_seen_by_another(tmp_path):
+    """Bir istemcinin açtığı devre kesici diğerini de durdurur."""
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 500, {"error": "bozuk"}
+
+    client_a, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    client_b, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+
+    for i in range(3):
+        with pytest.raises(GatewayError):
+            client_a.chat([{"role": "user", "content": f"m{i}"}], stage="test")
+
+    sends_before = len(calls)
+    with pytest.raises(CircuitOpen):
+        client_b.chat([{"role": "user", "content": "b-den"}], stage="test")
+    assert len(calls) == sends_before, (
+        "devre A tarafından açıldı; B tek bir istek bile atmamalı"
+    )
+
+
+def test_failure_counter_is_shared_across_clients(tmp_path):
+    """Ardışık hata sayacı istemciler arasında birikir."""
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 500, {"error": "bozuk"}
+
+    client_a, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    client_b, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+
+    # Hatalar ikiye bölünüyor: A'da 2, B'de 1 → eşik (3) yine dolmalı.
+    with pytest.raises(GatewayError):
+        client_a.chat([{"role": "user", "content": "a"}], stage="test")
+    with pytest.raises(GatewayError):
+        client_b.chat([{"role": "user", "content": "b"}], stage="test")
+    with pytest.raises(GatewayError):
+        client_a.chat([{"role": "user", "content": "c"}], stage="test")
+
+    with pytest.raises(CircuitOpen):
+        client_b.chat([{"role": "user", "content": "d"}], stage="test")
+
+
+def test_separate_endpoints_do_not_share_state(tmp_path):
+    """Kayıt defteri `base_url` ile anahtarlanır: farklı endpoint, farklı devre."""
+
+    def transport(payload):
+        return 500, {"error": "bozuk"}
+
+    def ok_transport(payload):
+        return 200, ok_body("baska-endpoint")
+
+    client_a, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    client_b, _ = make_client(
+        tmp_path,
+        ok_transport,
+        global_budget=99,
+        stage_budget=99,
+        base_url="https://baska.invalid/Jailbreak",
+    )
+
+    for i in range(3):
+        with pytest.raises(GatewayError):
+            client_a.chat([{"role": "user", "content": f"m{i}"}], stage="test")
+
+    with pytest.raises(CircuitOpen):
+        client_a.chat([{"role": "user", "content": "yine-a"}], stage="test")
+    # B başka bir endpoint: A'nın devresi onu bağlamaz.
+    assert client_b.chat([{"role": "user", "content": "b"}], stage="test") == (
+        "baska-endpoint"
+    )
+
+
+def test_conflicting_max_concurrency_is_rejected(tmp_path):
+    """Canlı semafor güvenle küçültülemez — uyuşmazlık sessizce yutulmaz."""
+
+    def transport(payload):
+        return 200, ok_body()
+
+    make_client(tmp_path, transport)
+
+    cfg = GatewayConfig(
+        base_url="https://example.invalid/Jailbreak",
+        model="hakem-llm",
+        api_key="test-key",
+        max_concurrency=5,
+        stage_budgets={"test": 10},
+    )
+    with pytest.raises(ValueError, match="eşzamanlılık"):
+        GatewayClient(
+            cfg,
+            cache_dir=tmp_path / "cache",
+            budget_path=tmp_path / "budget.json",
+            log_path=tmp_path / "calls.jsonl",
+            transport=transport,
+        )
+
+
+def test_strictest_rate_limit_wins_across_clients(tmp_path):
+    """Daha gevşek bir ikinci istemci ortak hız bütçesini gevşetemez."""
+    sent = []
+
+    def transport(payload):
+        sent.append(payload)
+        return 200, ok_body()
+
+    clock = FakeClock()
+    # Önce gevşek (10/sn), sonra katı (1/sn) — katı olan kazanmalı.
+    client_gevsek, _ = make_client(
+        tmp_path, transport, global_budget=99, stage_budget=99, rps=10.0, clock=clock
+    )
+    client_kati, _ = make_client(
+        tmp_path, transport, global_budget=99, stage_budget=99, rps=1.0, clock=clock
+    )
+
+    client_gevsek.chat([{"role": "user", "content": "a"}], stage="test")
+    client_gevsek.chat([{"role": "user", "content": "b"}], stage="test")
+
+    assert clock.slept == [1.0], (
+        f"gevşek istemci de katı aralığa uymalı: {clock.slept}"
+    )
+    assert client_kati is not client_gevsek
+
+
+def _fake_default_env(tmp_path, monkeypatch):
+    """`build_default_client()`'ı gerçek yollara ve gerçek HTTP'ye dokunmadan kur."""
+    from aax import config as cfg
+    from aax import gateway
+
+    monkeypatch.setenv("APP_KEY_JAILBREAK", "test-key")
+    monkeypatch.setattr(cfg, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(cfg, "BUDGET_PATH", tmp_path / "budget.json")
+    monkeypatch.setattr(cfg, "CALL_LOG_PATH", tmp_path / "calls.jsonl")
+    monkeypatch.setattr(
+        gateway, "_httpx_transport", lambda *a, **k: (lambda payload: (200, ok_body()))
+    )
+
+
+def test_build_default_client_is_memoized(tmp_path, monkeypatch):
+    """Tekrarlanan çağrı AYNI istemciyi döndürmeli — her seferinde taze değil.
+
+    Regresyon: her çağrıda yeni istemci üretmek, koruma durumu istemci başına
+    tutulduğunda hız sınırını ve devre kesiciyi sessizce sıfırlıyordu.
+    """
+    from aax.gateway import build_default_client, reset_shared_state
+
+    _fake_default_env(tmp_path, monkeypatch)
+
+    first = build_default_client()
+    second = build_default_client()
+    assert first is second
+
+    # Farklı aşama bütçeleri ayrı bir istemci demektir (bilinçli).
+    ozel = build_default_client({"test": 3})
+    assert ozel is not first
+
+    reset_shared_state()
+    assert build_default_client() is not first, "sıfırlama memo'yu da temizlemeli"
+
+
+def test_build_default_client_shares_state_with_manual_client(tmp_path, monkeypatch):
+    """`build_default_client()` ile elle kurulan istemci aynı devreyi paylaşır."""
+    from aax import config as cfg
+    from aax.gateway import build_default_client
+
+    _fake_default_env(tmp_path, monkeypatch)
+
+    varsayilan = build_default_client()
+    elle, _ = make_client(
+        tmp_path,
+        lambda payload: (200, ok_body()),
+        global_budget=99,
+        stage_budget=99,
+        base_url=cfg.GATEWAY_BASE_URL,
+    )
+    assert varsayilan._state is elle._state
+
+
+def test_api_key_is_not_in_config_repr():
+    """`repr(config)` anahtarı basmamalı — Plan 2-4 notebook dostu."""
+    cfg = GatewayConfig(
+        base_url="https://example.invalid/Jailbreak",
+        model="hakem-llm",
+        api_key="cok-gizli-anahtar",
+        stage_budgets={"test": 1},
+    )
+    assert "cok-gizli-anahtar" not in repr(cfg)
+    assert "example.invalid" in repr(cfg), "diğer alanlar hâlâ görünmeli"
 
 
 def test_call_log_written_as_jsonl(tmp_path):
