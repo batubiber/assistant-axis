@@ -18,6 +18,8 @@ import socket
 
 import pytest
 
+from aax.gateway import reset_shared_state
+
 
 class AgErisimiEngellendi(RuntimeError):
     """Bir test gerçek ağ bağlantısı açmaya çalıştı.
@@ -50,3 +52,17 @@ def ag_erisimi_kapali(monkeypatch):
     monkeypatch.setattr(socket, "create_connection", _reddet, raising=True)
     monkeypatch.setattr(socket, "getaddrinfo", _reddet, raising=True)
     yield
+
+
+@pytest.fixture(autouse=True)
+def temiz_gateway_durumu():
+    """Her testi temiz paylaşılan gateway durumuyla başlat.
+
+    Hız sınırlayıcı, semafor ve devre kesici `base_url` ile anahtarlanan modül
+    düzeyinde bir kayıt defterinde (süreç genelinde paylaşılıyor). Testlerin
+    çoğu aynı sahte `base_url`'i kullandığı için, devreyi açan bir test onu
+    kapatmadan sonrakilere sızdırırdı.
+    """
+    reset_shared_state()
+    yield
+    reset_shared_state()

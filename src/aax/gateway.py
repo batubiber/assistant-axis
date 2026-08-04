@@ -13,10 +13,18 @@ Kapsam farkı — bilerek böyle:
 * **Bütçe disktedir ve süreçler arasıdır.** `fcntl.flock` ile korunan
   oku-değiştir-yaz sayesinde aynı `budget_path`'i paylaşan farklı istemciler
   (ve farklı süreçler) birbirinin güncellemesini ezmez. Tavan globaldir.
-* **Hız sınırlayıcı ve devre kesici süreç içi bellektedir.** Yani aynı anda
-  iki ayrı süreç çalıştırırsan sunucuya giden hız 1 değil 2 istek/sn olur ve
-  devre kesici süreçler arası paylaşılmaz. Ortak vLLM sunucusunu koruyan tek
-  sert garanti bütçedir; koşuları tek süreçte tut.
+* **Hız sınırlayıcı, eşzamanlılık semaforu ve devre kesici SÜREÇ İÇİNDE
+  paylaşılır — istemci başına değil.** Durum, `base_url` ile anahtarlanan
+  modül düzeyinde bir kayıt defterinde tutulur (`_ENDPOINT_STATE`). Aynı
+  endpoint'e bakan kaç `GatewayClient` üretirsen üret hepsi TEK bir 1 istek/sn
+  bütçesine, TEK bir semafora ve TEK bir devre kesiciye uyar. Bu bilinçli:
+  Plan 2'nin doğal şekli aşama başına bir istemci ya da eşzamanlı yakalama +
+  hakemlik; istemci başına durum o kurulumda sunucuya giden hızı sessizce
+  ikiye katlardı.
+* **Süreçler arası paylaşım yoktur.** İki ayrı süreç çalıştırırsan sunucuya
+  giden hız 1 değil 2 istek/sn olur ve devre kesici paylaşılmaz. Süreçler
+  arasında sert garanti veren tek şey disktedeki bütçedir; koşuları tek
+  süreçte tut.
 """
 from __future__ import annotations
 
@@ -59,7 +67,9 @@ class CircuitOpen(RuntimeError):
 class GatewayConfig:
     base_url: str
     model: str
-    api_key: str
+    # `repr=False`: Plan 2-4 notebook dostu. `print(config)` ya da bir hücre
+    # çıktısı anahtarı `.ipynb`'ye gömerdi; anahtar hiçbir dosyaya yazılmaz.
+    api_key: str = field(repr=False)
     requests_per_second: float = 1.0
     max_concurrency: int = 2
     global_budget: int = 1500
@@ -67,6 +77,77 @@ class GatewayConfig:
     max_retries: int = 3
     circuit_threshold: int = 3
     timeout_seconds: float = 120.0
+
+
+@dataclass
+class _EndpointState:
+    """Bir endpoint için süreç genelinde paylaşılan koruma durumu.
+
+    Bu alanlar bilerek `GatewayClient` örneğinde DEĞİL burada: aynı sunucuya
+    bakan iki istemci tek bir hız bütçesine ve tek bir devre kesiciye uymalı.
+    `lock` bu alanların tamamını korur; `semaphore` aynı anda uçuşta olan
+    gönderim sayısını sınırlar.
+    """
+
+    lock: threading.Lock
+    semaphore: threading.Semaphore
+    max_concurrency: int
+    min_interval: float
+    last_send_at: float | None = None
+    consecutive_failures: int = 0
+    circuit_open: bool = False
+
+
+_REGISTRY_LOCK = threading.Lock()
+_ENDPOINT_STATE: dict[str, _EndpointState] = {}
+_DEFAULT_CLIENTS: dict[tuple, "GatewayClient"] = {}
+
+
+def _endpoint_state(
+    base_url: str, max_concurrency: int, min_interval: float
+) -> _EndpointState:
+    """`base_url` için paylaşılan durumu getir, yoksa oluştur.
+
+    İki uyuşmazlık kuralı — ikisi de kapalı yönde:
+
+    * `max_concurrency` farklıysa `ValueError`. Canlı bir semaforu güvenle
+      küçültemeyiz; farkı sessizce yutmak daha katı olan ayarı kaybettirirdi.
+    * `min_interval` farklıysa **en katısı** (en büyüğü) kazanır. Daha gevşek
+      bir ikinci istemci ortak hız bütçesini gevşetemez.
+    """
+    with _REGISTRY_LOCK:
+        state = _ENDPOINT_STATE.get(base_url)
+        if state is None:
+            state = _EndpointState(
+                lock=threading.Lock(),
+                semaphore=threading.Semaphore(max_concurrency),
+                max_concurrency=max_concurrency,
+                min_interval=min_interval,
+            )
+            _ENDPOINT_STATE[base_url] = state
+            return state
+        if state.max_concurrency != max_concurrency:
+            raise ValueError(
+                f"'{base_url}' için eşzamanlılık sınırı zaten "
+                f"{state.max_concurrency} olarak kuruldu; {max_concurrency} istendi. "
+                "Aynı endpoint'e bakan istemciler tek bir semaforu paylaşır — "
+                "aynı max_concurrency ile kur."
+            )
+        if min_interval > state.min_interval:
+            state.min_interval = min_interval
+        return state
+
+
+def reset_shared_state() -> None:
+    """Modül düzeyindeki paylaşılan durumu sıfırla — YALNIZCA testler için.
+
+    Üretim kodunda çağrılmaz: devre kesiciyi sıfırlamak, tam da onu açtıran
+    sunucuyu yeniden dövmek demektir. Testler arası sızıntıyı önlemek için
+    `tests/conftest.py` bunu her testten önce ve sonra çağırır.
+    """
+    with _REGISTRY_LOCK:
+        _ENDPOINT_STATE.clear()
+        _DEFAULT_CLIENTS.clear()
 
 
 class _HttpxTransport:
@@ -121,11 +202,17 @@ class GatewayClient:
         self.budget_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._lock = threading.Lock()
-        self._semaphore = threading.Semaphore(config.max_concurrency)
-        self._last_send_at: float | None = None
-        self._consecutive_failures = 0
-        self._circuit_open = False
+        # Hız sınırlayıcı / semafor / devre kesici durumu istemcide DEĞİL,
+        # `base_url` ile anahtarlanan modül düzeyindeki kayıt defterinde:
+        # aynı sunucuya bakan kaç istemci olursa olsun tek bütçeye uyar.
+        self._state = _endpoint_state(
+            config.base_url,
+            config.max_concurrency,
+            1.0 / config.requests_per_second,
+        )
+        # `sends_made` bilinçli olarak istemci başınadır: "bu istemci kaç
+        # istek attı?" bir tanı sorusudur, koruma değil. Koruma disktedeki
+        # bütçe sayacı ve paylaşılan devre kesicidir.
         self.sends_made = 0
 
     # --- yaşam döngüsü ---------------------------------------------------
@@ -274,20 +361,21 @@ class GatewayClient:
     # --- hız sınırlama --------------------------------------------------
 
     def _wait_for_slot(self) -> None:
-        min_interval = 1.0 / self.config.requests_per_second
-        if self._last_send_at is not None:
-            elapsed = self._monotonic() - self._last_send_at
+        """Paylaşılan hız penceresini bekle. Çağıran `self._state.lock`'u tutar."""
+        min_interval = self._state.min_interval
+        if self._state.last_send_at is not None:
+            elapsed = self._monotonic() - self._state.last_send_at
             if elapsed < min_interval:
                 self._sleep(min_interval - elapsed)
-        self._last_send_at = self._monotonic()
+        self._state.last_send_at = self._monotonic()
 
     # --- devre kesici ----------------------------------------------------
 
     def _record_failure(self) -> None:
-        with self._lock:
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= self.config.circuit_threshold:
-                self._circuit_open = True
+        with self._state.lock:
+            self._state.consecutive_failures += 1
+            if self._state.consecutive_failures >= self.config.circuit_threshold:
+                self._state.circuit_open = True
 
     @staticmethod
     def _is_retriable(status: int | None) -> bool:
@@ -332,8 +420,8 @@ class GatewayClient:
             self._log({"stage": stage, "status": 200, "cached": True, "latency": 0.0})
             return cached
 
-        with self._lock:
-            if self._circuit_open:
+        with self._state.lock:
+            if self._state.circuit_open:
                 raise CircuitOpen(
                     f"Devre kesici açık ({self.config.circuit_threshold} ardışık hata). "
                     "Koşu durduruldu — sunucuyu zorlamıyoruz."
@@ -346,8 +434,8 @@ class GatewayClient:
         last_error: BaseException | None = None
 
         for attempt in range(self.config.max_retries):
-            with self._semaphore:
-                with self._lock:
+            with self._state.semaphore:
+                with self._state.lock:
                     self._wait_for_slot()
                     # Her denemede yeniden kontrol + harcama, tek kilit altında.
                     # Buradan çıkan BudgetExceeded bilinçli olarak yakalanmaz:
@@ -386,8 +474,8 @@ class GatewayClient:
                     # sonsuza dek çağrılıp bütçeyi yakar, devre hiç açılmaz.
                     self._record_failure()
                     raise GatewayError(f"Beklenmeyen yanıt şekli: {body}") from exc
-                with self._lock:
-                    self._consecutive_failures = 0
+                with self._state.lock:
+                    self._state.consecutive_failures = 0
                 self._cache_write(key, content)
                 return content
 
@@ -407,8 +495,21 @@ class GatewayClient:
 
 
 def build_default_client(stage_budgets: dict[str, int] | None = None) -> GatewayClient:
-    """Gerçek endpoint'e bağlı istemci. Anahtarı ortamdan okur."""
+    """Gerçek endpoint'e bağlı istemci. Anahtarı ortamdan okur.
+
+    **Memoize edilir.** Aynı aşama bütçeleriyle tekrar çağırmak AYNI istemciyi
+    döndürür; her çağrıda yeni bir istemci (ve yeni bir httpx bağlantı havuzu)
+    üretmek gereksizdi. Koruma açısından zaten fark etmez — hız sınırlayıcı,
+    semafor ve devre kesici `base_url` üzerinden süreç genelinde paylaşılıyor —
+    ama bağlantı havuzunu ve `sends_made` tanısını tek yerde tutar.
+    """
     from aax import config as cfg
+
+    resolved = cfg.STAGE_BUDGETS if stage_budgets is None else stage_budgets
+    memo_key = (cfg.GATEWAY_BASE_URL, cfg.GATEWAY_MODEL, tuple(sorted(resolved.items())))
+    cached_client = _DEFAULT_CLIENTS.get(memo_key)
+    if cached_client is not None:
+        return cached_client
 
     gateway_config = GatewayConfig(
         base_url=cfg.GATEWAY_BASE_URL,
@@ -419,13 +520,15 @@ def build_default_client(stage_budgets: dict[str, int] | None = None) -> Gateway
         global_budget=cfg.GLOBAL_BUDGET,
         # Bilinçli olarak `is None`: açıkça verilen boş sözlük "hiçbir aşamaya
         # izin yok" demektir, "varsayılana dön" değil.
-        stage_budgets=cfg.STAGE_BUDGETS if stage_budgets is None else stage_budgets,
+        stage_budgets=resolved,
         max_retries=cfg.MAX_RETRIES,
         circuit_threshold=cfg.CIRCUIT_THRESHOLD,
     )
-    return GatewayClient(
+    client = GatewayClient(
         gateway_config,
         cache_dir=cfg.CACHE_DIR,
         budget_path=cfg.BUDGET_PATH,
         log_path=cfg.CALL_LOG_PATH,
     )
+    _DEFAULT_CLIENTS[memo_key] = client
+    return client
