@@ -93,6 +93,21 @@ def parse_generation_response(role: str, raw: str) -> dict:
     return {
         "role": role,
         "description": description.strip(),
-        "instructions": [str(item).strip() for item in instructions],
-        "questions": [str(item).strip() for item in questions],
+        "instructions": _require_string_items(role, "instructions", instructions),
+        "questions": _require_string_items(role, "questions", questions),
     }
+
+
+def _require_string_items(role: str, field_name: str, items: list) -> list[str]:
+    """Öğeleri zorla string'e çevirmek yerine yanlış tipteki öğeyi reddet.
+
+    `str(item).strip()` ile coerce etmek "reddet, tahmin etme" ilkesini bozar:
+    `{"questions": [null, 42, {...}]}` sessizce `"None"`, `"42"`, `"{...}"`
+    string'lerine dönüşürdü. Beklenmeyen şekil JudgeParseError'dır.
+    """
+    for index, item in enumerate(items):
+        if not isinstance(item, str):
+            raise JudgeParseError(
+                f"'{role}' için {field_name}[{index}] string değil: {item!r}"
+            )
+    return [item.strip() for item in items]

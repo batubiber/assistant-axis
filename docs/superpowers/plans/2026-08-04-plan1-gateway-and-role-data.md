@@ -1583,15 +1583,29 @@ git commit -m "feat: hakem modülü ve dayanıklı JSON ayrıştırma"
 - Produces:
   - `aax.roles.ROLE_NAMES: tuple[str, ...]` — tam 120 benzersiz isim
   - `aax.roles.build_generation_prompt(role: str) -> str`
-  - `aax.roles.parse_generation_response(role: str, raw: str) -> dict` — `{"role", "description", "instructions": [3], "questions": [40]}`
-  - Artifact: `data/roles.json` — `list[dict]` yukarıdaki şekilde
-  - Artifact: `data/questions.json` — `{"shared_questions": [40 str]}`
+  - `aax.roles.parse_generation_response(role: str, raw: str) -> dict` — `{"role", "description", "instructions": [3 str], "questions": [40 str]}`; her öğe string olmalı, olmayan öğe `JudgeParseError` (coerce edilmez)
+  - `scripts/00_generate_role_data.py` içindeki yardımcılar (fail-closed davranışın çekirdeği, ağsız test edilebilir):
+    - `select_roles(limit: int | None) -> tuple[str, ...]` — `limit=0` "sınırsız" değil "sıfır rol" demek (`is not None`, falsy değil)
+    - `build_roles_payload(records, failures, attempted) -> dict`, `build_questions_payload(records, attempted) -> dict`
+    - `resolve_artifact_paths(data_dir, complete, allow_partial) -> tuple[Path, Path]`
+    - `write_artifacts(data_dir, records, failures, attempted, allow_partial) -> tuple[int, Path, Path, dict, dict]`
+  - Artifact (tam koşu): `data/roles.json` —
+    ```json
+    {"complete": true, "attempted": 120, "produced": 120, "failed": [], "roles": [ {...120 rol} ]}
+    ```
+  - Artifact (tam koşu): `data/questions.json` —
+    ```json
+    {"complete": true, "attempted": 120, "produced": 120, "shared_questions": [40 str]}
+    ```
+  - **Fail-closed:** `produced != attempted` olan bir koşu (bütçe/devre kesici nedeniyle erken kesilmiş ya da tek tek rol ayrıştırma hataları birikmiş) `data/roles.json` / `data/questions.json`'a **yazmaz** — bunun yerine `data/roles.partial.json` / `data/questions.partial.json`'a yazar, mevcut tam artifact'lara dokunmaz, ve script sıfırdan farklı çıkış koduyla döner. `--allow-partial` bayrağı bu korumayı bilerek bypass edip kısmi sonucu kanonik dosya adlarına "terfi ettirir" (zarftaki `complete` yine `false` kalır).
 
 - [ ] **Step 1: Failing test'leri yaz**
 
 `tests/test_roles.py`:
 
 ```python
+import json
+
 import pytest
 
 from aax.roles import (
@@ -1654,6 +1668,57 @@ def test_parse_generation_response_rejects_wrong_instruction_count():
 def test_parse_generation_response_rejects_wrong_question_count():
     raw = '{"description": "x", "instructions": ["a", "b", "c"], "questions": ["q1"]}'
     with pytest.raises(JudgeParseError, match="questions"):
+        parse_generation_response("pirate", raw)
+
+
+def test_parse_generation_response_rejects_non_dict_top_level():
+    raw = "[1, 2, 3]"
+    with pytest.raises(JudgeParseError):
+        parse_generation_response("pirate", raw)
+
+
+def test_parse_generation_response_rejects_missing_description():
+    raw = json.dumps(
+        {
+            "instructions": ["a", "b", "c"],
+            "questions": [f"q{i}" for i in range(40)],
+        }
+    )
+    with pytest.raises(JudgeParseError, match="description"):
+        parse_generation_response("pirate", raw)
+
+
+def test_parse_generation_response_rejects_empty_description():
+    raw = json.dumps(
+        {
+            "description": "   ",
+            "instructions": ["a", "b", "c"],
+            "questions": [f"q{i}" for i in range(40)],
+        }
+    )
+    with pytest.raises(JudgeParseError, match="description"):
+        parse_generation_response("pirate", raw)
+
+
+def test_parse_generation_response_rejects_non_string_question_item():
+    questions = [f"q{i}" for i in range(40)]
+    questions[5] = None
+    raw = json.dumps(
+        {"description": "x", "instructions": ["a", "b", "c"], "questions": questions}
+    )
+    with pytest.raises(JudgeParseError, match="questions"):
+        parse_generation_response("pirate", raw)
+
+
+def test_parse_generation_response_rejects_non_string_instruction_item():
+    raw = json.dumps(
+        {
+            "description": "x",
+            "instructions": ["a", 42, "c"],
+            "questions": [f"q{i}" for i in range(40)],
+        }
+    )
+    with pytest.raises(JudgeParseError, match="instructions"):
         parse_generation_response("pirate", raw)
 ```
 
@@ -1762,15 +1827,30 @@ def parse_generation_response(role: str, raw: str) -> dict:
     return {
         "role": role,
         "description": description.strip(),
-        "instructions": [str(item).strip() for item in instructions],
-        "questions": [str(item).strip() for item in questions],
+        "instructions": _require_string_items(role, "instructions", instructions),
+        "questions": _require_string_items(role, "questions", questions),
     }
+
+
+def _require_string_items(role: str, field_name: str, items: list) -> list[str]:
+    """Öğeleri zorla string'e çevirmek yerine yanlış tipteki öğeyi reddet.
+
+    `str(item).strip()` ile coerce etmek "reddet, tahmin etme" ilkesini bozar:
+    `{"questions": [null, 42, {...}]}` sessizce `"None"`, `"42"`, `"{...}"`
+    string'lerine dönüşürdü. Beklenmeyen şekil JudgeParseError'dır.
+    """
+    for index, item in enumerate(items):
+        if not isinstance(item, str):
+            raise JudgeParseError(
+                f"'{role}' için {field_name}[{index}] string değil: {item!r}"
+            )
+    return [item.strip() for item in items]
 ```
 
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
 Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_roles.py -v`
-Expected: PASS, 8 passed
+Expected: PASS, 13 passed
 
 - [ ] **Step 5: Aşama 0 script'ini yaz**
 
@@ -1793,6 +1873,7 @@ import argparse
 import json
 import random
 import sys
+from pathlib import Path
 
 from aax import config
 from aax.gateway import BudgetExceeded, CircuitOpen, GatewayError, build_default_client
@@ -1801,16 +1882,126 @@ from aax.roles import ROLE_NAMES, build_generation_prompt, parse_generation_resp
 
 STAGE = "stage0_roles"
 SHARED_QUESTION_COUNT = 40
+# Sabit tohum: ortak soru kümesi her koşuda aynı çıkmalı, yoksa farklı
+# koşulardan gelen rol vektörleri birbiriyle kıyaslanabilir olmaktan çıkar.
 SEED = 20260804
 
 
-def main() -> int:
+def build_roles_payload(
+    records: list[dict], failures: list[tuple[str, str]], attempted: int
+) -> dict:
+    """`roles.json`/`roles.partial.json` içeriği — bare list yerine zarf.
+
+    `complete` alanı üretilen kayıt sayısının denenen rol sayısına eşit
+    olup olmadığını taşır; downstream bir script'in kısmi bir katalogu
+    tam sanmasını engellemek için bu zarf gereklidir.
+    """
+    produced = len(records)
+    return {
+        "complete": produced == attempted,
+        "attempted": attempted,
+        "produced": produced,
+        "failed": [{"role": role, "reason": reason} for role, reason in failures],
+        "roles": records,
+    }
+
+
+def sample_shared_questions(records: list[dict]) -> list[str]:
+    """Üretilen tüm sorulardan `SEED` ile deterministik bir ortak alt küme seç."""
+    pool = [question for record in records for question in record["questions"]]
+    rng = random.Random(SEED)
+    return rng.sample(pool, min(SHARED_QUESTION_COUNT, len(pool)))
+
+
+def build_questions_payload(records: list[dict], attempted: int) -> dict:
+    """`questions.json`/`questions.partial.json` içeriği."""
+    produced = len(records)
+    return {
+        "complete": produced == attempted,
+        "attempted": attempted,
+        "produced": produced,
+        "shared_questions": sample_shared_questions(records),
+    }
+
+
+def resolve_artifact_paths(
+    data_dir: Path, complete: bool, allow_partial: bool
+) -> tuple[Path, Path]:
+    """Kanonik dosya adlarını yalnızca koşu tamsa (ya da bilerek bypass
+    edildiyse) döndür.
+
+    Kapalı yönde (fail-closed) davranış: tamlığı kanıtlanamayan bir koşu
+    `data/roles.json` / `data/questions.json`'a asla dokunmaz — bunun
+    yerine `.partial.json` adlarına yazılır ve mevcut tam katalog olduğu
+    gibi kalır. `--allow-partial` bu korumayı bilerek devre dışı bırakan
+    görünür kaçış kapısıdır.
+    """
+    if complete or allow_partial:
+        return data_dir / "roles.json", data_dir / "questions.json"
+    return data_dir / "roles.partial.json", data_dir / "questions.partial.json"
+
+
+def write_artifacts(
+    data_dir: Path,
+    records: list[dict],
+    failures: list[tuple[str, str]],
+    attempted: int,
+    allow_partial: bool,
+) -> tuple[int, Path, Path, dict, dict]:
+    """Kayıtları diske yaz, dosya adını tamlık durumuna göre seç.
+
+    Döndürür: `(exit_code, roles_path, questions_path, roles_payload,
+    questions_payload)`. `exit_code` koşu eksik kaldıysa ve
+    `allow_partial` verilmediyse `1`'dir — bir kabuk pipeline'ının
+    devam etmek yerine durması için.
+    """
+    roles_payload = build_roles_payload(records, failures, attempted)
+    questions_payload = build_questions_payload(records, attempted)
+    complete = roles_payload["complete"]
+
+    roles_path, questions_path = resolve_artifact_paths(data_dir, complete, allow_partial)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    roles_path.write_text(
+        json.dumps(roles_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    questions_path.write_text(
+        json.dumps(questions_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    exit_code = 0 if (complete or allow_partial) else 1
+    return exit_code, roles_path, questions_path, roles_payload, questions_payload
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="istek atmadan çağrı say")
     parser.add_argument("--limit", type=int, default=None, help="ilk N rol (pilot için)")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help=(
+            "eksik kalan koşuyu kanonik roles.json/questions.json dosyalarına "
+            "yaz (varsayılan: kapalı — fail-closed, .partial.json'a yazılır)"
+        ),
+    )
+    return parser
 
-    roles = ROLE_NAMES[: args.limit] if args.limit else ROLE_NAMES
+
+def select_roles(limit: int | None) -> tuple[str, ...]:
+    """`--limit` uygulanmış rol listesi.
+
+    `0` "sınırsız" değil "sıfır rol" demektir — bu yüzden falsy kontrolü
+    (`if limit`) değil `is not None` kullanılır. `0` bir Python int'i olarak
+    falsy'dir; `if args.limit:` ile yazılsaydı `--limit 0` sessizce tüm 120
+    rolü çalıştırırdı.
+    """
+    return ROLE_NAMES[:limit] if limit is not None else ROLE_NAMES
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
+
+    roles = select_roles(args.limit)
     client = build_default_client()
 
     if args.dry_run:
@@ -1853,32 +2044,61 @@ def main() -> int:
         print(f"\r{index}/{len(roles)} — {role:<16} hata: {len(failures)}", end="")
 
     print()
-    roles_path = config.DATA_DIR / "roles.json"
-    roles_path.write_text(
-        json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
+    exit_code, roles_path, questions_path, roles_payload, questions_payload = write_artifacts(
+        config.DATA_DIR, records, failures, len(roles), args.allow_partial
     )
 
-    pool = [question for record in records for question in record["questions"]]
-    rng = random.Random(SEED)
-    shared = rng.sample(pool, min(SHARED_QUESTION_COUNT, len(pool)))
-    (config.DATA_DIR / "questions.json").write_text(
-        json.dumps({"shared_questions": shared}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    pool_size = sum(len(record["questions"]) for record in records)
+    shared = questions_payload["shared_questions"]
+    print(
+        f"Yazıldı: {roles_path} "
+        f"({roles_payload['produced']}/{roles_payload['attempted']} rol, "
+        f"complete={roles_payload['complete']})"
     )
-
-    print(f"Yazıldı: {roles_path} ({len(records)} rol)")
-    print(f"Ortak soru havuzu: {len(pool)} → {len(shared)} seçildi")
+    print(f"Ortak soru havuzu: {pool_size} → {len(shared)} seçildi → {questions_path}")
     print(f"Gönderilen istek: {client.sends_made}")
     if failures:
         print(f"\nBaşarısız {len(failures)} rol:")
         for role, reason in failures[:10]:
             print(f"  {role}: {reason[:100]}")
-    return 0
+
+    if exit_code != 0:
+        print(
+            f"\nHATA: koşu eksik kaldı ({roles_payload['produced']}/"
+            f"{roles_payload['attempted']}) ve --allow-partial verilmedi — "
+            f"kanonik dosyalara DOKUNULMADI, bunun yerine {roles_path.name} / "
+            f"{questions_path.name} yazıldı.",
+            file=sys.stderr,
+        )
+
+    return exit_code
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
 ```
+
+- [ ] **Step 5b: Script'in yazma/isimlendirme mantığı için failing test'leri yaz**
+
+Ağa çıkmadan test edilebilmesi için dosya yazma mantığı yukarıdaki pure
+fonksiyonlara (`select_roles`, `build_roles_payload`,
+`build_questions_payload`, `resolve_artifact_paths`, `write_artifacts`,
+`build_arg_parser`) ayrıştırıldı. `scripts/00_generate_role_data.py` bir
+rakamla başladığı için normal `import` ile içe aktarılamaz;
+`tests/test_generate_role_data.py` `importlib.util.spec_from_file_location`
+ile dosya yolundan yükler. Testler şunları kapsar:
+
+- tam bir koşu (`produced == attempted`) kanonik `roles.json`/`questions.json`
+  dosyalarını `complete: true` ile yazar,
+- eksik kalan bir koşu **yalnızca** `roles.partial.json`/`questions.partial.json`
+  dosyalarını yazar, çıkış kodu sıfırdan farklıdır, ve mevcut kanonik
+  dosyalara dokunmaz,
+- `--allow-partial` eksik sonucu kanonik dosya adlarına terfi ettirir (zarf
+  yine de `complete: false` der),
+- `--limit 0` tam 0 rol seçer (`--limit` verilmemesinden farklı).
+
+Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_generate_role_data.py -v`
+Expected: FAIL — script henüz yukarıdaki fonksiyonları içermiyorsa `AttributeError`/`ImportError`.
 
 - [ ] **Step 6: Script'in dry-run modunu doğrula**
 
@@ -1890,7 +2110,7 @@ Expected: `Planlanan çağrı: 120 (cache'te: 0)` ve `Aşama bütçesi: 130`, ç
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/aax/roles.py scripts/00_generate_role_data.py tests/test_roles.py
+git add src/aax/roles.py scripts/00_generate_role_data.py tests/test_roles.py tests/test_generate_role_data.py
 git commit -m "feat: 120 rollük katalog ve Aşama 0 veri üretim script'i"
 ```
 
@@ -2042,16 +2262,17 @@ Expected: `Planlanan çağrı: 120`, çıkış kodu 0.
 Sonra gerçek koşu (1 istek/sn'de ~2 dakika):
 
 Run: `cd "/home/pc-8469/Asistant Axis" && uv run python scripts/00_generate_role_data.py`
-Expected: `Yazıldı: .../data/roles.json (120 rol)`, `Gönderilen istek: 120`.
+Expected: `Yazıldı: .../data/roles.json (120/120 rol, complete=True)`, `Gönderilen istek: 120`, çıkış kodu 0.
 
-Başarısız rol sayısı **10'u aşarsa** durup üretim promptunu gözden geçir — `hakem-llm` 40 soruluk JSON'u tutturamıyor olabilir; bu durumda soru sayısı 20'ye indirilip rol başına iki çağrıya bölünür (bütçe 130'a sığar: 120 değil 240 eder, o yüzden önce prompt düzeltmesi denenir).
+Başarısız rol sayısı **10'u aşarsa** durup üretim promptunu gözden geçir — `hakem-llm` 40 soruluk JSON'u tutturamıyor olabilir; bu durumda soru sayısı 20'ye indirilip rol başına iki çağrıya bölünür (bütçe 130'a sığar: 120 değil 240 eder, o yüzden önce prompt düzeltmesi denenir). Bu durumda `produced < attempted` olacağı için script `data/roles.partial.json`/`data/questions.partial.json` yazıp çıkış kodu 1 ile döner — kanonik dosyalar oluşmaz, `--allow-partial` bilerek verilmedikçe.
 
 - [ ] **Step 7: Üretilen veriyi gözle kontrol et**
 
 Run: `cd "/home/pc-8469/Asistant Axis" && python3 -c "
 import json
-rows = json.load(open('data/roles.json'))
-print(f'{len(rows)} rol')
+payload = json.load(open('data/roles.json'))
+print(f\"complete={payload['complete']} — {payload['produced']}/{payload['attempted']} rol, {len(payload['failed'])} başarısız\")
+rows = payload['roles']
 r = rows[0]
 print(r['role'], '—', r['description'])
 print('Talimat:', r['instructions'][0])
@@ -2059,15 +2280,15 @@ print('Soru   :', r['questions'][0])
 q = json.load(open('data/questions.json'))['shared_questions']
 print(f'{len(q)} ortak soru, ilki: {q[0]}')
 "`
-Expected: açıklamalar rolle uyumlu, talimatlar "You are a…" formunda, sorular rolü **doğrudan istemiyor** (makalenin kuralı: rol örtük test edilmeli).
+Expected: `complete=True`, açıklamalar rolle uyumlu, talimatlar "You are a…" formunda, sorular rolü **doğrudan istemiyor** (makalenin kuralı: rol örtük test edilmeli).
 
 ---
 
 ## Plan 1 Tamamlanma Kriterleri
 
-- [ ] `uv run --extra dev pytest tests/ -v` — hepsi geçiyor (38 test: config 4, gateway 13, judge 13, roles 8), hiçbiri ağa çıkmıyor
-- [ ] `data/roles.json` — 120 rol, her biri description + 3 talimat + 40 soru
-- [ ] `data/questions.json` — 40 ortak soru
+- [ ] `uv run --extra dev pytest tests/ -v` — hepsi geçiyor (73 test: config 4, gateway 27, judge 13, roles 13, generate_role_data 16), hiçbiri ağa çıkmıyor
+- [ ] `data/roles.json` — `{"complete": true, "attempted": 120, "produced": 120, "failed": [], "roles": [120 rol, her biri description + 3 talimat + 40 soru]}`
+- [ ] `data/questions.json` — `{"complete": true, "attempted": 120, "produced": 120, "shared_questions": [40 ortak soru]}`
 - [ ] `data/gateway_budget.json` — toplam ≈ 121 gönderim (1 smoke + 120 Aşama 0)
 - [ ] `git status --short` temiz; `data/` commit edilmemiş
 - [ ] Smoke testi adım 3 `TAMAM` — `hakem-llm` İngilizce JSON üretiyor
