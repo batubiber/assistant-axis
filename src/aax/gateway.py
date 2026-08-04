@@ -150,6 +150,22 @@ def reset_shared_state() -> None:
         _DEFAULT_CLIENTS.clear()
 
 
+def _is_valid_count(value: object) -> bool:
+    """Bütçe sayacı olarak kabul edilebilir mi?
+
+    `isinstance(value, int)` tek başına yetmez, iki ayrı sızıntısı var:
+
+    * `bool` Python'da `int`'in alt sınıfıdır — `{"a": true}` sayaç 1 olurdu.
+      Bu, `judge.py:96`'da zaten kapatılmış hata sınıfının kardeşidir.
+    * Negatif değer TOPLAMI küçültür: `{"a": true, "b": -1000}` doğrulamayı
+      geçip -999 toplar, yani 1500'lük global tavanı fiilen genişletirdi.
+
+    `_read_budget` docstring'i operatöre bu dosyayı elle onarmasını söylüyor,
+    yani ikisi de erişilebilir senaryolar.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 class _HttpxTransport:
     """Gerçek HTTP taşıması. `close()` ile bağlantı havuzu kapatılır."""
 
@@ -297,10 +313,11 @@ class GatewayClient:
                 "Sayaç sıfırlanmış sayılmaz — dosyayı elle onar veya bilinçli olarak sil."
             ) from exc
         if not isinstance(counts, dict) or not all(
-            isinstance(key, str) and isinstance(value, int) for key, value in counts.items()
+            isinstance(key, str) and _is_valid_count(value) for key, value in counts.items()
         ):
             raise BudgetCorrupted(
-                f"Bütçe dosyası beklenen şekilde değil (str->int sözlük): {self.budget_path}."
+                f"Bütçe dosyası beklenen şekilde değil "
+                f"(str -> negatif olmayan int sözlük): {self.budget_path}."
             )
         return counts
 
@@ -391,9 +408,27 @@ class GatewayClient:
     # --- log ------------------------------------------------------------
 
     def _log(self, entry: dict) -> None:
-        entry = {"ts": time.time(), **entry}
+        """JSONL denetim izine tek satır yaz.
+
+        Şema tek tiptir: her satırda aynı anahtarlar bulunur. Cache isabetinde
+        `attempt` / `prompt_tokens` / `completion_tokens` anlamsızdır ama
+        anahtarlar açıkça `None` olarak yazılır — bu JSONL projenin planlar
+        arası TEK denetim izi ve satır satır değişen bir şema, onu okuyan her
+        aracı `.get()` savunmasına zorlardı.
+        """
+        row = {
+            "ts": time.time(),
+            "stage": None,
+            "status": None,
+            "cached": None,
+            "attempt": None,
+            "latency": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+        }
+        row.update(entry)
         with self.log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     # --- kamuya açık API -------------------------------------------------
 
