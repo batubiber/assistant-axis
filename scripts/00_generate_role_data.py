@@ -383,10 +383,12 @@ def run_generation_loop(
 def run_dry_run(client, roles: tuple[str, ...]) -> int:
     """İstek atmadan planı KALAN bütçeyle kıyasla.
 
-    Aşama tavanının tamamıyla (`STAGE_BUDGETS[STAGE]`) kıyaslamak yanıltıcıydı:
-    130'un 100'ünü zaten harcamış bir operatör temiz bir 0 görüp koşuyu
-    başlatıyor, 30 çağrı sonra kesiliyordu. Spec Bölüm 6 `--dry-run`'ı zorunlu
-    ön kontrol yapıyor; ön kontrolün baktığı sayı diskteki sayaç olmalı.
+    Aşama TAVANIYLA (`STAGE_BUDGETS[STAGE]`) kıyaslamak yanıltıcıydı: tavanın
+    çoğunu önceki bir koşuda harcamış bir operatör temiz bir 0 görüp koşuyu
+    başlatıyor, kalan bütçe biter bitmez ortasında kesiliyordu. Spec Bölüm 6
+    `--dry-run`'ı zorunlu ön kontrol yapıyor; ön kontrolün baktığı sayı tavan
+    değil diskteki sayaca göre KALAN olmalı. Global tavan da ayrıca kontrol
+    edilir: aşama bütçesi bol olsa bile 1500 dolmuş olabilir.
     """
     planned = sum(
         1
