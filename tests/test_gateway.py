@@ -307,12 +307,20 @@ def test_retries_on_429_then_succeeds(tmp_path):
             return 429, {"error": "cok hizli"}
         return 200, ok_body("nihayet")
 
-    client, clock = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    # `rps` bilerek çok yüksek: hız sınırlayıcı hiç uyumaz, `clock.slept`
+    # SAF backoff dizisi olur. Varsayılan 1 istek/sn ile bu ayrım imkânsızdı —
+    # backoff tamamen kaldırıldığında hız sınırlayıcı aynı 1.0'ı yazdığı için
+    # `assert clock.slept == [1.0]` bile yeşil kalıyordu (mutasyonla doğrulandı).
+    # Hız sınırlayıcının kendi testleri ayrı: test_rate_limiter_* .
+    client, clock = make_client(
+        tmp_path, transport, global_budget=99, stage_budget=99, rps=1000.0
+    )
     assert client.chat(MSG, stage="test") == "nihayet"
     assert attempts["n"] == 2
     assert client.sends_made == 2, "retry de bütçeden sayılmalı"
     assert budget_counts(tmp_path)["test"] == 2, "tavanı zorlayan sayaç disktekidir"
-    assert clock.slept, "retry öncesi backoff uygulanmalı"
+    # Tek retry → tek backoff → 2.0**0 = 1.0.
+    assert clock.slept == [1.0], f"backoff dizisi beklenenden farklı: {clock.slept}"
 
 
 def test_client_error_status_is_not_retried(tmp_path):
@@ -351,12 +359,16 @@ def test_transport_exception_is_retried_and_logged(tmp_path):
             raise SahteAgHatasi("sunucuya ulasilamadi")
         return 200, ok_body("nihayet")
 
-    client, clock = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    # `rps` yüksek → `clock.slept` saf backoff dizisi (bkz. 429 testindeki not).
+    client, clock = make_client(
+        tmp_path, transport, global_budget=99, stage_budget=99, rps=1000.0
+    )
     assert client.chat(MSG, stage="test") == "nihayet"
     assert attempts["n"] == 3
     assert client.sends_made == 3, "istisna atan gönderim de bütçeden sayılmalı"
     assert budget_counts(tmp_path)["test"] == 3
-    assert clock.slept, "istisna sonrası backoff uygulanmalı"
+    # İki retry → iki backoff → 2.0**0, 2.0**1.
+    assert clock.slept == [1.0, 2.0], f"backoff dizisi beklenenden farklı: {clock.slept}"
 
     lines = (tmp_path / "calls.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 3, "her deneme için bir log satırı olmalı"
@@ -444,6 +456,51 @@ def test_non_dict_budget_file_is_fatal(tmp_path):
     with pytest.raises(BudgetCorrupted):
         client.chat(MSG, stage="test")
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "govde",
+    [
+        '{"test": true}',  # bool, Python'da int'in alt sınıfı
+        '{"test": false}',
+        '{"test": -1000}',  # negatif sayaç toplamı küçültür
+        '{"test": 1, "smoke": true, "diger": -1000}',  # 1500 tavanını genişletirdi
+        '{"test": 1.5}',
+        '{"test": "3"}',
+    ],
+)
+def test_out_of_domain_budget_values_are_fatal(tmp_path, govde):
+    """Sayaç yalnızca negatif olmayan gerçek int olabilir.
+
+    `{"a": true, "b": -1000}` eski kontrolü geçip -999 topluyordu, yani
+    global tavanı sessizce genişletiyordu. `_read_budget` operatöre bu dosyayı
+    elle onarmasını söylüyor — bu değerler erişilebilir.
+    """
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=2, stage_budget=99)
+    (tmp_path / "budget.json").write_text(govde, encoding="utf-8")
+
+    with pytest.raises(BudgetCorrupted):
+        client.chat(MSG, stage="test")
+    assert calls == [], "alan dışı sayaç tek bir istek bile attırmamalı"
+
+
+def test_zero_budget_value_is_accepted(tmp_path):
+    """0 geçerli bir sayaçtır — negatif olmayan int kuralı 0'ı dışlamamalı."""
+
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=99, stage_budget=99)
+    (tmp_path / "budget.json").write_text('{"test": 0}', encoding="utf-8")
+
+    assert client.chat(MSG, stage="test") == "merhaba"
+    assert budget_counts(tmp_path)["test"] == 1
 
 
 def test_concurrent_callers_never_exceed_global_budget(tmp_path):
@@ -907,6 +964,47 @@ def test_call_log_written_as_jsonl(tmp_path):
     assert entry["status"] == 200
     assert entry["cached"] is False
     assert "api_key" not in json.dumps(entry), "anahtar log'a sızmamalı"
+
+
+def test_cache_hit_log_row_has_same_schema_as_send_row(tmp_path):
+    """Cache satırı ile gönderim satırı aynı anahtar kümesini taşımalı.
+
+    Bu JSONL projenin planlar arası TEK denetim izi. Cache satırı `attempt`,
+    `prompt_tokens` ve `completion_tokens`'ı hiç yazmıyordu; satır satır
+    değişen bir şema onu okuyan her aracı `.get()` savunmasına zorlardı.
+    """
+
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport)
+    client.chat(MSG, stage="test")  # gönderim satırı
+    client.chat(MSG, stage="test")  # cache satırı
+
+    lines = (tmp_path / "calls.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    gonderim, cache = json.loads(lines[0]), json.loads(lines[1])
+
+    assert gonderim["cached"] is False and cache["cached"] is True
+    assert set(cache) == set(gonderim), (
+        f"şema uyuşmuyor — yalnızca gönderimde: {set(gonderim) - set(cache)}, "
+        f"yalnızca cache'te: {set(cache) - set(gonderim)}"
+    )
+    assert set(gonderim) == {
+        "ts",
+        "stage",
+        "status",
+        "cached",
+        "attempt",
+        "latency",
+        "prompt_tokens",
+        "completion_tokens",
+    }
+    # Cache satırında bu alanlar anlamsız ama açıkça None olarak var olmalı.
+    assert cache["attempt"] is None
+    assert cache["prompt_tokens"] is None
+    assert cache["completion_tokens"] is None
+    assert gonderim["prompt_tokens"] == 5
 
 
 def test_api_key_never_appears_in_cache_files(tmp_path):
