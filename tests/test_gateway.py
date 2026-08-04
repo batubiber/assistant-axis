@@ -252,6 +252,67 @@ def test_would_call_reports_cache_state_without_sending(tmp_path):
     assert client.would_call(MSG) is False
 
 
+def test_remaining_budget_reports_untouched_caps(tmp_path):
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=20, stage_budget=5)
+    assert client.remaining_budget("test") == (5, 20)
+
+
+def test_remaining_budget_shrinks_as_budget_is_spent(tmp_path):
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=20, stage_budget=5)
+    client.chat([{"role": "user", "content": "a"}], stage="test")
+    client.chat([{"role": "user", "content": "b"}], stage="test")
+    assert client.remaining_budget("test") == (3, 18)
+
+
+def test_remaining_budget_counts_other_stages_against_global_only(tmp_path):
+    """Başka aşamaların harcaması globali düşürür, aşama kalanını değil."""
+
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=20, stage_budget=5)
+    (tmp_path / "budget.json").write_text('{"baska": 12}', encoding="utf-8")
+    assert client.remaining_budget("test") == (5, 8)
+
+
+def test_remaining_budget_never_goes_negative(tmp_path):
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport, global_budget=20, stage_budget=5)
+    (tmp_path / "budget.json").write_text('{"test": 99}', encoding="utf-8")
+    assert client.remaining_budget("test") == (0, 0)
+
+
+def test_remaining_budget_rejects_unknown_stage(tmp_path):
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport)
+    with pytest.raises(ValueError):
+        client.remaining_budget("tesst")
+
+
+def test_remaining_budget_sends_nothing(tmp_path):
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport)
+    client.remaining_budget("test")
+    assert calls == []
+    assert client.sends_made == 0
+    assert not (tmp_path / "budget.json").exists(), "salt okunur olmalı"
+
+
 def test_circuit_opens_after_three_consecutive_failures(tmp_path):
     calls = []
 
