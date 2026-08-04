@@ -1,6 +1,11 @@
 import pytest
 
-from aax.judge import JudgeParseError, extract_json, score_role_expression
+from aax.judge import (
+    ROLE_SCORE_RUBRIC,
+    JudgeParseError,
+    extract_json,
+    score_role_expression,
+)
 
 
 def test_extract_bare_json_array():
@@ -86,6 +91,27 @@ def test_score_role_expression_raises_on_out_of_range_score():
         )
 
 
+def test_score_role_expression_raises_on_boolean_score():
+    # bool is a subclass of int in Python; [true, false] must not be silently
+    # accepted as scores 1, 0 — that would be exactly the guessed/coerced
+    # score the module's invariant forbids.
+    client = StubClient(["[true, false]"])
+    with pytest.raises(JudgeParseError, match="aralığı"):
+        score_role_expression(
+            client, role="ghost", description="a restless spirit",
+            items=make_items(2), stage="test",
+        )
+
+
+def test_score_role_expression_raises_on_float_score():
+    client = StubClient(["[1.5]"])
+    with pytest.raises(JudgeParseError, match="aralığı"):
+        score_role_expression(
+            client, role="ghost", description="a restless spirit",
+            items=make_items(1), stage="test",
+        )
+
+
 def test_prompt_contains_role_and_rubric():
     client = StubClient(["[3]"])
     score_role_expression(
@@ -96,3 +122,4 @@ def test_prompt_contains_role_and_rubric():
     assert "leviathan" in prompt
     assert "vast sea creature" in prompt
     assert "soru 0" in prompt and "yanit 0" in prompt
+    assert ROLE_SCORE_RUBRIC in prompt

@@ -1314,7 +1314,12 @@ Küçük ve orta boy modellerin JSON çıktısı güvenilmezdir: markdown fence 
 ```python
 import pytest
 
-from aax.judge import JudgeParseError, extract_json, score_role_expression
+from aax.judge import (
+    ROLE_SCORE_RUBRIC,
+    JudgeParseError,
+    extract_json,
+    score_role_expression,
+)
 
 
 def test_extract_bare_json_array():
@@ -1393,10 +1398,31 @@ def test_score_role_expression_raises_on_length_mismatch():
 
 def test_score_role_expression_raises_on_out_of_range_score():
     client = StubClient(["[1, 7]"])
-    with pytest.raises(JudgeParseError, match="aralık"):
+    with pytest.raises(JudgeParseError, match="aralığı"):
         score_role_expression(
             client, role="ghost", description="a restless spirit",
             items=make_items(2), stage="test",
+        )
+
+
+def test_score_role_expression_raises_on_boolean_score():
+    # bool is a subclass of int in Python; [true, false] must not be silently
+    # accepted as scores 1, 0 — that would be exactly the guessed/coerced
+    # score the module's invariant forbids.
+    client = StubClient(["[true, false]"])
+    with pytest.raises(JudgeParseError, match="aralığı"):
+        score_role_expression(
+            client, role="ghost", description="a restless spirit",
+            items=make_items(2), stage="test",
+        )
+
+
+def test_score_role_expression_raises_on_float_score():
+    client = StubClient(["[1.5]"])
+    with pytest.raises(JudgeParseError, match="aralığı"):
+        score_role_expression(
+            client, role="ghost", description="a restless spirit",
+            items=make_items(1), stage="test",
         )
 
 
@@ -1410,6 +1436,7 @@ def test_prompt_contains_role_and_rubric():
     assert "leviathan" in prompt
     assert "vast sea creature" in prompt
     assert "soru 0" in prompt and "yanit 0" in prompt
+    assert ROLE_SCORE_RUBRIC in prompt
 ```
 
 - [ ] **Step 2: Test'lerin başarısız olduğunu doğrula**
@@ -1515,16 +1542,25 @@ def score_role_expression(
                 f"Hakem yanıtı uzunluk uyuşmazlığı: {len(parsed)} != {len(batch)}"
             )
         for value in parsed:
-            if not isinstance(value, int) or not 0 <= value <= 3:
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 3:
                 raise JudgeParseError(f"Puan 0-3 aralığı dışında: {value!r}")
         scores.extend(parsed)
     return scores
 ```
 
+`bool` is a subclass of `int` in Python, so `isinstance(value, int)` alone accepts
+`True`/`False` (i.e. JSON `true`/`false`) as valid scores 1/0. That is silent
+coercion of a malformed shape, which violates this module's central invariant —
+every malformed shape must raise `JudgeParseError`, never be guessed at or
+coerced. The `isinstance(value, bool)` check rejects booleans explicitly, ahead
+of the `int` check. `float` values (e.g. `1.5`) are already rejected by
+`isinstance(value, int)` on its own, since `bool` is `int`'s only surprising
+subclass here.
+
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
 Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_judge.py -v`
-Expected: PASS, 11 passed
+Expected: PASS, 13 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2029,7 +2065,7 @@ Expected: açıklamalar rolle uyumlu, talimatlar "You are a…" formunda, sorula
 
 ## Plan 1 Tamamlanma Kriterleri
 
-- [ ] `uv run --extra dev pytest tests/ -v` — hepsi geçiyor (36 test: config 4, gateway 13, judge 11, roles 8), hiçbiri ağa çıkmıyor
+- [ ] `uv run --extra dev pytest tests/ -v` — hepsi geçiyor (38 test: config 4, gateway 13, judge 13, roles 8), hiçbiri ağa çıkmıyor
 - [ ] `data/roles.json` — 120 rol, her biri description + 3 talimat + 40 soru
 - [ ] `data/questions.json` — 40 ortak soru
 - [ ] `data/gateway_budget.json` — toplam ≈ 121 gönderim (1 smoke + 120 Aşama 0)
