@@ -29,19 +29,36 @@ SEED = 20260804
 
 
 def build_roles_payload(
-    records: list[dict], failures: list[tuple[str, str]], attempted: int
+    records: list[dict],
+    failures: list[tuple[str, str]],
+    requested: int,
+    attempted: int,
+    not_attempted: list[str],
 ) -> dict:
     """`roles.json`/`roles.partial.json` içeriği — bare list yerine zarf.
 
-    `complete` alanı üretilen kayıt sayısının denenen rol sayısına eşit
-    olup olmadığını taşır; downstream bir script'in kısmi bir katalogu
-    tam sanmasını engellemek için bu zarf gereklidir.
+    Üç sayaç bilerek birbirinden farklıdır:
+
+    * `requested`  — istenen batch büyüklüğü (`select_roles()` çıktısının
+      uzunluğu); koşu hiç başlamasa bile sabittir.
+    * `attempted`  — döngünün fiilen ulaştığı rol sayısı. Bütçe/devre kesici
+      koşuyu erken durdurursa `requested`'tan küçük kalır.
+    * `produced`   — başarıyla ayrıştırılan kayıt sayısı (`len(records)`).
+
+    `complete` alanı `produced == requested` olup olmadığını taşır; downstream
+    bir script'in kısmi bir katalogu tam sanmasını engellemek için bu zarf
+    gereklidir. `not_attempted`, döngünün hiç ulaşamadığı rolleri katalog
+    sırasıyla listeler — bir operatörün "hangi roller kaldı?" sorusuna
+    `ROLE_NAMES` ile set-diff almaya gerek kalmadan doğrudan bu dosyadan cevap
+    bulabilmesi için.
     """
     produced = len(records)
     return {
-        "complete": produced == attempted,
+        "complete": produced == requested,
+        "requested": requested,
         "attempted": attempted,
         "produced": produced,
+        "not_attempted": not_attempted,
         "failed": [{"role": role, "reason": reason} for role, reason in failures],
         "roles": records,
     }
@@ -54,11 +71,15 @@ def sample_shared_questions(records: list[dict]) -> list[str]:
     return rng.sample(pool, min(SHARED_QUESTION_COUNT, len(pool)))
 
 
-def build_questions_payload(records: list[dict], attempted: int) -> dict:
-    """`questions.json`/`questions.partial.json` içeriği."""
+def build_questions_payload(records: list[dict], requested: int, attempted: int) -> dict:
+    """`questions.json`/`questions.partial.json` içeriği.
+
+    Sayaç anlamları `build_roles_payload` ile birebir aynıdır (bkz. orada).
+    """
     produced = len(records)
     return {
-        "complete": produced == attempted,
+        "complete": produced == requested,
+        "requested": requested,
         "attempted": attempted,
         "produced": produced,
         "shared_questions": sample_shared_questions(records),
@@ -84,6 +105,7 @@ def resolve_artifact_paths(
 
 def write_artifacts(
     data_dir: Path,
+    roles: tuple[str, ...],
     records: list[dict],
     failures: list[tuple[str, str]],
     attempted: int,
@@ -91,13 +113,20 @@ def write_artifacts(
 ) -> tuple[int, Path, Path, dict, dict]:
     """Kayıtları diske yaz, dosya adını tamlık durumuna göre seç.
 
+    `roles` istenen (requested) tam batch'tir — `roles[attempted:]` döngünün
+    hiç ulaşamadığı kuyruktur (`not_attempted`), çünkü `run_generation_loop`
+    rolleri her zaman katalog sırasıyla ve aradan atlamadan işler.
+
     Döndürür: `(exit_code, roles_path, questions_path, roles_payload,
     questions_payload)`. `exit_code` koşu eksik kaldıysa ve
     `allow_partial` verilmediyse `1`'dir — bir kabuk pipeline'ının
     devam etmek yerine durması için.
     """
-    roles_payload = build_roles_payload(records, failures, attempted)
-    questions_payload = build_questions_payload(records, attempted)
+    requested = len(roles)
+    not_attempted = list(roles[attempted:])
+
+    roles_payload = build_roles_payload(records, failures, requested, attempted, not_attempted)
+    questions_payload = build_questions_payload(records, requested, attempted)
     complete = roles_payload["complete"]
 
     roles_path, questions_path = resolve_artifact_paths(data_dir, complete, allow_partial)
@@ -108,6 +137,16 @@ def write_artifacts(
     questions_path.write_text(
         json.dumps(questions_payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    if allow_partial and not complete:
+        # `--allow-partial` eski bir tam artifact'ı sessizce ezmesin: bu
+        # bilinçli terfiyi operatöre stderr'de açıkça söyle.
+        print(
+            f"UYARI: kısmi koşu ({roles_payload['produced']}/{roles_payload['requested']} "
+            f"rol) kanonik dosya adlarına terfi ettirildi — {roles_path.name} / "
+            f"{questions_path.name}. Önceki tam artifact varsa üzerine yazıldı.",
+            file=sys.stderr,
+        )
 
     exit_code = 0 if (complete or allow_partial) else 1
     return exit_code, roles_path, questions_path, roles_payload, questions_payload
@@ -139,6 +178,48 @@ def select_roles(limit: int | None) -> tuple[str, ...]:
     return ROLE_NAMES[:limit] if limit is not None else ROLE_NAMES
 
 
+def run_generation_loop(
+    roles: tuple[str, ...], client, *, stage: str = STAGE, max_tokens: int = 4096
+) -> tuple[list[dict], list[tuple[str, str]], int]:
+    """`roles`'u sırayla gateway'e gönder, yanıtları ayrıştır.
+
+    Döndürür: `(records, failures, attempted)`. `attempted`, döngünün fiilen
+    ulaştığı rol sayısıdır — `len(roles)` (istenen batch büyüklüğü) ile
+    KARIŞTIRILMAMALI: bütçe/devre kesici koşuyu erken durdurursa küçük kalır.
+
+    Bütçe/devre kesici koşuyu durdurduğunda, o anki rol de "denendi VE
+    başarısız oldu" sayılır — atlanmaz, nedeni açıkça tetikleyici olduğunu
+    söyleyen bir mesajla `failures`'a eklenir. Böylece bir ayrıştırma/gateway
+    hatasından ayırt edilebilir kalır ve `roles.partial.json` "koşuyu hangi
+    rol durdurdu?" sorusuna kendi başına cevap verebilir.
+    """
+    records: list[dict] = []
+    failures: list[tuple[str, str]] = []
+    attempted = 0
+
+    for index, role in enumerate(roles, start=1):
+        attempted = index
+        prompt = build_generation_prompt(role)
+        try:
+            raw = client.chat(
+                [{"role": "user", "content": prompt}], stage=stage, max_tokens=max_tokens
+            )
+            records.append(parse_generation_response(role, raw))
+        except JudgeParseError as exc:
+            failures.append((role, str(exc)))
+        except (BudgetExceeded, CircuitOpen) as exc:
+            print(f"\nDURDURULDU: {exc}", file=sys.stderr)
+            failures.append(
+                (role, f"DURDURULDU — koşuyu durduran bütçe/devre kesici tetikleyicisi: {exc}")
+            )
+            break
+        except GatewayError as exc:
+            failures.append((role, str(exc)))
+        print(f"\r{index}/{len(roles)} — {role:<16} hata: {len(failures)}", end="")
+
+    return records, failures, attempted
+
+
 def main() -> int:
     args = build_arg_parser().parse_args()
 
@@ -164,36 +245,18 @@ def main() -> int:
             return 1
         return 0
 
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    records: list[dict] = []
-    failures: list[tuple[str, str]] = []
-
-    for index, role in enumerate(roles, start=1):
-        prompt = build_generation_prompt(role)
-        try:
-            raw = client.chat(
-                [{"role": "user", "content": prompt}], stage=STAGE, max_tokens=4096
-            )
-            records.append(parse_generation_response(role, raw))
-        except JudgeParseError as exc:
-            failures.append((role, str(exc)))
-        except (BudgetExceeded, CircuitOpen) as exc:
-            print(f"\nDURDURULDU: {exc}", file=sys.stderr)
-            break
-        except GatewayError as exc:
-            failures.append((role, str(exc)))
-        print(f"\r{index}/{len(roles)} — {role:<16} hata: {len(failures)}", end="")
+    records, failures, attempted = run_generation_loop(roles, client)
 
     print()
     exit_code, roles_path, questions_path, roles_payload, questions_payload = write_artifacts(
-        config.DATA_DIR, records, failures, len(roles), args.allow_partial
+        config.DATA_DIR, roles, records, failures, attempted, args.allow_partial
     )
 
     pool_size = sum(len(record["questions"]) for record in records)
     shared = questions_payload["shared_questions"]
     print(
         f"Yazıldı: {roles_path} "
-        f"({roles_payload['produced']}/{roles_payload['attempted']} rol, "
+        f"({roles_payload['produced']}/{roles_payload['requested']} rol, "
         f"complete={roles_payload['complete']})"
     )
     print(f"Ortak soru havuzu: {pool_size} → {len(shared)} seçildi → {questions_path}")
@@ -206,7 +269,7 @@ def main() -> int:
     if exit_code != 0:
         print(
             f"\nHATA: koşu eksik kaldı ({roles_payload['produced']}/"
-            f"{roles_payload['attempted']}) ve --allow-partial verilmedi — "
+            f"{roles_payload['requested']}) ve --allow-partial verilmedi — "
             f"kanonik dosyalara DOKUNULMADI, bunun yerine {roles_path.name} / "
             f"{questions_path.name} yazıldı.",
             file=sys.stderr,

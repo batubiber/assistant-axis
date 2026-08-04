@@ -1586,18 +1586,27 @@ git commit -m "feat: hakem modülü ve dayanıklı JSON ayrıştırma"
   - `aax.roles.parse_generation_response(role: str, raw: str) -> dict` — `{"role", "description", "instructions": [3 str], "questions": [40 str]}`; her öğe string olmalı, olmayan öğe `JudgeParseError` (coerce edilmez)
   - `scripts/00_generate_role_data.py` içindeki yardımcılar (fail-closed davranışın çekirdeği, ağsız test edilebilir):
     - `select_roles(limit: int | None) -> tuple[str, ...]` — `limit=0` "sınırsız" değil "sıfır rol" demek (`is not None`, falsy değil)
-    - `build_roles_payload(records, failures, attempted) -> dict`, `build_questions_payload(records, attempted) -> dict`
+    - `run_generation_loop(roles, client, *, stage=STAGE, max_tokens=4096) -> tuple[records, failures, attempted]` — rolleri sırayla gönderir; `attempted` döngünün fiilen ulaştığı rol sayısıdır (`len(roles)` ile karıştırılmamalı). Bütçe/devre kesici koşuyu durdurursa tetikleyici rol de, nedenini açıkça "tetikleyici" olarak işaretleyen bir mesajla `failures`'a eklenir — kaybolmaz.
+    - `build_roles_payload(records, failures, requested, attempted, not_attempted) -> dict`, `build_questions_payload(records, requested, attempted) -> dict` — üç ayrı sayaç: `requested` (istenen batch büyüklüğü), `attempted` (döngünün ulaştığı rol sayısı), `produced` (başarıyla ayrıştırılan kayıt sayısı)
     - `resolve_artifact_paths(data_dir, complete, allow_partial) -> tuple[Path, Path]`
-    - `write_artifacts(data_dir, records, failures, attempted, allow_partial) -> tuple[int, Path, Path, dict, dict]`
+    - `write_artifacts(data_dir, roles, records, failures, attempted, allow_partial) -> tuple[int, Path, Path, dict, dict]` — `not_attempted`'ı `roles[attempted:]`'ten türetir (rolleri her zaman katalog sırasıyla, aradan atlamadan işleyen `run_generation_loop` sayesinde bu her zaman doğru bir kuyruktur); `--allow-partial` eksik bir sonucu kanonik dosyalara terfi ettirdiğinde stderr'e açık bir `UYARI` yazar
   - Artifact (tam koşu): `data/roles.json` —
     ```json
-    {"complete": true, "attempted": 120, "produced": 120, "failed": [], "roles": [ {...120 rol} ]}
+    {"complete": true, "requested": 120, "attempted": 120, "produced": 120, "not_attempted": [], "failed": [], "roles": [ {...120 rol} ]}
     ```
   - Artifact (tam koşu): `data/questions.json` —
     ```json
-    {"complete": true, "attempted": 120, "produced": 120, "shared_questions": [40 str]}
+    {"complete": true, "requested": 120, "attempted": 120, "produced": 120, "shared_questions": [40 str]}
     ```
-  - **Fail-closed:** `produced != attempted` olan bir koşu (bütçe/devre kesici nedeniyle erken kesilmiş ya da tek tek rol ayrıştırma hataları birikmiş) `data/roles.json` / `data/questions.json`'a **yazmaz** — bunun yerine `data/roles.partial.json` / `data/questions.partial.json`'a yazar, mevcut tam artifact'lara dokunmaz, ve script sıfırdan farklı çıkış koduyla döner. `--allow-partial` bayrağı bu korumayı bilerek bypass edip kısmi sonucu kanonik dosya adlarına "terfi ettirir" (zarftaki `complete` yine `false` kalır).
+  - Artifact (kesik koşu, ör. bütçe 45. rolde tetiklendi): `data/roles.partial.json` —
+    ```json
+    {"complete": false, "requested": 120, "attempted": 45, "produced": 44,
+     "not_attempted": ["...kalan 75 rol, katalog sırasıyla..."],
+     "failed": [{"role": "...", "reason": "DURDURULDU — koşuyu durduran bütçe/devre kesici tetikleyicisi: ..."}],
+     "roles": [ {...44 rol} ]}
+    ```
+    Bu zarf kendi başına yeterlidir: bir operatörün "hangi roller kaldı?" sorusuna `ROLE_NAMES` ile set-diff almadan `not_attempted`'tan doğrudan cevap bulabilmesi, ve koşuyu hangi rolün durdurduğunu `failed`'daki tetikleyici kayıttan görebilmesi için.
+  - **Fail-closed:** `produced != requested` olan bir koşu (bütçe/devre kesici nedeniyle erken kesilmiş ya da tek tek rol ayrıştırma hataları birikmiş) `data/roles.json` / `data/questions.json`'a **yazmaz** — bunun yerine `data/roles.partial.json` / `data/questions.partial.json`'a yazar, mevcut tam artifact'lara dokunmaz, ve script sıfırdan farklı çıkış koduyla döner. `--allow-partial` bayrağı bu korumayı bilerek bypass edip kısmi sonucu kanonik dosya adlarına "terfi ettirir" (zarftaki `complete` yine `false` kalır) — bu terfi sessiz değildir, stderr'e kaç rolün kaç istenen üzerinden yazıldığını ve önceki tam artifact'ın üzerine yazıldığını söyleyen bir `UYARI` basılır.
 
 - [ ] **Step 1: Failing test'leri yaz**
 
@@ -1888,19 +1897,36 @@ SEED = 20260804
 
 
 def build_roles_payload(
-    records: list[dict], failures: list[tuple[str, str]], attempted: int
+    records: list[dict],
+    failures: list[tuple[str, str]],
+    requested: int,
+    attempted: int,
+    not_attempted: list[str],
 ) -> dict:
     """`roles.json`/`roles.partial.json` içeriği — bare list yerine zarf.
 
-    `complete` alanı üretilen kayıt sayısının denenen rol sayısına eşit
-    olup olmadığını taşır; downstream bir script'in kısmi bir katalogu
-    tam sanmasını engellemek için bu zarf gereklidir.
+    Üç sayaç bilerek birbirinden farklıdır:
+
+    * `requested`  — istenen batch büyüklüğü (`select_roles()` çıktısının
+      uzunluğu); koşu hiç başlamasa bile sabittir.
+    * `attempted`  — döngünün fiilen ulaştığı rol sayısı. Bütçe/devre kesici
+      koşuyu erken durdurursa `requested`'tan küçük kalır.
+    * `produced`   — başarıyla ayrıştırılan kayıt sayısı (`len(records)`).
+
+    `complete` alanı `produced == requested` olup olmadığını taşır; downstream
+    bir script'in kısmi bir katalogu tam sanmasını engellemek için bu zarf
+    gereklidir. `not_attempted`, döngünün hiç ulaşamadığı rolleri katalog
+    sırasıyla listeler — bir operatörün "hangi roller kaldı?" sorusuna
+    `ROLE_NAMES` ile set-diff almaya gerek kalmadan doğrudan bu dosyadan cevap
+    bulabilmesi için.
     """
     produced = len(records)
     return {
-        "complete": produced == attempted,
+        "complete": produced == requested,
+        "requested": requested,
         "attempted": attempted,
         "produced": produced,
+        "not_attempted": not_attempted,
         "failed": [{"role": role, "reason": reason} for role, reason in failures],
         "roles": records,
     }
@@ -1913,11 +1939,15 @@ def sample_shared_questions(records: list[dict]) -> list[str]:
     return rng.sample(pool, min(SHARED_QUESTION_COUNT, len(pool)))
 
 
-def build_questions_payload(records: list[dict], attempted: int) -> dict:
-    """`questions.json`/`questions.partial.json` içeriği."""
+def build_questions_payload(records: list[dict], requested: int, attempted: int) -> dict:
+    """`questions.json`/`questions.partial.json` içeriği.
+
+    Sayaç anlamları `build_roles_payload` ile birebir aynıdır (bkz. orada).
+    """
     produced = len(records)
     return {
-        "complete": produced == attempted,
+        "complete": produced == requested,
+        "requested": requested,
         "attempted": attempted,
         "produced": produced,
         "shared_questions": sample_shared_questions(records),
@@ -1933,8 +1963,8 @@ def resolve_artifact_paths(
     Kapalı yönde (fail-closed) davranış: tamlığı kanıtlanamayan bir koşu
     `data/roles.json` / `data/questions.json`'a asla dokunmaz — bunun
     yerine `.partial.json` adlarına yazılır ve mevcut tam katalog olduğu
-    gibi kalır. `--allow-partial` bu korumayı bilerek devre dışı bırakan
-    görünür kaçış kapısıdır.
+    gibi kalır. `--allow-partial` bu korumayı bilinçli olarak devre dışı
+    bırakan görünür kaçış kapısıdır.
     """
     if complete or allow_partial:
         return data_dir / "roles.json", data_dir / "questions.json"
@@ -1943,6 +1973,7 @@ def resolve_artifact_paths(
 
 def write_artifacts(
     data_dir: Path,
+    roles: tuple[str, ...],
     records: list[dict],
     failures: list[tuple[str, str]],
     attempted: int,
@@ -1950,13 +1981,20 @@ def write_artifacts(
 ) -> tuple[int, Path, Path, dict, dict]:
     """Kayıtları diske yaz, dosya adını tamlık durumuna göre seç.
 
+    `roles` istenen (requested) tam batch'tir — `roles[attempted:]` döngünün
+    hiç ulaşamadığı kuyruktur (`not_attempted`), çünkü `run_generation_loop`
+    rolleri her zaman katalog sırasıyla ve aradan atlamadan işler.
+
     Döndürür: `(exit_code, roles_path, questions_path, roles_payload,
     questions_payload)`. `exit_code` koşu eksik kaldıysa ve
     `allow_partial` verilmediyse `1`'dir — bir kabuk pipeline'ının
     devam etmek yerine durması için.
     """
-    roles_payload = build_roles_payload(records, failures, attempted)
-    questions_payload = build_questions_payload(records, attempted)
+    requested = len(roles)
+    not_attempted = list(roles[attempted:])
+
+    roles_payload = build_roles_payload(records, failures, requested, attempted, not_attempted)
+    questions_payload = build_questions_payload(records, requested, attempted)
     complete = roles_payload["complete"]
 
     roles_path, questions_path = resolve_artifact_paths(data_dir, complete, allow_partial)
@@ -1967,6 +2005,16 @@ def write_artifacts(
     questions_path.write_text(
         json.dumps(questions_payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    if allow_partial and not complete:
+        # `--allow-partial` eski bir tam artifact'ı sessizce ezmesin: bu
+        # bilinçli terfiyi operatöre stderr'de açıkça söyle.
+        print(
+            f"UYARI: kısmi koşu ({roles_payload['produced']}/{roles_payload['requested']} "
+            f"rol) kanonik dosya adlarına terfi ettirildi — {roles_path.name} / "
+            f"{questions_path.name}. Önceki tam artifact varsa üzerine yazıldı.",
+            file=sys.stderr,
+        )
 
     exit_code = 0 if (complete or allow_partial) else 1
     return exit_code, roles_path, questions_path, roles_payload, questions_payload
@@ -1998,6 +2046,48 @@ def select_roles(limit: int | None) -> tuple[str, ...]:
     return ROLE_NAMES[:limit] if limit is not None else ROLE_NAMES
 
 
+def run_generation_loop(
+    roles: tuple[str, ...], client, *, stage: str = STAGE, max_tokens: int = 4096
+) -> tuple[list[dict], list[tuple[str, str]], int]:
+    """`roles`'u sırayla gateway'e gönder, yanıtları ayrıştır.
+
+    Döndürür: `(records, failures, attempted)`. `attempted`, döngünün fiilen
+    ulaştığı rol sayısıdır — `len(roles)` (istenen batch büyüklüğü) ile
+    KARIŞTIRILMAMALI: bütçe/devre kesici koşuyu erken durdurursa küçük kalır.
+
+    Bütçe/devre kesici koşuyu durdurduğunda, o anki rol de "denendi VE
+    başarısız oldu" sayılır — atlanmaz, nedeni açıkça tetikleyici olduğunu
+    söyleyen bir mesajla `failures`'a eklenir. Böylece bir ayrıştırma/gateway
+    hatasından ayırt edilebilir kalır ve `roles.partial.json` "koşuyu hangi
+    rol durdurdu?" sorusuna kendi başına cevap verebilir.
+    """
+    records: list[dict] = []
+    failures: list[tuple[str, str]] = []
+    attempted = 0
+
+    for index, role in enumerate(roles, start=1):
+        attempted = index
+        prompt = build_generation_prompt(role)
+        try:
+            raw = client.chat(
+                [{"role": "user", "content": prompt}], stage=stage, max_tokens=max_tokens
+            )
+            records.append(parse_generation_response(role, raw))
+        except JudgeParseError as exc:
+            failures.append((role, str(exc)))
+        except (BudgetExceeded, CircuitOpen) as exc:
+            print(f"\nDURDURULDU: {exc}", file=sys.stderr)
+            failures.append(
+                (role, f"DURDURULDU — koşuyu durduran bütçe/devre kesici tetikleyicisi: {exc}")
+            )
+            break
+        except GatewayError as exc:
+            failures.append((role, str(exc)))
+        print(f"\r{index}/{len(roles)} — {role:<16} hata: {len(failures)}", end="")
+
+    return records, failures, attempted
+
+
 def main() -> int:
     args = build_arg_parser().parse_args()
 
@@ -2023,36 +2113,18 @@ def main() -> int:
             return 1
         return 0
 
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    records: list[dict] = []
-    failures: list[tuple[str, str]] = []
-
-    for index, role in enumerate(roles, start=1):
-        prompt = build_generation_prompt(role)
-        try:
-            raw = client.chat(
-                [{"role": "user", "content": prompt}], stage=STAGE, max_tokens=4096
-            )
-            records.append(parse_generation_response(role, raw))
-        except JudgeParseError as exc:
-            failures.append((role, str(exc)))
-        except (BudgetExceeded, CircuitOpen) as exc:
-            print(f"\nDURDURULDU: {exc}", file=sys.stderr)
-            break
-        except GatewayError as exc:
-            failures.append((role, str(exc)))
-        print(f"\r{index}/{len(roles)} — {role:<16} hata: {len(failures)}", end="")
+    records, failures, attempted = run_generation_loop(roles, client)
 
     print()
     exit_code, roles_path, questions_path, roles_payload, questions_payload = write_artifacts(
-        config.DATA_DIR, records, failures, len(roles), args.allow_partial
+        config.DATA_DIR, roles, records, failures, attempted, args.allow_partial
     )
 
     pool_size = sum(len(record["questions"]) for record in records)
     shared = questions_payload["shared_questions"]
     print(
         f"Yazıldı: {roles_path} "
-        f"({roles_payload['produced']}/{roles_payload['attempted']} rol, "
+        f"({roles_payload['produced']}/{roles_payload['requested']} rol, "
         f"complete={roles_payload['complete']})"
     )
     print(f"Ortak soru havuzu: {pool_size} → {len(shared)} seçildi → {questions_path}")
@@ -2065,7 +2137,7 @@ def main() -> int:
     if exit_code != 0:
         print(
             f"\nHATA: koşu eksik kaldı ({roles_payload['produced']}/"
-            f"{roles_payload['attempted']}) ve --allow-partial verilmedi — "
+            f"{roles_payload['requested']}) ve --allow-partial verilmedi — "
             f"kanonik dosyalara DOKUNULMADI, bunun yerine {roles_path.name} / "
             f"{questions_path.name} yazıldı.",
             file=sys.stderr,
@@ -2080,21 +2152,31 @@ if __name__ == "__main__":
 
 - [ ] **Step 5b: Script'in yazma/isimlendirme mantığı için failing test'leri yaz**
 
-Ağa çıkmadan test edilebilmesi için dosya yazma mantığı yukarıdaki pure
-fonksiyonlara (`select_roles`, `build_roles_payload`,
-`build_questions_payload`, `resolve_artifact_paths`, `write_artifacts`,
-`build_arg_parser`) ayrıştırıldı. `scripts/00_generate_role_data.py` bir
-rakamla başladığı için normal `import` ile içe aktarılamaz;
-`tests/test_generate_role_data.py` `importlib.util.spec_from_file_location`
-ile dosya yolundan yükler. Testler şunları kapsar:
+Ağa çıkmadan test edilebilmesi için dosya yazma mantığı ve gönderim döngüsü
+yukarıdaki pure/ağsız-test-edilebilir fonksiyonlara (`select_roles`,
+`run_generation_loop`, `build_roles_payload`, `build_questions_payload`,
+`resolve_artifact_paths`, `write_artifacts`, `build_arg_parser`) ayrıştırıldı.
+`scripts/00_generate_role_data.py` bir rakamla başladığı için normal `import`
+ile içe aktarılamaz; `tests/test_generate_role_data.py`
+`importlib.util.spec_from_file_location` ile dosya yolundan yükler.
+`run_generation_loop` gerçek `GatewayClient` yerine `.chat()` çağrılarını
+sırayla önceden hazırlanmış yanıt/istisna listesinden karşılayan sahte bir
+`StubClient` ile test edilir — ağa hiç çıkılmaz. Testler şunları kapsar:
 
-- tam bir koşu (`produced == attempted`) kanonik `roles.json`/`questions.json`
+- tam bir koşu (`produced == requested`) kanonik `roles.json`/`questions.json`
   dosyalarını `complete: true` ile yazar,
 - eksik kalan bir koşu **yalnızca** `roles.partial.json`/`questions.partial.json`
   dosyalarını yazar, çıkış kodu sıfırdan farklıdır, ve mevcut kanonik
   dosyalara dokunmaz,
+- `not_attempted` döngünün hiç ulaşamadığı rolleri katalog sırasıyla listeler,
+  ve `attempted` batch büyüklüğü (`requested`) değil döngünün fiilen ulaştığı
+  rol sayısını yansıtır,
+- bütçe/devre kesici koşuyu durdurduğunda tetikleyici rol de, nedenini açıkça
+  "tetikleyici" olarak işaretleyen bir mesajla `failed`'a eklenir,
 - `--allow-partial` eksik sonucu kanonik dosya adlarına terfi ettirir (zarf
-  yine de `complete: false` der),
+  yine de `complete: false` der) VE stderr'e kaç rol/kaç istenen ve önceki tam
+  artifact'ın üzerine yazıldığını söyleyen bir `UYARI` basar — tam bir koşuda
+  bu uyarı basılmaz,
 - `--limit 0` tam 0 rol seçer (`--limit` verilmemesinden farklı).
 
 Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_generate_role_data.py -v`
@@ -2264,14 +2346,14 @@ Sonra gerçek koşu (1 istek/sn'de ~2 dakika):
 Run: `cd "/home/pc-8469/Asistant Axis" && uv run python scripts/00_generate_role_data.py`
 Expected: `Yazıldı: .../data/roles.json (120/120 rol, complete=True)`, `Gönderilen istek: 120`, çıkış kodu 0.
 
-Başarısız rol sayısı **10'u aşarsa** durup üretim promptunu gözden geçir — `hakem-llm` 40 soruluk JSON'u tutturamıyor olabilir; bu durumda soru sayısı 20'ye indirilip rol başına iki çağrıya bölünür (bütçe 130'a sığar: 120 değil 240 eder, o yüzden önce prompt düzeltmesi denenir). Bu durumda `produced < attempted` olacağı için script `data/roles.partial.json`/`data/questions.partial.json` yazıp çıkış kodu 1 ile döner — kanonik dosyalar oluşmaz, `--allow-partial` bilerek verilmedikçe.
+Başarısız rol sayısı **10'u aşarsa** durup üretim promptunu gözden geçir — `hakem-llm` 40 soruluk JSON'u tutturamıyor olabilir; bu durumda soru sayısı 20'ye indirilip rol başına iki çağrıya bölünür (bütçe 130'a sığar: 120 değil 240 eder, o yüzden önce prompt düzeltmesi denenir). Bu durumda `produced < requested` olacağı için script `data/roles.partial.json`/`data/questions.partial.json` yazıp çıkış kodu 1 ile döner — kanonik dosyalar oluşmaz, `--allow-partial` bilerek verilmedikçe. (Bütçe/devre kesici koşuyu erken durdurduysa `attempted` da `requested`'tan küçük kalır ve `not_attempted` denenmemiş rolleri katalog sırasıyla listeler.)
 
 - [ ] **Step 7: Üretilen veriyi gözle kontrol et**
 
 Run: `cd "/home/pc-8469/Asistant Axis" && python3 -c "
 import json
 payload = json.load(open('data/roles.json'))
-print(f\"complete={payload['complete']} — {payload['produced']}/{payload['attempted']} rol, {len(payload['failed'])} başarısız\")
+print(f\"complete={payload['complete']} — {payload['produced']}/{payload['requested']} rol, {len(payload['failed'])} başarısız\")
 rows = payload['roles']
 r = rows[0]
 print(r['role'], '—', r['description'])
@@ -2286,9 +2368,9 @@ Expected: `complete=True`, açıklamalar rolle uyumlu, talimatlar "You are a…"
 
 ## Plan 1 Tamamlanma Kriterleri
 
-- [ ] `uv run --extra dev pytest tests/ -v` — hepsi geçiyor (73 test: config 4, gateway 27, judge 13, roles 13, generate_role_data 16), hiçbiri ağa çıkmıyor
-- [ ] `data/roles.json` — `{"complete": true, "attempted": 120, "produced": 120, "failed": [], "roles": [120 rol, her biri description + 3 talimat + 40 soru]}`
-- [ ] `data/questions.json` — `{"complete": true, "attempted": 120, "produced": 120, "shared_questions": [40 ortak soru]}`
+- [ ] `uv run --extra dev pytest tests/ -v` — hepsi geçiyor (85 test: config 4, gateway 27, judge 13, roles 13, generate_role_data 28), hiçbiri ağa çıkmıyor
+- [ ] `data/roles.json` — `{"complete": true, "requested": 120, "attempted": 120, "produced": 120, "not_attempted": [], "failed": [], "roles": [120 rol, her biri description + 3 talimat + 40 soru]}`
+- [ ] `data/questions.json` — `{"complete": true, "requested": 120, "attempted": 120, "produced": 120, "shared_questions": [40 ortak soru]}`
 - [ ] `data/gateway_budget.json` — toplam ≈ 121 gönderim (1 smoke + 120 Aşama 0)
 - [ ] `git status --short` temiz; `data/` commit edilmemiş
 - [ ] Smoke testi adım 3 `TAMAM` — `hakem-llm` İngilizce JSON üretiyor
