@@ -286,7 +286,7 @@ Tüm dış çağrılar `gateway.py`'den geçer. Başka hiçbir modül HTTP yapma
 | Özellik | Davranış |
 |---|---|
 | Hız | Token bucket, **1 istek/sn**; semafor **2 eşzamanlı** |
-| Bütçe | Diske kalıcı sayaç. Global tavan **1500**, aşama başına alt bütçe. Aşılırsa `BudgetExceeded` fırlatır — sessizce devam **etmez** |
+| Bütçe | Diske kalıcı sayaç, **HTTP gönderimi** birimiyle (retry'lar dahil). Global tavan **1500**, aşama başına alt bütçe. Aşılırsa `BudgetExceeded` fırlatır — sessizce devam **etmez** |
 | Cache | `sha256(model, messages, params)` → yanıt. Tekrar koşular sıfır çağrı |
 | Retry | 429/5xx'te exponential backoff, en fazla 3 deneme |
 | Devre kesici | Üst üste 3 başarısız çağrı → tüm koşu durur (zorlanan sunucuyu dövmemek için) |
@@ -298,22 +298,39 @@ batch küçültülür, bütçe yükseltilmez.
 
 ### Bütçe dağılımı
 
-| Aşama | Çağrı |
-|---|---|
-| 0 — rol/soru üretimi | 120 |
-| 0.5 — hakem doğrulama | 5 |
-| 1 — rollout/aktivasyon | 0 |
-| 2 — rol ifadesi filtresi | 250 |
-| 3 — eksen çıkarımı | 0 |
-| 4 — steering sweep | 175 |
-| 5 — persona drift | 320 |
-| 6 — capping | 150 |
-| 7 — Türkçe transfer | 60 |
-| **Toplam** | **1,080** |
-| **Kodda sert tavan** | **1,500** |
+**Birim uyarısı — iki sütun iki farklı şey sayar.** *Mantıksal çağrı* bir aşamanın
+kaç kez "modele sor" dediğidir. *Bütçe* ise `gateway.py`'nin diskteki sayacının saydığı
+şeydir: **HTTP gönderimi, retry'lar dahil.** Bir mantıksal çağrı geçici bir 429/5xx'te
+`MAX_RETRIES` kadar (3) gönderim harcayabilir. Kodda sert tavan (`GLOBAL_BUDGET`) da
+gönderim cinsindendir.
 
-1 istek/sn'de bu ~18 dakikalık gerçek istek süresidir, günlere yayılmış — production trafiği
-içinde fark edilmez.
+**Retry payı.** Her aşamanın bütçesi mantıksal çağrı sayısının üstünde açık bir pay
+taşır (≈ %20, küçük aşamalarda en az 10 gönderim, 5'in katına yuvarlanmış). Pay olmadan
+bir aşamanın bütçesi çağrı sayısına eşit olurdu ve **tek bir geçici 5xx** aşamayı sonuna
+varmadan keserdi.
+
+| Aşama | Anahtar (`STAGE_BUDGETS`) | Mantıksal çağrı | Retry payı | Bütçe (gönderim) |
+|---|---|---:|---:|---:|
+| — smoke testi (Plan 1) | `smoke` | 2 | 8 | 10 |
+| 0 — rol/soru üretimi | `stage0_roles` | 120 | 25 | 145 |
+| 0.5 — hakem doğrulama | `stage05_judge_gate` | 5 | 10 | 15 |
+| 1 — rollout/aktivasyon | — | 0 | 0 | 0 |
+| 2 — rol ifadesi filtresi | `stage2_probe_labels` | 250 | 50 | 300 |
+| 3 — eksen çıkarımı | — | 0 | 0 | 0 |
+| 4 — steering sweep | `stage4_steering` | 175 | 35 | 210 |
+| 5 — persona drift | `stage5_drift` | 320 | 65 | 385 |
+| 6 — capping | `stage6_capping` | 150 | 30 | 180 |
+| 7 — Türkçe transfer | `stage7_turkish` | 60 | 15 | 75 |
+| **Toplam** | | **1,082** | **238** | **1,320** |
+| **Kodda sert tavan** | `GLOBAL_BUDGET` | | | **1,500** |
+
+Bu tablo `src/aax/config.py`'deki `STAGE_LOGICAL_CALLS` ve `STAGE_BUDGETS` ile birebir
+aynıdır ve `tests/test_config.py` ikisinin sürüklenmesini engeller. Aşama bütçeleri
+toplamı sert tavanın altında kalmak **zorundadır**; tavan yükseltilmez, sığmayan batch
+küçültülür.
+
+1 istek/sn'de bu ~22 dakikalık gerçek istek süresidir, günlere yayılmış — production
+trafiği içinde fark edilmez.
 
 ## 7. Başarı kriterleri
 

@@ -439,6 +439,29 @@ class GatewayClient:
         payload = self._payload(messages, temperature, max_tokens)
         return self._cache_read(self._cache_key(payload)) is None
 
+    def remaining_budget(self, stage: str) -> tuple[int, int]:
+        """`(aşama için kalan, global kalan)` — istek atmaz, bütçe harcamaz.
+
+        `--dry-run` ön kontrolünün ihtiyacı olan sayı budur. Planlanan çağrıyı
+        `config.STAGE_BUDGETS[stage]` ile kıyaslamak yanıltıcıdır: aşama
+        bütçesinin çoğu önceki bir koşuda harcanmış olabilir ve tavana ne
+        kadar KALDIĞI diskteki sayaca bağlıdır.
+
+        Bilinmeyen aşama adı `chat()` ile aynı şekilde `ValueError`'dır:
+        `--dry-run`, yazım hatası yüzünden temiz bir 0 dönmemeli.
+        """
+        stage_cap = self.config.stage_budgets.get(stage)
+        if stage_cap is None:
+            raise ValueError(
+                f"Bilinmeyen aşama adı: {stage!r}. "
+                f"Tanımlı aşamalar: {sorted(self.config.stage_budgets)}"
+            )
+        with self._budget_file_lock():
+            counts = self._read_budget()
+        stage_remaining = max(0, stage_cap - counts.get(stage, 0))
+        global_remaining = max(0, self.config.global_budget - sum(counts.values()))
+        return stage_remaining, global_remaining
+
     def chat(
         self,
         messages: list[dict],
