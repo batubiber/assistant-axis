@@ -1041,3 +1041,120 @@ def test_main_rejects_unknown_stage_in_dry_run(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="Bilinmeyen aşama"):
         main_with(["--dry-run", "--limit", "2"])
+
+
+# --- I5: tanı sarmalayıcısı (iyi bicimde hata mesajları) ----------------------
+
+
+def test_main_missing_api_key_produces_diagnostic(monkeypatch, capsys):
+    """APP_KEY_JAILBREAK yoksa traceback yerine tanı çıkmalı."""
+
+    def raise_missing_key():
+        raise RuntimeError(
+            "APP_KEY_JAILBREAK ortam değişkeni tanımlı değil. "
+            "Dağıtım ortamınızın .env dosyasından alıp kabuğunuzda export edin."
+        )
+
+    monkeypatch.setattr(grd, "build_default_client", raise_missing_key)
+
+    exit_code = main_with([])
+
+    assert exit_code == 2, "eksik anahtar EXIT_KOSULAMADI (2) dönmeli"
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err, "hata iletisi Türkçe tanı içermeli"
+    assert "gateway istemcisi kurulamadı" in err
+    assert "APP_KEY_JAILBREAK" in err
+    assert "RuntimeError" not in err, "traceback içermemeli"
+
+
+def test_main_budget_corrupted_during_dry_run_produces_diagnostic(
+    tmp_path, monkeypatch, capsys
+):
+    """BudgetCorrupted --dry-run sırasında tanısal mesaj ile EXIT_KOSULAMADI dönmeli."""
+
+    class MockClientBudgetCorrupted:
+        def remaining_budget(self, stage):
+            raise BudgetCorrupted("bütçe dosyası ayrıştırılamadı")
+
+        def would_call(self, *args, **kwargs):
+            return True
+
+    monkeypatch.setattr(grd, "build_default_client", lambda: MockClientBudgetCorrupted())
+
+    exit_code = main_with(["--dry-run", "--limit", "1"])
+
+    assert exit_code == 2, "gateway hatası EXIT_KOSULAMADI (2) dönmeli"
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "bütçe dosyası" in err
+    assert "BudgetCorrupted" not in err, "sınıf adını göstermemeli"
+
+
+def test_main_budget_exceeded_during_dry_run_produces_diagnostic(
+    tmp_path, monkeypatch, capsys
+):
+    """BudgetExceeded --dry-run sırasında tanısal mesaj ile EXIT_KOSULAMADI dönmeli."""
+
+    class MockClientBudgetExceeded:
+        def remaining_budget(self, stage):
+            raise BudgetExceeded("'stage0_roles' aşama bütçesi doldu: 145/145")
+
+        def would_call(self, *args, **kwargs):
+            return True
+
+    monkeypatch.setattr(grd, "build_default_client", lambda: MockClientBudgetExceeded())
+
+    exit_code = main_with(["--dry-run", "--limit", "1"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "bütçe" in err
+    assert "dolu" in err
+    assert "BudgetExceeded" not in err, "sınıf adını göstermemeli"
+
+
+def test_main_circuit_open_during_dry_run_produces_diagnostic(
+    tmp_path, monkeypatch, capsys
+):
+    """CircuitOpen --dry-run sırasında tanısal mesaj ile EXIT_KOSULAMADI dönmeli."""
+
+    class MockClientCircuitOpen:
+        def remaining_budget(self, stage):
+            raise CircuitOpen("devre kesici açık")
+
+        def would_call(self, *args, **kwargs):
+            return True
+
+    monkeypatch.setattr(grd, "build_default_client", lambda: MockClientCircuitOpen())
+
+    exit_code = main_with(["--dry-run", "--limit", "1"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "devre kesici" in err
+    assert "CircuitOpen" not in err, "sınıf adını göstermemeli"
+
+
+def test_main_gateway_error_during_dry_run_produces_diagnostic(
+    tmp_path, monkeypatch, capsys
+):
+    """GatewayError --dry-run sırasında tanısal mesaj ile EXIT_KOSULAMADI dönmeli."""
+
+    class MockClientGatewayError:
+        def remaining_budget(self, stage):
+            raise GatewayError("HTTP 500 Sunucu Hatası")
+
+        def would_call(self, *args, **kwargs):
+            return True
+
+    monkeypatch.setattr(grd, "build_default_client", lambda: MockClientGatewayError())
+
+    exit_code = main_with(["--dry-run", "--limit", "1"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "gateway çağrısı" in err
+    assert "GatewayError" not in err, "sınıf adını göstermemeli"
