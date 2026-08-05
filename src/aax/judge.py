@@ -22,8 +22,76 @@ class SupportsChat(Protocol):
     ) -> str: ...
 
 
+def _drop_trailing_commas(text: str) -> str:
+    r"""Sadece JSON string literal'lerinin DIŞINDAki sondaki virgülleri kaldır.
+
+    `re.sub(r",(\s*[\]}])", r"\1", text)` gibi saf bir regex burada YANLIŞ
+    olur: bu modülün girdileri doğal dil sorularıdır ve meşru bir string
+    değeri harfiyen `,]` veya `,}` içerebilir. Regex bunu göremez ve string
+    içeriğini sessizce bozar — bu projenin tasarımının yasakladığı tam olarak
+    o türden sessiz veri hasarıdır.
+
+    Bunun yerine metni karakter karakter tarar, backslash kaçışlarına saygı
+    göstererek bir string literal'in içinde olup olmadığını takip eder ve
+    bir virgülü yalnızca string DIŞINDAyken ve bir sonraki boşluk-olmayan
+    karakter `]` veya `}` ise atar.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    length = len(text)
+    i = 0
+    while i < length:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == ",":
+            j = i + 1
+            while j < length and text[j] in " \t\r\n":
+                j += 1
+            if j < length and text[j] in "]}":
+                # Sondaki virgül: at, geri kalanı (boşluk + kapanış) sonraki
+                # yinelemelerde olduğu gibi eklenecek.
+                i += 1
+                continue
+
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def extract_json(text: str) -> Any:
-    """Model çıktısından JSON çıkar; fence ve çevre metnine dayanıklı."""
+    """Model çıktısından JSON çıkar; fence ve çevre metnine dayanıklı.
+
+    Önce her aday, onarım yapılmadan sıkı biçimde ayrıştırılır — aday sırası
+    ve bu katı davranış korunur. Hiçbir aday sıkı biçimde ayrıştırılamazsa,
+    SON ÇARE olarak her aday üzerinde sondaki virgülleri kaldıran bir onarım
+    denenir (bkz. `_drop_trailing_commas`). Sıkı biçimde ayrıştırılabilen
+    hiçbir şey bu onarım yoluna girmez.
+
+    Bu onarım, modülün "belirsizse reddet, tahmin etme" ilkesini ihlal etmez.
+    O ilke ANLAMSAL belirsizlikle ilgilidir ve mutlak kalır — bu modüldeki
+    önceki bir düzeltme `[true, false]` dizisinin `1, 0` puanları olarak
+    okunmasını reddetmişti ve bu red geçerliliğini korur. Sondaki virgül
+    farklı bir kategoridir: `[1, 2,]` dizisinin tek bir olası okunuşu vardır
+    ve virgülü kaldırmak kayıpsızdır. Bu ayrımı görmezden gelip buraya başka
+    bir tahmin/coerce mekanizması eklemeyin.
+    """
     candidates: list[str] = [text.strip()]
     candidates.extend(m.group(1).strip() for m in _FENCE_RE.finditer(text))
     for opener, closer in (("[", "]"), ("{", "}")):
@@ -37,6 +105,13 @@ def extract_json(text: str) -> Any:
             return json.loads(candidate)
         except ValueError:
             continue
+
+    for candidate in candidates:
+        try:
+            return json.loads(_drop_trailing_commas(candidate))
+        except ValueError:
+            continue
+
     raise JudgeParseError(f"JSON çıkarılamadı: {text[:200]!r}")
 
 
