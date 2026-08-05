@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Çalışma dizini `/home/pc-8469/Asistant Axis` — **adında boşluk var**, kabuk komutlarında yollar tırnaklanır.
+- Çalışma dizini `/home/pc-8469/assistant-axis` — **adında boşluk var**, kabuk komutlarında yollar tırnaklanır.
 - Gateway endpoint: `https://gateway.invalid/app`, model adı `hakem-llm`.
 - API anahtarı **yalnızca** `APP_KEY_JAILBREAK` ortam değişkeninden okunur. Hiçbir dosyaya, log'a, teste veya commit'e yazılmaz.
 - Hız sınırı: **1 istek/saniye**, en fazla **2 eşzamanlı**. Bu ikisi ve devre kesici **endpoint başına, süreç genelinde paylaşılır** (`base_url` ile anahtarlanan modül düzeyi kayıt defteri) — aynı süreçte kaç `GatewayClient` üretilirse üretilsin tek bütçeye uyarlar. `build_default_client()` memoize edilir.
@@ -176,7 +176,7 @@ def test_gateway_url_targets_jailbreak_app():
 
 - [ ] **Step 3: Test'in başarısız olduğunu doğrula**
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_config.py -v`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/test_config.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'aax'`
 
 - [ ] **Step 4: `src/aax/__init__.py` ve `src/aax/config.py` yaz**
@@ -281,7 +281,7 @@ def api_key() -> str:
 
 - [ ] **Step 5: Testlerin geçtiğini doğrula**
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_config.py -v`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/test_config.py -v`
 Expected: PASS, 7 passed
 
 - [ ] **Step 6: Commit**
@@ -1435,7 +1435,7 @@ def test_close_is_noop_for_plain_callable_transport(tmp_path):
 
 - [ ] **Step 2: Test'lerin başarısız olduğunu doğrula**
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_gateway.py -v`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/test_gateway.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'aax.gateway'`
 
 - [ ] **Step 3: `src/aax/gateway.py` yaz**
@@ -2037,12 +2037,12 @@ def build_default_client(stage_budgets: dict[str, int] | None = None) -> Gateway
 
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_gateway.py -v`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/test_gateway.py -v`
 Expected: PASS, 52 passed
 
 - [ ] **Step 5: Hiçbir testin ağa çıkmadığını doğrula**
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/ -v -p no:cacheprovider 2>&1 | grep -ci "httpx\|connection\|timeout" || echo "ağ izi yok"`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/ -v -p no:cacheprovider 2>&1 | grep -ci "httpx\|connection\|timeout" || echo "ağ izi yok"`
 Expected: `ağ izi yok` — testler yalnızca enjekte edilen sahte transport'u kullanır.
 
 - [ ] **Step 6: Commit**
@@ -2206,7 +2206,7 @@ def test_prompt_contains_role_and_rubric():
 
 - [ ] **Step 2: Test'lerin başarısız olduğunu doğrula**
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_judge.py -v`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/test_judge.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'aax.judge'`
 
 - [ ] **Step 3: `src/aax/judge.py` yaz**
@@ -2324,7 +2324,7 @@ subclass here.
 
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_judge.py -v`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/test_judge.py -v`
 Expected: PASS, 13 passed
 
 - [ ] **Step 5: Commit**
@@ -2504,7 +2504,7 @@ def test_parse_generation_response_rejects_non_string_instruction_item():
 
 - [ ] **Step 2: Test'lerin başarısız olduğunu doğrula**
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_roles.py -v`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/test_roles.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'aax.roles'`
 
 - [ ] **Step 3: `src/aax/roles.py` yaz**
@@ -2629,7 +2629,7 @@ def _require_string_items(role: str, field_name: str, items: list) -> list[str]:
 
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_roles.py -v`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/test_roles.py -v`
 Expected: PASS, 13 passed
 
 - [ ] **Step 5: Aşama 0 script'ini yaz**
@@ -3169,14 +3169,14 @@ her iki yolda da ağa hiç çıkılmaz. Testler şunları kapsar:
   `--allow-partial` verilse bile sıfırdan farklı çıkar,
 - `--limit 0` tam 0 rol seçer (`--limit` verilmemesinden farklı).
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_generate_role_data.py -v`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/test_generate_role_data.py -v`
 Expected: PASS, 59 passed
 
 - [ ] **Step 6: Script'in dry-run modunu doğrula**
 
 Anahtar gerektirir ama istek atmaz.
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run python scripts/00_generate_role_data.py --dry-run`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run python scripts/00_generate_role_data.py --dry-run`
 Expected: `Planlanan çağrı:      120 (cache'te: 0)`, `Aşama bütçesi:        145 (kalan: 145)`,
 `Global tavan:         1500 (kalan: ~1499)`, çıkış kodu 0. (Smoke testi zaten koşulduysa
 global kalan 1499'dur.)
@@ -3461,7 +3461,7 @@ ayrıştırılamayan koşu, şekli farklı ama ayrışan JSON, **ilk çağrını
 ettiği koşu** (cache arızasıyla karıştırılmamalı), eksik anahtar ve dört
 gateway istisnasının her biri için tanı metni + çıkış kodu.
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run --extra dev pytest tests/test_smoke_gateway.py -v`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/test_smoke_gateway.py -v`
 Expected: PASS, 27 passed
 
 - [ ] **Step 2: Anahtarı export et ve çalıştır — GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
@@ -3476,19 +3476,19 @@ Expected: PASS, 27 passed
 export APP_KEY_JAILBREAK="<dağıtım ortamının .env dosyasından>"
 ```
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run python scripts/01_smoke_gateway.py`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run python scripts/01_smoke_gateway.py`
 Expected: üç adım da `TAMAM`, `Toplam gönderilen istek: 1`, çıkış kodu 0.
 
 Adım 3 `BAŞARISIZ` verirse **Plan 2'ye geçme** — hakem promptu stratejisi yeniden düşünülmeli (spec Aşama 0.5'in geri çekilme yolu: promptu Türkçeleştir).
 
 - [ ] **Step 3: Log ve bütçe dosyalarının yazıldığını doğrula — GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
 
-Run: `cd "/home/pc-8469/Asistant Axis" && cat data/gateway_budget.json && wc -l data/gateway_calls.jsonl`
+Run: `cd "/home/pc-8469/assistant-axis" && cat data/gateway_budget.json && wc -l data/gateway_calls.jsonl`
 Expected: `{"smoke": 1}` ve 2 satır log (biri `cached: true`).
 
 - [ ] **Step 4: Hiçbir veri dosyasının commit'e girmediğini doğrula — GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
 
-Run: `cd "/home/pc-8469/Asistant Axis" && git status --short`
+Run: `cd "/home/pc-8469/assistant-axis" && git status --short`
 Expected: `data/` altında hiçbir dosya listelenmemeli (`.gitignore` çalışıyor).
 
 - [ ] **Step 5: Commit**
@@ -3502,12 +3502,12 @@ git commit -m "feat: gateway canlı smoke testi"
 
 Smoke geçtikten sonra 120 rolün verisini üret. Dry-run önce:
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run python scripts/00_generate_role_data.py --dry-run`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run python scripts/00_generate_role_data.py --dry-run`
 Expected: `Planlanan çağrı: 120`, çıkış kodu 0.
 
 Sonra gerçek koşu (1 istek/sn'de ~2 dakika):
 
-Run: `cd "/home/pc-8469/Asistant Axis" && uv run python scripts/00_generate_role_data.py`
+Run: `cd "/home/pc-8469/assistant-axis" && uv run python scripts/00_generate_role_data.py`
 Expected: `Yazıldı: .../data/roles.json (120/120 rol, complete=True)`, `Gönderilen istek: 120`, çıkış kodu 0.
 
 Üst üste **10** rolde ayrıştırma hatası olursa script **kendiliğinden durur** (`--max-parse-failures`, varsayılan 10) — bu artık elle uygulanan bir talimat değil, kodun uyguladığı bir kapıdır. Neden gerekli: gövdesi ayrışan ama kullanılamayan bir 200 taşıma devre kesicisini **sıfırlar**, yani `hakem-llm` istenen JSON'u üretemiyorsa aşama bütçesinin tamamı sıfır kayıt için yanardı.
@@ -3516,7 +3516,7 @@ Bu durumda üretim promptunu gözden geçir — `hakem-llm` 40 soruluk JSON'u tu
 
 - [ ] **Step 7: Üretilen veriyi gözle kontrol et — GEREKİR: `APP_KEY_JAILBREAK`, HENÜZ ÇALIŞTIRILMADI**
 
-Run: `cd "/home/pc-8469/Asistant Axis" && python3 -c "
+Run: `cd "/home/pc-8469/assistant-axis" && python3 -c "
 import json
 payload = json.load(open('data/roles.json'))
 print(f\"complete={payload['complete']} — {payload['produced']}/{payload['requested']} rol, {len(payload['failed'])} başarısız\")

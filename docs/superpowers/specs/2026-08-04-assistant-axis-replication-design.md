@@ -90,7 +90,7 @@ vLLM ile HF arasındaki sayısal farklar sonucu etkilemez: vLLM'den **yalnızca 
 ### 4.2 Repo yapısı
 
 ```
-Asistant Axis/                      # kendi git repo'su (nested; ev dizini repo'sundan bağımsız)
+assistant-axis/                     # kendi git repo'su (nested; ev dizini repo'sundan bağımsız)
   pyproject.toml                    # uv ile yönetilir
   src/aax/
     config.py                       # model id, yollar, katman oranları, bütçe tavanları
@@ -403,6 +403,8 @@ Bilinçli olarak yapılmayacaklar:
 
 - Proje dizini kendi git repo'su olarak başlatılır. Ev dizini de bir git repo'sudur (CartPole'u izler);
   nested repo dıştakini etkilemez ve yanlışlıkla oraya commit edilmesini önler.
-- Dizin adında boşluk var (`Asistant Axis`). Script'lerde her yol tırnaklanır.
-  `assistant-axis`'e yeniden adlandırma önerildi, kullanıcı kararına bırakıldı.
+- Proje dizini `~/assistant-axis`. 2026-08-05'te `Asistant Axis`'ten yeniden adlandırıldı —
+  eski adda boşluk vardı ve her kabuk komutunda tırnak gerektiriyordu. Kod hiçbir zaman
+  mutlak yol içermedi (`config.py` yolları `__file__`'dan türetiyor), bu yüzden taşıma
+  yalnızca iki dokümanı ve bir izin girdisini etkiledi.
 - `data/`, `.env`, `*.npy` ve tüm anahtarlar `.gitignore`'da.
