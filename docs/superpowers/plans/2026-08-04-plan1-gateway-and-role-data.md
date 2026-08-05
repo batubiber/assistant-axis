@@ -2061,6 +2061,8 @@ Küçük ve orta boy modellerin JSON çıktısı güvenilmezdir: markdown fence 
 **Files:**
 - Create: `src/aax/judge.py`
 - Test: `tests/test_judge.py`
+- Fixture: `tests/fixtures/prophet_trailing_comma.txt` — gerçek `hakem-llm`
+  koşusundan yakalanmış, sondaki virgül içeren tam model yanıtı
 
 **Interfaces:**
 - Consumes: `aax.gateway.GatewayClient.chat` (Task 2)
@@ -2077,14 +2079,21 @@ Küçük ve orta boy modellerin JSON çıktısı güvenilmezdir: markdown fence 
 `tests/test_judge.py`:
 
 ```python
+import json
+from pathlib import Path
+from unittest import mock
+
 import pytest
 
 from aax.judge import (
     ROLE_SCORE_RUBRIC,
     JudgeParseError,
+    _drop_trailing_commas,
     extract_json,
     score_role_expression,
 )
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
 def test_extract_bare_json_array():
@@ -2114,6 +2123,87 @@ def test_extract_json_with_leading_prose_no_fence():
 def test_extract_raises_on_garbage():
     with pytest.raises(JudgeParseError):
         extract_json("burada hiç json yok")
+
+
+# --- Sondaki virgül onarımı (gerçek `hakem-llm` koşusunda `prophet` rolünün
+# başarısız olduğu vaka) -------------------------------------------------
+
+
+def test_drop_trailing_commas_before_bracket():
+    assert _drop_trailing_commas("[1, 2,]") == "[1, 2]"
+
+
+def test_drop_trailing_commas_before_brace():
+    assert _drop_trailing_commas('{"a": 1,}') == '{"a": 1}'
+
+
+def test_drop_trailing_commas_multiple_in_one_document():
+    text = '{"a": [1, 2,], "b": {"c": 3,},}'
+    assert _drop_trailing_commas(text) == '{"a": [1, 2], "b": {"c": 3}}'
+
+
+def test_drop_trailing_commas_preserves_string_containing_comma_bracket():
+    # Bir string değeri harfiyen ",]" veya ",}" içerebilir; scanner bunu
+    # bozmamalı.
+    text = '["a value with ,] inside", "another with ,} too",]'
+    expected = '["a value with ,] inside", "another with ,} too"]'
+    assert _drop_trailing_commas(text) == expected
+
+
+def test_drop_trailing_commas_handles_escaped_quote_before_trailing_comma():
+    # Kaçışlı bir tırnak, string'in bittiğini yanlış işaretlememeli — aksi
+    # halde tarayıcı senkronunu kaybeder.
+    text = r'["she said \"hi,]\" to me",]'
+    expected = r'["she said \"hi,]\" to me"]'
+    assert _drop_trailing_commas(text) == expected
+
+
+def test_drop_trailing_commas_no_trailing_commas_unchanged():
+    text = '{"a": [1, 2], "b": "no trailing comma here"}'
+    assert _drop_trailing_commas(text) == text
+
+
+def test_extract_json_repairs_trailing_comma_array():
+    assert extract_json("[1, 2, 3,]") == [1, 2, 3]
+
+
+def test_extract_json_repairs_trailing_comma_object():
+    assert extract_json('{"a": 1, "b": 2,}') == {"a": 1, "b": 2}
+
+
+def test_extract_json_repair_does_not_touch_string_with_comma_bracket():
+    text = '{"note": "list is a,] weird case", "n": 1,}'
+    assert extract_json(text) == {"note": "list is a,] weird case", "n": 1}
+
+
+def test_extract_json_repair_cannot_save_genuinely_malformed_json():
+    with pytest.raises(JudgeParseError):
+        extract_json("{not json at all, ]")
+
+
+def test_extract_json_valid_input_never_reaches_repair():
+    # Sıkı bir şekilde ayrıştırılabilen girdi, onarım yoluna hiç girmemeli.
+    with mock.patch("aax.judge._drop_trailing_commas") as repair:
+        result = extract_json("[1, 2, 3]")
+    assert result == [1, 2, 3]
+    repair.assert_not_called()
+
+
+def test_extract_json_real_prophet_fixture_parses_after_repair():
+    raw = (FIXTURES_DIR / "prophet_trailing_comma.txt").read_text(encoding="utf-8")
+    parsed = extract_json(raw)
+    assert isinstance(parsed, dict)
+    assert len(parsed["instructions"]) == 3
+    assert len(parsed["questions"]) == 40
+
+
+def test_extract_json_real_prophet_fixture_needs_repair():
+    # Belgeler bu fixture'ın sıkı ayrıştırmayı başarısız kıldığını iddia
+    # ediyor; bunu doğrula, aksi halde yukarıdaki test onarım yolunu hiç
+    # egzersiz etmeyebilir.
+    raw = (FIXTURES_DIR / "prophet_trailing_comma.txt").read_text(encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(raw.strip())
 
 
 class StubClient:
@@ -2236,8 +2326,76 @@ class SupportsChat(Protocol):
     ) -> str: ...
 
 
+def _drop_trailing_commas(text: str) -> str:
+    r"""Sadece JSON string literal'lerinin DIŞINDAki sondaki virgülleri kaldır.
+
+    `re.sub(r",(\s*[\]}])", r"\1", text)` gibi saf bir regex burada YANLIŞ
+    olur: bu modülün girdileri doğal dil sorularıdır ve meşru bir string
+    değeri harfiyen `,]` veya `,}` içerebilir. Regex bunu göremez ve string
+    içeriğini sessizce bozar — bu projenin tasarımının yasakladığı tam olarak
+    o türden sessiz veri hasarıdır.
+
+    Bunun yerine metni karakter karakter tarar, backslash kaçışlarına saygı
+    göstererek bir string literal'in içinde olup olmadığını takip eder ve
+    bir virgülü yalnızca string DIŞINDAyken ve bir sonraki boşluk-olmayan
+    karakter `]` veya `}` ise atar.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    length = len(text)
+    i = 0
+    while i < length:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == ",":
+            j = i + 1
+            while j < length and text[j] in " \t\r\n":
+                j += 1
+            if j < length and text[j] in "]}":
+                # Sondaki virgül: at, geri kalanı (boşluk + kapanış) sonraki
+                # yinelemelerde olduğu gibi eklenecek.
+                i += 1
+                continue
+
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def extract_json(text: str) -> Any:
-    """Model çıktısından JSON çıkar; fence ve çevre metnine dayanıklı."""
+    """Model çıktısından JSON çıkar; fence ve çevre metnine dayanıklı.
+
+    Önce her aday, onarım yapılmadan sıkı biçimde ayrıştırılır — aday sırası
+    ve bu katı davranış korunur. Hiçbir aday sıkı biçimde ayrıştırılamazsa,
+    SON ÇARE olarak her aday üzerinde sondaki virgülleri kaldıran bir onarım
+    denenir (bkz. `_drop_trailing_commas`). Sıkı biçimde ayrıştırılabilen
+    hiçbir şey bu onarım yoluna girmez.
+
+    Bu onarım, modülün "belirsizse reddet, tahmin etme" ilkesini ihlal etmez.
+    O ilke ANLAMSAL belirsizlikle ilgilidir ve mutlak kalır — bu modüldeki
+    önceki bir düzeltme `[true, false]` dizisinin `1, 0` puanları olarak
+    okunmasını reddetmişti ve bu red geçerliliğini korur. Sondaki virgül
+    farklı bir kategoridir: `[1, 2,]` dizisinin tek bir olası okunuşu vardır
+    ve virgülü kaldırmak kayıpsızdır. Bu ayrımı görmezden gelip buraya başka
+    bir tahmin/coerce mekanizması eklemeyin.
+    """
     candidates: list[str] = [text.strip()]
     candidates.extend(m.group(1).strip() for m in _FENCE_RE.finditer(text))
     for opener, closer in (("[", "]"), ("{", "}")):
@@ -2251,6 +2409,13 @@ def extract_json(text: str) -> Any:
             return json.loads(candidate)
         except ValueError:
             continue
+
+    for candidate in candidates:
+        try:
+            return json.loads(_drop_trailing_commas(candidate))
+        except ValueError:
+            continue
+
     raise JudgeParseError(f"JSON çıkarılamadı: {text[:200]!r}")
 
 
@@ -2325,7 +2490,15 @@ subclass here.
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
 Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/test_judge.py -v`
-Expected: PASS, 13 passed
+Expected: PASS, 26 passed
+
+**Post-hoc fix (canlı `hakem-llm` koşusunda `prophet` rolü sondaki virgül
+yüzünden ayrıştırma hatası verdi):** `extract_json` artık her sıkı aday
+başarısız olduktan SONRA, son çare olarak `_drop_trailing_commas` ile
+onarılmış adayları dener — aday sırası ve sıkı davranış değişmeden.
+Gerçek başarısız yanıt `tests/fixtures/prophet_trailing_comma.txt`'e
+fixture olarak eklendi. Toplam test sayısı 194 → 207 (test_judge.py:
+13 → 26).
 
 - [ ] **Step 5: Commit**
 
