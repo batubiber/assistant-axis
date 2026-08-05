@@ -2354,30 +2354,39 @@ git commit -m "feat: hakem modülü ve dayanıklı JSON ayrıştırma"
     - `run_generation_loop(roles, client, *, stage=STAGE, max_tokens=CHAT_MAX_TOKENS, max_consecutive_parse_failures=10) -> tuple[records, failures, attempted, stop_reason]` — rolleri sırayla gönderir; `attempted` döngünün fiilen ulaştığı rol sayısıdır (`len(roles)` ile karıştırılmamalı), `stop_reason` koşuyu durduran nedendir (durmadıysa `None`). **Hiçbir istisna bu döngüden dışarı sızmaz** — `BudgetCorrupted`, bilinmeyen aşama `ValueError`'ı ve `KeyboardInterrupt` dahil; ne çıkarsa çıksın `failures`'a kaydedilir, döngü kırılır ve o ana kadarki iş `main()` tarafından diske yazılır. Durdurma nedenleri üç türlüdür ve `failed` içinde ayırt edilebilir kalır: bütçe/devre kesici tetikleyicisi, üst üste `max_consecutive_parse_failures` ayrıştırma hatası, beklenmeyen istisna.
     - `run_dry_run(client, roles) -> int` — istek atmadan planı **kalan** aşama ve **kalan** global bütçeyle kıyaslar, ikisini de raporlar, biri aşılırsa `1` döner
     - `compute_run_id(records) -> str` — üretilen rol adlarından (katalog sırasıyla) türetilen 16 haneli koşu kimliği. Saatten değil içerikten türetilir: aynı roller başarırsa aynı kimlik, dolayısıyla aynı `shared_questions`.
-    - `build_roles_payload(records, failures, requested, attempted, not_attempted) -> dict`, `build_questions_payload(records, requested, attempted) -> dict` — üç ayrı sayaç: `requested` (istenen batch büyüklüğü), `attempted` (döngünün ulaştığı rol sayısı), `produced` (başarıyla ayrıştırılan kayıt sayısı). **Değişmez:** `requested == produced + len(failed) + len(not_attempted)`.
-    - `resolve_artifact_paths(data_dir, complete, allow_partial) -> tuple[Path, Path]`
-    - `write_artifacts(data_dir, roles, records, failures, attempted, allow_partial) -> tuple[int, Path, Path, dict, dict]` — `not_attempted`'ı `roles[attempted:]`'ten türetir (rolleri her zaman katalog sırasıyla, aradan atlamadan işleyen `run_generation_loop` sayesinde bu her zaman doğru bir kuyruktur); iki artifact'ı geçici dosya + `os.replace` ile yayımlar (ikisi de tam yazılmadan hiçbiri yerine konmaz); `--allow-partial` eksik bir sonucu kanonik dosyalara terfi ettirdiğinde stderr'e açık bir `UYARI` yazar
+    - `build_roles_payload(records, failures, requested, attempted, not_attempted, limit=None) -> dict`, `build_questions_payload(records, requested, attempted, limit=None) -> dict` — üç ayrı sayaç: `requested` (istenen batch büyüklüğü), `attempted` (döngünün ulaştığı rol sayısı), `produced` (başarıyla ayrıştırılan kayıt sayısı). **Değişmez:** `requested == produced + len(failed) + len(not_attempted)`. Zarf ayrıca `catalog_size` (`len(ROLE_NAMES)`, sabit 120) ve `limit` (`--limit` değeri, verilmediyse `None`) taşır — `complete` TEK BAŞINA kanonikliğin kanıtı değildir (`--limit 3` ile üretilen 3 rol de `produced == requested` ile "complete" çıkar); tam kanoniklik kontrolü `complete and limit is None and requested == catalog_size`'tır.
+    - `resolve_artifact_paths(data_dir, complete, allow_partial, *, is_pilot=False) -> tuple[Path, Path]` — üç ayrı ad ailesinden birini döndürür: kanonik, `.partial.json`, `.pilot.json`. `is_pilot=True` (yani `--limit` verilmiş) HER ZAMAN önceliklidir: `complete`/`allow_partial` ne olursa olsun `.pilot.json` adlarını döndürür.
+    - `write_artifacts(data_dir, roles, records, failures, attempted, allow_partial, *, limit=None) -> tuple[int, Path, Path, dict, dict]` — `not_attempted`'ı `roles[attempted:]`'ten türetir (rolleri her zaman katalog sırasıyla, aradan atlamadan işleyen `run_generation_loop` sayesinde bu her zaman doğru bir kuyruktur); iki artifact'ı geçici dosya + `os.replace` ile yayımlar (ikisi de tam yazılmadan hiçbiri yerine konmaz). `limit is not None` olması koşuyu PİLOT yapar: dosya adları `.pilot.json` ailesine gider, kanonik VE `.partial.json` adlarının ikisi de bypass edilir; `--allow-partial` pilotlarda hiçbir etki yapmaz (o bayrak tam koşular içindir) — ne dosya adını terfi ettirir ne çıkış kodunu değiştirir. Pilot değilken eski mantık aynen sürer: `--allow-partial` eksik bir sonucu kanonik dosyalara terfi ettirdiğinde stderr'e açık bir `UYARI` yazar.
     - `main(argv: list[str] | None = None) -> int` — `argv` verilebilir olması `sys.argv`'ye dokunmadan uçtan uca test edilebilmesi içindir
     - `CHAT_TEMPERATURE` / `CHAT_MAX_TOKENS` — cache anahtarının parçası olan çağrı parametreleri. `chat` ve `would_call` yolları bu sabitleri **paylaşmak zorunda**: ayrışırlarsa `--dry-run` cache'teki kayıtları göremez ve her şeyi "planlanan" sayar.
   - Artifact (tam koşu): `data/roles.json` —
     ```json
-    {"run_id": "3f2a…", "complete": true, "requested": 120, "attempted": 120, "produced": 120, "not_attempted": [], "failed": [], "roles": [ {...120 rol} ]}
+    {"run_id": "3f2a…", "complete": true, "requested": 120, "attempted": 120, "produced": 120,
+     "catalog_size": 120, "limit": null, "not_attempted": [], "failed": [], "roles": [ {...120 rol} ]}
     ```
   - Artifact (tam koşu): `data/questions.json` —
     ```json
     {"run_id": "3f2a…", "complete": true, "requested": 120, "attempted": 120, "produced": 120,
+     "catalog_size": 120, "limit": null,
      "seed": 20260804, "role_count": 120, "pool_size": 4800, "shared_questions": [40 str]}
     ```
     `run_id` iki artifact'ta **aynıdır** ve üretilen rol adlarından türetilir. Amacı: `shared_questions` determinizmi tohuma DEĞİL, hangi rollerin başardığına da bağlıdır — `--allow-partial` ile yazılan kısmi bir soru kümesi sonradan tam bir koşuyla farklı 40 soruya takas edilebilir. Spec Aşama 1'in 14.400 rollout'u bu dosyaya bağlı olduğundan takasın diskten görülebilir olması şart.
   - Artifact (kesik koşu, ör. bütçe 45. rolde tetiklendi): `data/roles.partial.json` —
     ```json
     {"run_id": "9c81…", "complete": false, "requested": 120, "attempted": 45, "produced": 44,
+     "catalog_size": 120, "limit": null,
      "not_attempted": ["...kalan 75 rol, katalog sırasıyla..."],
      "failed": [{"role": "...", "reason": "DURDURULDU — koşuyu durduran bütçe/devre kesici tetikleyicisi: ..."}],
      "roles": [ {...44 rol} ]}
     ```
     Bu zarf kendi başına yeterlidir: bir operatörün "hangi roller kaldı?" sorusuna `ROLE_NAMES` ile set-diff almadan `not_attempted`'tan doğrudan cevap bulabilmesi, ve koşuyu hangi rolün durdurduğunu `failed`'daki tetikleyici kayıttan görebilmesi için.
-  - **Fail-closed:** `produced != requested` olan bir koşu (bütçe/devre kesici nedeniyle erken kesilmiş ya da tek tek rol ayrıştırma hataları birikmiş) `data/roles.json` / `data/questions.json`'a **yazmaz** — bunun yerine `data/roles.partial.json` / `data/questions.partial.json`'a yazar, mevcut tam artifact'lara dokunmaz, ve script sıfırdan farklı çıkış koduyla döner. `--allow-partial` bayrağı bu korumayı bilerek bypass edip kısmi sonucu kanonik dosya adlarına "terfi ettirir" (zarftaki `complete` yine `false` kalır) — bu terfi sessiz değildir, stderr'e kaç rolün kaç istenen üzerinden yazıldığını ve önceki tam artifact'ın üzerine yazıldığını söyleyen bir `UYARI` basılır.
+  - Artifact (pilot koşu, ör. `--limit 3`): `data/roles.pilot.json` —
+    ```json
+    {"run_id": "d1dd…", "complete": true, "requested": 3, "attempted": 3, "produced": 3,
+     "catalog_size": 120, "limit": 3, "not_attempted": [], "failed": [], "roles": [ {...3 rol} ]}
+    ```
+    Bulgu: `--limit 3` ile bir pilot koşu `produced == requested` olduğu için `complete: true` çıkabilir — bu onu 120 rollük kanonik kataloğa EŞİT YAPMAZ. Bir gerçek koşu daha önce yazılan bir pilotu görünce `data/roles.json`'ı 3 rollük bir katalog sanıp üzerine yazmıştı; bu yüzden `--limit` verilen HER koşu (tamamlansın ya da kesilsin) kanonik VE `.partial.json` adlarının ikisinden de ayrı, kendi `.pilot.json` ad ailesine yazılır ve `complete: true` ile bile `data/roles.json`/`data/questions.json`'a asla dokunmaz. `--allow-partial` bu davranışı değiştirmez — bayrak yalnızca tam koşular içindir.
+  - **Fail-closed:** `produced != requested` olan bir koşu (bütçe/devre kesici nedeniyle erken kesilmiş ya da tek tek rol ayrıştırma hataları birikmiş) `data/roles.json` / `data/questions.json`'a **yazmaz** — bunun yerine `data/roles.partial.json` / `data/questions.partial.json`'a yazar, mevcut tam artifact'lara dokunmaz, ve script sıfırdan farklı çıkış koduyla döner. `--allow-partial` bayrağı bu korumayı bilerek bypass edip kısmi sonucu kanonik dosya adlarına "terfi ettirir" (zarftaki `complete` yine `false` kalır) — bu terfi sessiz değildir, stderr'e kaç rolün kaç istenen üzerinden yazıldığını ve önceki tam artifact'ın üzerine yazıldığını söyleyen bir `UYARI` basılır. **Ama bu yalnızca TAM koşular için geçerlidir** — `--limit` verilmiş bir koşu (pilot) `complete`/`allow_partial` durumundan bağımsız olarak her zaman `.pilot.json` adlarına yazar; `--allow-partial` bir pilotu asla kanoniğe terfi ettirmez ve onu "başarı" saymaz (pilotun kendi başarısı yalnızca `complete`'e bakar).
 
 - [ ] **Step 1: Failing test'leri yaz**
 
@@ -2659,7 +2668,13 @@ import tempfile
 from pathlib import Path
 
 from aax import config
-from aax.gateway import BudgetExceeded, CircuitOpen, GatewayError, build_default_client
+from aax.gateway import (
+    BudgetCorrupted,
+    BudgetExceeded,
+    CircuitOpen,
+    GatewayError,
+    build_default_client,
+)
 from aax.judge import JudgeParseError
 from aax.roles import ROLE_NAMES, build_generation_prompt, parse_generation_response
 
@@ -2717,8 +2732,10 @@ def build_roles_payload(
     requested: int,
     attempted: int,
     not_attempted: list[str],
+    limit: int | None = None,
 ) -> dict:
-    """`roles.json`/`roles.partial.json` içeriği — bare list yerine zarf.
+    """`roles.json`/`roles.partial.json`/`roles.pilot.json` içeriği — bare
+    list yerine zarf.
 
     Üç sayaç bilerek birbirinden farklıdır:
 
@@ -2734,10 +2751,18 @@ def build_roles_payload(
 
     `complete` alanı `produced == requested` olup olmadığını taşır; downstream
     bir script'in kısmi bir katalogu tam sanmasını engellemek için bu zarf
-    gereklidir. `not_attempted`, döngünün hiç ulaşamadığı rolleri katalog
-    sırasıyla listeler — bir operatörün "hangi roller kaldı?" sorusuna
-    `ROLE_NAMES` ile set-diff almaya gerek kalmadan doğrudan bu dosyadan cevap
-    bulabilmesi için. `run_id`, `questions.json` ile eşleştirme içindir.
+    gereklidir. Ama `complete` TEK BAŞINA kanonikliğin kanıtı değildir: küçük
+    bir `--limit` verilmiş bir pilot koşu da `produced == requested` ile tam
+    çıkabilir ("3 istendi, 3 üretildi, complete: true") — bu onu 120 rollük
+    kataloğa eşit yapmaz. Bu yüzden `catalog_size` (`len(ROLE_NAMES)`, sabit
+    120) ve `limit` (`--limit` değeri, verilmediyse `None`) da zarfa yazılır.
+    Bir tüketicinin "bu gerçekten kanonik katalog mu?" sorusunun tam cevabı:
+    `complete and limit is None and requested == catalog_size`.
+
+    `not_attempted`, döngünün hiç ulaşamadığı rolleri katalog sırasıyla
+    listeler — bir operatörün "hangi roller kaldı?" sorusuna `ROLE_NAMES` ile
+    set-diff almaya gerek kalmadan doğrudan bu dosyadan cevap bulabilmesi
+    için. `run_id`, `questions.json` ile eşleştirme içindir.
     """
     produced = len(records)
     return {
@@ -2746,6 +2771,8 @@ def build_roles_payload(
         "requested": requested,
         "attempted": attempted,
         "produced": produced,
+        "catalog_size": len(ROLE_NAMES),
+        "limit": limit,
         "not_attempted": not_attempted,
         "failed": [{"role": role, "reason": reason} for role, reason in failures],
         "roles": records,
@@ -2763,10 +2790,13 @@ def sample_shared_questions(records: list[dict]) -> list[str]:
     return rng.sample(pool, min(SHARED_QUESTION_COUNT, len(pool)))
 
 
-def build_questions_payload(records: list[dict], requested: int, attempted: int) -> dict:
-    """`questions.json`/`questions.partial.json` içeriği.
+def build_questions_payload(
+    records: list[dict], requested: int, attempted: int, limit: int | None = None
+) -> dict:
+    """`questions.json`/`questions.partial.json`/`questions.pilot.json` içeriği.
 
-    Sayaç anlamları `build_roles_payload` ile birebir aynıdır (bkz. orada).
+    Sayaç anlamları `build_roles_payload` ile birebir aynıdır (bkz. orada) —
+    `catalog_size`/`limit` dahil, aynı gerekçeyle.
 
     Örnekleme girdileri (`seed`, `role_count`, `pool_size`) ve `run_id` de
     yazılır. Neden: `--allow-partial` ile koşan bir koşu kısmi bir havuzdan
@@ -2783,6 +2813,8 @@ def build_questions_payload(records: list[dict], requested: int, attempted: int)
         "requested": requested,
         "attempted": attempted,
         "produced": produced,
+        "catalog_size": len(ROLE_NAMES),
+        "limit": limit,
         "seed": SEED,
         "role_count": produced,
         "pool_size": len(pool),
@@ -2791,17 +2823,28 @@ def build_questions_payload(records: list[dict], requested: int, attempted: int)
 
 
 def resolve_artifact_paths(
-    data_dir: Path, complete: bool, allow_partial: bool
+    data_dir: Path, complete: bool, allow_partial: bool, *, is_pilot: bool = False
 ) -> tuple[Path, Path]:
-    """Kanonik dosya adlarını yalnızca koşu tamsa (ya da bilerek bypass
-    edildiyse) döndür.
+    """Üç ayrı dosya adı ailesinden doğrusunu seç: kanonik, partial, pilot.
 
-    Kapalı yönde (fail-closed) davranış: tamlığı kanıtlanamayan bir koşu
-    `data/roles.json` / `data/questions.json`'a asla dokunmaz — bunun
-    yerine `.partial.json` adlarına yazılır ve mevcut tam katalog olduğu
-    gibi kalır. `--allow-partial` bu korumayı bilinçli olarak devre dışı
-    bırakan görünür kaçış kapısıdır.
+    `is_pilot` (yani `--limit` verilmiş bir koşu) HER ZAMAN önceliklidir ve
+    `.pilot.json` adlarını döndürür — `complete` ne olursa olsun, `allow_partial`
+    ne olursa olsun. Bir pilot batch tanım gereği pilottur: `--limit 3` ile
+    üretilen 3 rol `produced == requested` ile "complete" çıksa bile 120 rollük
+    kanonik kataloğu TEMSİL ETMEZ. Kapalı yönde davranış burada da geçerli:
+    pilot bir koşu `data/roles.json`'a da `data/roles.partial.json`'a da asla
+    dokunmaz — kendi ayrı ad ailesine yazılır, üçü birbirine karışmaz.
+
+    Pilot değilse eski mantık aynen sürer (fail-closed): tamlığı
+    kanıtlanamayan bir koşu `data/roles.json` / `data/questions.json`'a asla
+    dokunmaz — bunun yerine `.partial.json` adlarına yazılır ve mevcut tam
+    katalog olduğu gibi kalır. `--allow-partial` bu korumayı bilinçli olarak
+    devre dışı bırakan görünür kaçış kapısıdır — ama yalnızca TAM koşular
+    için: "flag exists for truncated full runs", pilotları terfi ettirmez
+    (bkz. yukarıdaki `is_pilot` dalı).
     """
+    if is_pilot:
+        return data_dir / "roles.pilot.json", data_dir / "questions.pilot.json"
     if complete or allow_partial:
         return data_dir / "roles.json", data_dir / "questions.json"
     return data_dir / "roles.partial.json", data_dir / "questions.partial.json"
@@ -2857,44 +2900,67 @@ def write_artifacts(
     failures: list[tuple[str, str]],
     attempted: int,
     allow_partial: bool,
+    *,
+    limit: int | None = None,
 ) -> tuple[int, Path, Path, dict, dict]:
-    """Kayıtları diske yaz, dosya adını tamlık durumuna göre seç.
+    """Kayıtları diske yaz, dosya adını tamlık/pilot durumuna göre seç.
 
-    `roles` istenen (requested) tam batch'tir — `roles[attempted:]` döngünün
-    hiç ulaşamadığı kuyruktur (`not_attempted`), çünkü `run_generation_loop`
-    rolleri her zaman katalog sırasıyla ve aradan atlamadan işler.
+    `roles` istenen (requested) tam batch'tir (`--limit` uygulanmış hâliyle)
+    — `roles[attempted:]` döngünün hiç ulaşamadığı kuyruktur (`not_attempted`),
+    çünkü `run_generation_loop` rolleri her zaman katalog sırasıyla ve aradan
+    atlamadan işler.
+
+    `limit`, `select_roles()`'a verilen `--limit` değeridir (verilmediyse
+    `None`). `limit is not None` olması bu koşuyu bir PİLOT yapar: dosya
+    adları hem kanonikten hem `.partial.json`'dan ayrı, `.pilot.json`
+    ailesine gider (bkz. `resolve_artifact_paths`) — `produced == requested`
+    ile tam çıksa bile. `--allow-partial` pilotlarda hiçbir etki yapmaz: ne
+    dosya adını kanoniğe terfi ettirir ne de çıkış kodunu değiştirir; o bayrak
+    tam koşular için var ("the flag exists for truncated full runs").
 
     Döndürür: `(exit_code, roles_path, questions_path, roles_payload,
-    questions_payload)`. `exit_code` koşu eksik kaldıysa ve
-    `allow_partial` verilmediyse `1`'dir — bir kabuk pipeline'ının
-    devam etmek yerine durması için.
+    questions_payload)`.
+
+    * Pilot değilse: `exit_code` koşu eksik kaldıysa ve `allow_partial`
+      verilmediyse `1`'dir — bir kabuk pipeline'ının devam etmek yerine
+      durması için.
+    * Pilot ise: `exit_code` yalnızca `complete`'e bakar — `0` istenen kadar
+      üretildiyse (pilotun kendisi başarılıdır), aksi hâlde `1`.
     """
     requested = len(roles)
     not_attempted = list(roles[attempted:])
+    is_pilot = limit is not None
 
-    roles_payload = build_roles_payload(records, failures, requested, attempted, not_attempted)
-    questions_payload = build_questions_payload(records, requested, attempted)
+    roles_payload = build_roles_payload(
+        records, failures, requested, attempted, not_attempted, limit=limit
+    )
+    questions_payload = build_questions_payload(records, requested, attempted, limit=limit)
     complete = roles_payload["complete"]
 
-    roles_path, questions_path = resolve_artifact_paths(data_dir, complete, allow_partial)
+    roles_path, questions_path = resolve_artifact_paths(
+        data_dir, complete, allow_partial, is_pilot=is_pilot
+    )
     data_dir.mkdir(parents=True, exist_ok=True)
     _publish_atomically(
         [(roles_path, roles_payload), (questions_path, questions_payload)]
     )
 
-    if allow_partial and not complete:
-        # `--allow-partial` eski bir tam artifact'ı sessizce ezmesin: bu
-        # bilinçli terfiyi operatöre stderr'de açıkça söyle.
-        print(
-            f"UYARI: kısmi koşu ({roles_payload['produced']}/{roles_payload['requested']} "
-            f"rol) kanonik dosya adlarına terfi ettirildi — {roles_path.name} / "
-            f"{questions_path.name}. Önceki tam artifact varsa üzerine yazıldı. "
-            f"Yeni run_id: {roles_payload['run_id']} — bu koşunun ortak soru "
-            f"kümesi öncekinden FARKLI olabilir.",
-            file=sys.stderr,
-        )
+    if is_pilot:
+        exit_code = 0 if complete else 1
+    else:
+        if allow_partial and not complete:
+            # `--allow-partial` eski bir tam artifact'ı sessizce ezmesin: bu
+            # bilinçli terfiyi operatöre stderr'de açıkça söyle.
+            print(
+                f"UYARI: kısmi koşu ({roles_payload['produced']}/"
+                f"{roles_payload['requested']} rol) kanonik dosya adlarına terfi "
+                f"ettirildi — {roles_path.name} / {questions_path.name}. Önceki tam "
+                f"artifact varsa üzerine yazıldı. Yeni run_id: {roles_payload['run_id']} "
+                "— bu koşunun ortak soru kümesi öncekinden FARKLI olabilir.",
+                file=sys.stderr,
+            )
+        exit_code = 0 if (complete or allow_partial) else 1
 
-    exit_code = 0 if (complete or allow_partial) else 1
     return exit_code, roles_path, questions_path, roles_payload, questions_payload
 
 
@@ -3069,52 +3135,120 @@ def run_dry_run(client, roles: tuple[str, ...]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Tanı sarmalayıcısı.
+
+    Bu script projenin production `hakem-llm` sunucusuna bir veri jenerasyon
+    aşamasıdır ve onu çoğunlukla bir batch operatörü koşar. Aşama 0 öncesinde
+    ön kontrol (--dry-run) zorunludur; ön kontrolde bir traceback (eksik
+    `APP_KEY_JAILBREAK`, dolmuş bütçe, açık devre kesici, bozuk bütçe dosyası)
+    tam da o anda en faydasız çıktıdır — hepsi anlaşılır bir Türkçe tanı ve
+    sıfırdan farklı bir çıkış koduna çevrilir.
+    """
+    # Çıkış kodları — bir kabuk pipeline'ının ayırt edebilmesi için:
+    #   0  her şey TAMAM
+    #   1  bağlantı kuruldu ama bir kontrol BAŞARISIZ (ör. JSON üretilemiyor)
+    #   2  koşu hiç yapılamadı (anahtar yok, bütçe doldu, devre açık, taşıma hatası)
+    EXIT_OK = 0
+    EXIT_KOSULAMADI = 2
+
     args = build_arg_parser().parse_args(argv)
 
     roles = select_roles(args.limit)
-    client = build_default_client()
 
-    if args.dry_run:
-        return run_dry_run(client, roles)
+    try:
+        client = build_default_client()
+    except RuntimeError as exc:
+        print(f"BAŞARISIZ: gateway istemcisi kurulamadı.\n  {exc}", file=sys.stderr)
+        return EXIT_KOSULAMADI
 
-    records, failures, attempted, stop_reason = run_generation_loop(
-        roles, client, max_consecutive_parse_failures=args.max_parse_failures
-    )
+    try:
+        if args.dry_run:
+            return run_dry_run(client, roles)
 
-    print()
-    exit_code, roles_path, questions_path, roles_payload, questions_payload = write_artifacts(
-        config.DATA_DIR, roles, records, failures, attempted, args.allow_partial
-    )
-
-    pool_size = questions_payload["pool_size"]
-    shared = questions_payload["shared_questions"]
-    print(
-        f"Yazıldı: {roles_path} "
-        f"({roles_payload['produced']}/{roles_payload['requested']} rol, "
-        f"complete={roles_payload['complete']}, run_id={roles_payload['run_id']})"
-    )
-    print(f"Ortak soru havuzu: {pool_size} → {len(shared)} seçildi → {questions_path}")
-    print(f"Gönderilen istek: {client.sends_made}")
-    if failures:
-        print(f"\nBaşarısız {len(failures)} rol:")
-        for role, reason in failures[:10]:
-            print(f"  {role}: {reason[:100]}")
-
-    if stop_reason is not None:
-        # Yarıda kesilmiş bir koşu asla "başarı" değildir — `--allow-partial`
-        # dosya adlarını terfi ettirse bile çıkış kodu sıfır olmamalı.
-        print(f"\n{stop_reason}", file=sys.stderr)
-        exit_code = exit_code or 1
-
-    if exit_code != 0:
-        print(
-            f"\nHATA: koşu eksik kaldı ({roles_payload['produced']}/"
-            f"{roles_payload['requested']}) — yazılan dosyalar: {roles_path.name} / "
-            f"{questions_path.name}.",
-            file=sys.stderr,
+        records, failures, attempted, stop_reason = run_generation_loop(
+            roles, client, max_consecutive_parse_failures=args.max_parse_failures
         )
 
-    return exit_code
+        print()
+        exit_code, roles_path, questions_path, roles_payload, questions_payload = (
+            write_artifacts(
+                config.DATA_DIR,
+                roles,
+                records,
+                failures,
+                attempted,
+                args.allow_partial,
+                limit=args.limit,
+            )
+        )
+
+        pool_size = questions_payload["pool_size"]
+        shared = questions_payload["shared_questions"]
+        print(
+            f"Yazıldı: {roles_path} "
+            f"({roles_payload['produced']}/{roles_payload['requested']} rol, "
+            f"complete={roles_payload['complete']}, run_id={roles_payload['run_id']})"
+        )
+        if roles_payload["limit"] is not None:
+            # Pilot koşu: `--limit` verildiği için dosya adları `.pilot.json` —
+            # kanonik `roles.json`/`questions.json`'a KESİNLİKLE dokunulmadı.
+            print(
+                f"PİLOT KOŞU (--limit={roles_payload['limit']}, katalog "
+                f"{roles_payload['catalog_size']} rol): {roles_path.name} / "
+                f"{questions_path.name} yazıldı — kanonik roles.json / "
+                "questions.json dosyalarına DOKUNULMADI."
+            )
+        print(f"Ortak soru havuzu: {pool_size} → {len(shared)} seçildi → {questions_path}")
+        print(f"Gönderilen istek: {client.sends_made}")
+        if failures:
+            print(f"\nBaşarısız {len(failures)} rol:")
+            for role, reason in failures[:10]:
+                print(f"  {role}: {reason[:100]}")
+
+        if stop_reason is not None:
+            # Yarıda kesilmiş bir koşu asla "başarı" değildir — `--allow-partial`
+            # dosya adlarını terfi ettirse bile çıkış kodu sıfır olmamalı.
+            print(f"\n{stop_reason}", file=sys.stderr)
+            exit_code = exit_code or 1
+
+        if exit_code != 0:
+            print(
+                f"\nHATA: koşu eksik kaldı ({roles_payload['produced']}/"
+                f"{roles_payload['requested']}) — yazılan dosyalar: {roles_path.name} / "
+                f"{questions_path.name}.",
+                file=sys.stderr,
+            )
+
+        return exit_code
+    except BudgetCorrupted as exc:
+        print(
+            f"BAŞARISIZ: bütçe dosyası okunamıyor — hiç istek atılmadı.\n  {exc}\n"
+            f"  Dosya: {config.BUDGET_PATH}\n"
+            "  Sayaç sıfırlanmış sayılmaz: dosyayı elle onar ya da bilinçli olarak sil.",
+            file=sys.stderr,
+        )
+    except BudgetExceeded as exc:
+        print(
+            f"BAŞARISIZ: çağrı bütçesi dolu — hiç istek atılmadı.\n  {exc}\n"
+            f"  Sayaç: {config.BUDGET_PATH}. Tavan yükseltilmez; "
+            "önceki koşuların harcamasını gözden geçir.",
+            file=sys.stderr,
+        )
+    except CircuitOpen as exc:
+        print(
+            f"BAŞARISIZ: devre kesici açık — koşu durduruldu.\n  {exc}\n"
+            "  Ortak production sunucusunu zorlamıyoruz. Sunucunun durumunu "
+            "kontrol et ve süreci yeniden başlat.",
+            file=sys.stderr,
+        )
+    except GatewayError as exc:
+        print(
+            f"BAŞARISIZ: gateway çağrısı başarısız oldu.\n  {exc}\n"
+            "  401/403 ise APP_KEY_JAILBREAK yanlış; 5xx ise sunucu şu an sorunlu.\n"
+            f"  Ayrıntılı log: {config.CALL_LOG_PATH}",
+            file=sys.stderr,
+        )
+    return EXIT_KOSULAMADI
 
 
 if __name__ == "__main__":
@@ -3162,15 +3296,28 @@ her iki yolda da ağa hiç çıkılmaz. Testler şunları kapsar:
   `roles.json`/`questions.json` aynı `run_id`'yi taşır,
 - iki artifact atomik yayımlanır: ikincisi yazılamazsa birincisi de yerine
   konmaz ve geçici dosya artığı kalmaz,
-- `--allow-partial` eksik sonucu kanonik dosya adlarına terfi ettirir (zarf
-  yine de `complete: false` der) VE stderr'e kaç rol/kaç istenen, önceki tam
-  artifact'ın üzerine yazıldığı ve yeni `run_id` bilgisini içeren bir `UYARI`
-  basar — tam bir koşuda bu uyarı basılmaz; kesilmiş bir koşu ise
+- `--allow-partial` eksik bir TAM koşuyu kanonik dosya adlarına terfi ettirir
+  (zarf yine de `complete: false` der) VE stderr'e kaç rol/kaç istenen, önceki
+  tam artifact'ın üzerine yazıldığı ve yeni `run_id` bilgisini içeren bir
+  `UYARI` basar — tam bir koşuda bu uyarı basılmaz; kesilmiş bir koşu ise
   `--allow-partial` verilse bile sıfırdan farklı çıkar,
-- `--limit 0` tam 0 rol seçer (`--limit` verilmemesinden farklı).
+- `--limit 0` tam 0 rol seçer (`--limit` verilmemesinden farklı),
+- **`--limit N` bir pilot koşu üretir ve HER ZAMAN `roles.pilot.json`/
+  `questions.pilot.json`'a yazar** — `complete` durumundan bağımsız (bulgu:
+  eskiden `--limit 3` tamamlanınca kanonik `roles.json`'ı 3 rollük bir
+  katalogla eziyordu). Kanonik dosyalar (varsa) byte-identical kalır. Zarf
+  `catalog_size` (sabit 120) ve `limit` (verilen değer, tam koşuda `null`)
+  taşır; bir tüketicinin gerçek kanoniklik kontrolü
+  `complete and limit is None and requested == catalog_size`'tır.
+- pilotun kendi başarısı yalnızca `complete`'e bakar: istenen kadar
+  ürettiyse çıkış kodu `0`'dır (bu artık "başarı" sayılır), eksik kaldıysa
+  `1`'dir,
+- `--allow-partial` pilotları ETKİLEMEZ: ne dosya adını kanoniğe terfi
+  ettirir ne çıkış kodunu değiştirir ne de "terfi" `UYARI`'sı basılır — bayrak
+  yalnızca tam koşular içindir ("the flag exists for truncated full runs").
 
 Run: `cd "/home/pc-8469/assistant-axis" && uv run --extra dev pytest tests/test_generate_role_data.py -v`
-Expected: PASS, 59 passed
+Expected: PASS, 77 passed
 
 - [ ] **Step 6: Script'in dry-run modunu doğrula**
 

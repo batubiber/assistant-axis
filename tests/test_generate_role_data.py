@@ -151,6 +151,31 @@ def test_resolve_paths_promotes_to_canonical_names_when_allow_partial(tmp_path):
     assert questions_path == tmp_path / "questions.json"
 
 
+def test_resolve_paths_uses_pilot_names_when_is_pilot_and_complete(tmp_path):
+    roles_path, questions_path = grd.resolve_artifact_paths(
+        tmp_path, complete=True, allow_partial=False, is_pilot=True
+    )
+    assert roles_path == tmp_path / "roles.pilot.json"
+    assert questions_path == tmp_path / "questions.pilot.json"
+
+
+def test_resolve_paths_uses_pilot_names_when_is_pilot_and_incomplete(tmp_path):
+    roles_path, questions_path = grd.resolve_artifact_paths(
+        tmp_path, complete=False, allow_partial=False, is_pilot=True
+    )
+    assert roles_path == tmp_path / "roles.pilot.json"
+    assert questions_path == tmp_path / "questions.pilot.json"
+
+
+def test_resolve_paths_pilot_ignores_allow_partial(tmp_path):
+    """`--allow-partial` bir tam koşu bayrağıdır — pilotu terfi ettirmez."""
+    roles_path, questions_path = grd.resolve_artifact_paths(
+        tmp_path, complete=False, allow_partial=True, is_pilot=True
+    )
+    assert roles_path == tmp_path / "roles.pilot.json"
+    assert questions_path == tmp_path / "questions.pilot.json"
+
+
 # --- build_roles_payload / build_questions_payload --------------------------
 
 
@@ -165,6 +190,8 @@ def test_roles_payload_is_complete_when_produced_equals_requested():
         "requested": 2,
         "attempted": 2,
         "produced": 2,
+        "catalog_size": len(grd.ROLE_NAMES),
+        "limit": None,
         "not_attempted": [],
         "failed": [],
         "roles": records,
@@ -211,6 +238,42 @@ def test_questions_payload_tracks_completeness():
     assert payload["attempted"] == 2
     assert payload["produced"] == 2
     assert len(payload["shared_questions"]) == 10  # 2 roles * 5 questions each
+
+
+# --- catalog_size / limit envelope fields (pilot vs canonical) --------------
+
+
+def test_roles_payload_limit_is_null_for_full_run():
+    records = [make_record("pirate"), make_record("sage")]
+    payload = grd.build_roles_payload(
+        records, failures=[], requested=2, attempted=2, not_attempted=[]
+    )
+    assert payload["limit"] is None
+    assert payload["catalog_size"] == len(grd.ROLE_NAMES)
+
+
+def test_roles_payload_carries_catalog_size_and_limit_for_pilot():
+    records = [make_record("pirate"), make_record("sage")]
+    payload = grd.build_roles_payload(
+        records, failures=[], requested=2, attempted=2, not_attempted=[], limit=2
+    )
+    assert payload["limit"] == 2
+    assert payload["catalog_size"] == len(grd.ROLE_NAMES)
+    assert payload["catalog_size"] == 120
+
+
+def test_questions_payload_limit_is_null_for_full_run():
+    records = [make_record("pirate"), make_record("sage")]
+    payload = grd.build_questions_payload(records, requested=2, attempted=2)
+    assert payload["limit"] is None
+    assert payload["catalog_size"] == len(grd.ROLE_NAMES)
+
+
+def test_questions_payload_carries_catalog_size_and_limit_for_pilot():
+    records = [make_record("pirate"), make_record("sage")]
+    payload = grd.build_questions_payload(records, requested=2, attempted=2, limit=2)
+    assert payload["limit"] == 2
+    assert payload["catalog_size"] == len(grd.ROLE_NAMES)
 
 
 # --- write_artifacts (the full behavior under test) --------------------------
@@ -393,6 +456,117 @@ def test_write_artifacts_creates_data_dir_if_missing(tmp_path):
     )
     assert exit_code == 0
     assert roles_path.exists()
+
+
+# --- write_artifacts: --limit → pilot, never canonical, never .partial.json --
+
+
+def test_complete_pilot_run_writes_pilot_filenames_and_exits_zero(tmp_path):
+    """Bulgu senaryosu: `--limit 3` tamamlanır ama bu onu kanonik yapmaz."""
+    roles = ("pirate", "sage")
+    records = [make_record("pirate"), make_record("sage")]
+    exit_code, roles_path, questions_path, roles_payload, _ = grd.write_artifacts(
+        tmp_path, roles, records, failures=[], attempted=2, allow_partial=False, limit=2
+    )
+
+    assert exit_code == 0, "istenen kadar üretilmiş bir pilot başarıdır"
+    assert roles_payload["complete"] is True
+    assert roles_path == tmp_path / "roles.pilot.json"
+    assert questions_path == tmp_path / "questions.pilot.json"
+    assert not (tmp_path / "roles.json").exists()
+    assert not (tmp_path / "questions.json").exists()
+    assert not (tmp_path / "roles.partial.json").exists()
+    assert not (tmp_path / "questions.partial.json").exists()
+
+
+def test_truncated_pilot_run_writes_pilot_filenames_and_exits_nonzero(tmp_path):
+    roles = ("pirate", "sage", "ghost")
+    records = [make_record("pirate")]
+    failures = [("sage", "boom")]
+    exit_code, roles_path, questions_path, roles_payload, _ = grd.write_artifacts(
+        tmp_path, roles, records, failures, attempted=2, allow_partial=False, limit=3
+    )
+
+    assert exit_code != 0
+    assert roles_payload["complete"] is False
+    assert roles_path == tmp_path / "roles.pilot.json"
+    assert questions_path == tmp_path / "questions.pilot.json"
+    assert not (tmp_path / "roles.json").exists()
+    assert not (tmp_path / "roles.partial.json").exists(), "pilot .partial.json'a yazmaz"
+
+
+def test_pilot_with_allow_partial_still_does_not_write_canonical_filenames(tmp_path):
+    """`--limit` + `--allow-partial`: terfi yok — bayrak tam koşular içindir."""
+    roles = ("pirate", "sage")
+    records = [make_record("pirate")]
+    failures = [("sage", "boom")]
+    exit_code, roles_path, questions_path, roles_payload, _ = grd.write_artifacts(
+        tmp_path, roles, records, failures, attempted=2, allow_partial=True, limit=2
+    )
+
+    assert exit_code != 0, "--allow-partial eksik bir pilotu 'başarı' saymaz"
+    assert roles_path == tmp_path / "roles.pilot.json"
+    assert questions_path == tmp_path / "questions.pilot.json"
+    assert not (tmp_path / "roles.json").exists()
+    assert not (tmp_path / "questions.json").exists()
+
+
+def test_pilot_allow_partial_does_not_emit_promotion_warning(tmp_path, capsys):
+    """Pilot terfi ETMEDİĞİ için 'terfi ettirildi' uyarısı yanlış olurdu."""
+    roles = ("pirate", "sage", "ghost")
+    records = [make_record("pirate")]
+    failures = [("sage", "boom")]
+    grd.write_artifacts(
+        tmp_path, roles, records, failures, attempted=2, allow_partial=True, limit=3
+    )
+    err = capsys.readouterr().err
+    assert "UYARI" not in err
+
+
+def test_pilot_run_leaves_existing_canonical_artifacts_byte_identical(tmp_path):
+    """Bir önceki tam koşudan kalan kanonik dosyalar pilot koşusundan
+    tamamen etkilenmemeli — bkz. bulgu: `--limit 3` `data/roles.json`'ın
+    120 rollük kanonik kataloğunu 3 rollük bir zarfla ezmişti."""
+    existing_roles_text = '{"complete": true, "sentinel": "keep-me"}'
+    existing_questions_text = '{"complete": true, "sentinel": "keep-me"}'
+    (tmp_path / "roles.json").write_text(existing_roles_text, encoding="utf-8")
+    (tmp_path / "questions.json").write_text(existing_questions_text, encoding="utf-8")
+
+    roles = ("pirate", "sage", "ghost")
+    records = [make_record("pirate"), make_record("sage"), make_record("ghost")]
+    exit_code, roles_path, questions_path, _, _ = grd.write_artifacts(
+        tmp_path, roles, records, failures=[], attempted=3, allow_partial=False, limit=3
+    )
+
+    assert exit_code == 0
+    assert roles_path.name == "roles.pilot.json"
+    assert questions_path.name == "questions.pilot.json"
+    assert (tmp_path / "roles.json").read_text(encoding="utf-8") == existing_roles_text, (
+        "kanonik dosya byte-identical kalmalı"
+    )
+    assert (
+        tmp_path / "questions.json"
+    ).read_text(encoding="utf-8") == existing_questions_text
+    assert not (tmp_path / "roles.partial.json").exists()
+    assert not (tmp_path / "questions.partial.json").exists()
+
+
+def test_truncated_pilot_run_also_leaves_existing_canonical_artifacts_untouched(
+    tmp_path,
+):
+    existing_roles_text = '{"complete": true, "sentinel": "keep-me"}'
+    (tmp_path / "roles.json").write_text(existing_roles_text, encoding="utf-8")
+
+    roles = ("pirate", "sage", "ghost")
+    records = [make_record("pirate")]
+    failures = [("sage", "boom")]
+    exit_code, roles_path, _, _, _ = grd.write_artifacts(
+        tmp_path, roles, records, failures, attempted=2, allow_partial=False, limit=3
+    )
+
+    assert exit_code != 0
+    assert roles_path.name == "roles.pilot.json"
+    assert (tmp_path / "roles.json").read_text(encoding="utf-8") == existing_roles_text
 
 
 # --- run_generation_loop (network-free via StubClient) -----------------------
@@ -593,7 +767,10 @@ def test_main_writes_partial_artifact_when_unexpected_error_escapes(
     monkeypatch.setattr(grd, "build_default_client", lambda: client)
     monkeypatch.setattr(grd.config, "DATA_DIR", tmp_path)
 
-    exit_code = main_with(["--limit", "3"])
+    # `--limit` VERİLMEDEN: bu bir tam koşu, `BudgetCorrupted` 3. rolde
+    # döngüyü kırıyor. `--limit` kullanılmıyor ki bu test pilot dosya adı
+    # mantığıyla karışmasın (bkz. `test_complete_pilot_run_...` grubu).
+    exit_code = main_with([])
 
     assert exit_code != 0
     partial = tmp_path / "roles.partial.json"
@@ -616,7 +793,8 @@ def test_main_aborted_run_exits_nonzero_even_with_allow_partial(
     monkeypatch.setattr(grd, "build_default_client", lambda: client)
     monkeypatch.setattr(grd.config, "DATA_DIR", tmp_path)
 
-    exit_code = main_with(["--limit", "3", "--allow-partial"])
+    # `--limit` VERİLMEDEN: bu bir tam koşu + `--allow-partial` senaryosu.
+    exit_code = main_with(["--allow-partial"])
 
     assert exit_code != 0
     # `--allow-partial` dosya adlarını yine de terfi ettirir (kapı korunuyor).
@@ -970,9 +1148,11 @@ def test_dry_run_and_chat_share_the_same_cache_key(tmp_path, monkeypatch, capsys
     assert len(calls) == 3, "dry-run yeni istek atmamalı"
 
 
-def test_main_complete_run_writes_canonical_files_and_exits_zero(
+def test_main_complete_pilot_run_writes_pilot_files_not_canonical(
     tmp_path, monkeypatch, capsys
 ):
+    """Bulgu senaryosu: `--limit 3` tamamlanıyor ama bu onu kanonik yapmaz —
+    `roles.json`/`questions.json`'a asla dokunulmamalı."""
     client, calls = make_gateway_client(tmp_path, raw_response_for("bohemian"))
     monkeypatch.setattr(grd, "build_default_client", lambda: client)
     monkeypatch.setattr(grd.config, "DATA_DIR", tmp_path)
@@ -981,15 +1161,21 @@ def test_main_complete_run_writes_canonical_files_and_exits_zero(
 
     assert exit_code == 0
     assert len(calls) == 3
-    on_disk = json.loads((tmp_path / "roles.json").read_text(encoding="utf-8"))
+    assert not (tmp_path / "roles.json").exists(), "pilot kanonik dosyaya dokunmamalı"
+    assert not (tmp_path / "questions.json").exists()
+    assert not (tmp_path / "roles.partial.json").exists()
+    on_disk = json.loads((tmp_path / "roles.pilot.json").read_text(encoding="utf-8"))
     assert on_disk["complete"] is True
     assert on_disk["produced"] == 3
-    assert not (tmp_path / "roles.partial.json").exists()
+    assert on_disk["limit"] == 3
+    assert on_disk["catalog_size"] == len(grd.ROLE_NAMES)
 
     out = capsys.readouterr().out
     assert "complete=True" in out
     assert "run_id=" in out
     assert "Gönderilen istek: 3" in out
+    assert "PİLOT KOŞU" in out
+    assert "DOKUNULMADI" in out
 
 
 def test_main_second_run_is_free_from_cache(tmp_path, monkeypatch, capsys):
@@ -1003,7 +1189,7 @@ def test_main_second_run_is_free_from_cache(tmp_path, monkeypatch, capsys):
     assert "Gönderilen istek: 3" in capsys.readouterr().out
 
 
-def test_main_incomplete_run_writes_partial_and_exits_nonzero(
+def test_main_incomplete_pilot_run_writes_pilot_files_not_partial(
     tmp_path, monkeypatch, capsys
 ):
     client = StubClient([raw_response_for("bohemian"), "bu json degil"])
@@ -1013,24 +1199,28 @@ def test_main_incomplete_run_writes_partial_and_exits_nonzero(
     exit_code = main_with(["--limit", "2"])
 
     assert exit_code == 1
-    assert (tmp_path / "roles.partial.json").exists()
+    assert (tmp_path / "roles.pilot.json").exists()
     assert not (tmp_path / "roles.json").exists(), "kapı korunmalı"
+    assert not (tmp_path / "roles.partial.json").exists(), "pilot .partial.json'a yazmaz"
     assert "koşu eksik kaldı" in capsys.readouterr().err
 
 
-def test_main_allow_partial_promotes_and_exits_zero_when_not_aborted(
+def test_main_limit_with_allow_partial_does_not_promote_to_canonical(
     tmp_path, monkeypatch, capsys
 ):
-    """Kapı davranışı değişmedi: kesinti YOKSA --allow-partial 0 döndürür."""
+    """`--allow-partial` tam koşular içindir — bir pilotu terfi ettirmez ve
+    onu 'başarı' saymaz (kapı davranışı pilotlar için değişti: bkz. bulgu)."""
     client = StubClient([raw_response_for("bohemian"), "bu json degil"])
     monkeypatch.setattr(grd, "build_default_client", lambda: client)
     monkeypatch.setattr(grd.config, "DATA_DIR", tmp_path)
 
     exit_code = main_with(["--limit", "2", "--allow-partial"])
 
-    assert exit_code == 0
-    assert (tmp_path / "roles.json").exists()
-    assert "UYARI" in capsys.readouterr().err
+    assert exit_code != 0, "--allow-partial eksik bir pilotu 'başarı' saymaz"
+    assert (tmp_path / "roles.pilot.json").exists()
+    assert not (tmp_path / "roles.json").exists()
+    err = capsys.readouterr().err
+    assert "UYARI" not in err, "pilot terfi ETMEDİĞİ için promosyon uyarısı basılmamalı"
 
 
 def test_main_rejects_unknown_stage_in_dry_run(tmp_path, monkeypatch):
