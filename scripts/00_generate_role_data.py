@@ -20,7 +20,13 @@ import tempfile
 from pathlib import Path
 
 from aax import config
-from aax.gateway import BudgetExceeded, CircuitOpen, GatewayError, build_default_client
+from aax.gateway import (
+    BudgetCorrupted,
+    BudgetExceeded,
+    CircuitOpen,
+    GatewayError,
+    build_default_client,
+)
 from aax.judge import JudgeParseError
 from aax.roles import ROLE_NAMES, build_generation_prompt, parse_generation_response
 
@@ -430,52 +436,105 @@ def run_dry_run(client, roles: tuple[str, ...]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Tanı sarmalayıcısı.
+
+    Bu script projenin production `hakem-llm` sunucusuna bir veri jenerasyon
+    aşamasıdır ve onu çoğunlukla bir batch operatörü koşar. Aşama 0 öncesinde
+    ön kontrol (--dry-run) zorunludur; ön kontrolde bir traceback (eksik
+    `APP_KEY_JAILBREAK`, dolmuş bütçe, açık devre kesici, bozuk bütçe dosyası)
+    tam da o anda en faydasız çıktıdır — hepsi anlaşılır bir Türkçe tanı ve
+    sıfırdan farklı bir çıkış koduna çevrilir.
+    """
+    # Çıkış kodları — bir kabuk pipeline'ının ayırt edebilmesi için:
+    #   0  her şey TAMAM
+    #   1  bağlantı kuruldu ama bir kontrol BAŞARISIZ (ör. JSON üretilemiyor)
+    #   2  koşu hiç yapılamadı (anahtar yok, bütçe doldu, devre açık, taşıma hatası)
+    EXIT_OK = 0
+    EXIT_KOSULAMADI = 2
+
     args = build_arg_parser().parse_args(argv)
 
     roles = select_roles(args.limit)
-    client = build_default_client()
 
-    if args.dry_run:
-        return run_dry_run(client, roles)
+    try:
+        client = build_default_client()
+    except RuntimeError as exc:
+        print(f"BAŞARISIZ: gateway istemcisi kurulamadı.\n  {exc}", file=sys.stderr)
+        return EXIT_KOSULAMADI
 
-    records, failures, attempted, stop_reason = run_generation_loop(
-        roles, client, max_consecutive_parse_failures=args.max_parse_failures
-    )
+    try:
+        if args.dry_run:
+            return run_dry_run(client, roles)
 
-    print()
-    exit_code, roles_path, questions_path, roles_payload, questions_payload = write_artifacts(
-        config.DATA_DIR, roles, records, failures, attempted, args.allow_partial
-    )
-
-    pool_size = questions_payload["pool_size"]
-    shared = questions_payload["shared_questions"]
-    print(
-        f"Yazıldı: {roles_path} "
-        f"({roles_payload['produced']}/{roles_payload['requested']} rol, "
-        f"complete={roles_payload['complete']}, run_id={roles_payload['run_id']})"
-    )
-    print(f"Ortak soru havuzu: {pool_size} → {len(shared)} seçildi → {questions_path}")
-    print(f"Gönderilen istek: {client.sends_made}")
-    if failures:
-        print(f"\nBaşarısız {len(failures)} rol:")
-        for role, reason in failures[:10]:
-            print(f"  {role}: {reason[:100]}")
-
-    if stop_reason is not None:
-        # Yarıda kesilmiş bir koşu asla "başarı" değildir — `--allow-partial`
-        # dosya adlarını terfi ettirse bile çıkış kodu sıfır olmamalı.
-        print(f"\n{stop_reason}", file=sys.stderr)
-        exit_code = exit_code or 1
-
-    if exit_code != 0:
-        print(
-            f"\nHATA: koşu eksik kaldı ({roles_payload['produced']}/"
-            f"{roles_payload['requested']}) — yazılan dosyalar: {roles_path.name} / "
-            f"{questions_path.name}.",
-            file=sys.stderr,
+        records, failures, attempted, stop_reason = run_generation_loop(
+            roles, client, max_consecutive_parse_failures=args.max_parse_failures
         )
 
-    return exit_code
+        print()
+        exit_code, roles_path, questions_path, roles_payload, questions_payload = (
+            write_artifacts(
+                config.DATA_DIR, roles, records, failures, attempted, args.allow_partial
+            )
+        )
+
+        pool_size = questions_payload["pool_size"]
+        shared = questions_payload["shared_questions"]
+        print(
+            f"Yazıldı: {roles_path} "
+            f"({roles_payload['produced']}/{roles_payload['requested']} rol, "
+            f"complete={roles_payload['complete']}, run_id={roles_payload['run_id']})"
+        )
+        print(f"Ortak soru havuzu: {pool_size} → {len(shared)} seçildi → {questions_path}")
+        print(f"Gönderilen istek: {client.sends_made}")
+        if failures:
+            print(f"\nBaşarısız {len(failures)} rol:")
+            for role, reason in failures[:10]:
+                print(f"  {role}: {reason[:100]}")
+
+        if stop_reason is not None:
+            # Yarıda kesilmiş bir koşu asla "başarı" değildir — `--allow-partial`
+            # dosya adlarını terfi ettirse bile çıkış kodu sıfır olmamalı.
+            print(f"\n{stop_reason}", file=sys.stderr)
+            exit_code = exit_code or 1
+
+        if exit_code != 0:
+            print(
+                f"\nHATA: koşu eksik kaldı ({roles_payload['produced']}/"
+                f"{roles_payload['requested']}) — yazılan dosyalar: {roles_path.name} / "
+                f"{questions_path.name}.",
+                file=sys.stderr,
+            )
+
+        return exit_code
+    except BudgetCorrupted as exc:
+        print(
+            f"BAŞARISIZ: bütçe dosyası okunamıyor — hiç istek atılmadı.\n  {exc}\n"
+            f"  Dosya: {config.BUDGET_PATH}\n"
+            "  Sayaç sıfırlanmış sayılmaz: dosyayı elle onar ya da bilinçli olarak sil.",
+            file=sys.stderr,
+        )
+    except BudgetExceeded as exc:
+        print(
+            f"BAŞARISIZ: çağrı bütçesi dolu — hiç istek atılmadı.\n  {exc}\n"
+            f"  Sayaç: {config.BUDGET_PATH}. Tavan yükseltilmez; "
+            "önceki koşuların harcamasını gözden geçir.",
+            file=sys.stderr,
+        )
+    except CircuitOpen as exc:
+        print(
+            f"BAŞARISIZ: devre kesici açık — koşu durduruldu.\n  {exc}\n"
+            "  Ortak production sunucusunu zorlamıyoruz. Sunucunun durumunu "
+            "kontrol et ve süreci yeniden başlat.",
+            file=sys.stderr,
+        )
+    except GatewayError as exc:
+        print(
+            f"BAŞARISIZ: gateway çağrısı başarısız oldu.\n  {exc}\n"
+            "  401/403 ise APP_KEY_JAILBREAK yanlış; 5xx ise sunucu şu an sorunlu.\n"
+            f"  Ayrıntılı log: {config.CALL_LOG_PATH}",
+            file=sys.stderr,
+        )
+    return EXIT_KOSULAMADI
 
 
 if __name__ == "__main__":
