@@ -24,7 +24,7 @@ def test_mask_rejects_prompt_longer_than_total():
         response_token_mask(prompt_len=9, total_len=5, pad_len=0)
 
 
-@pytest.mark.gpu
+@pytest.mark.ml
 def test_capture_layer_outputs_calls_base_model_with_use_cache_false():
     """VRAM azaltımı: `lm_head` hiç hesaplanmamalı, KV cache kapalı olmalı.
 
@@ -32,10 +32,13 @@ def test_capture_layer_outputs_calls_base_model_with_use_cache_false():
     `capture_layer_outputs`'ın hangi çağrı yolunu kullandığını doğrudan
     doğruluyoruz: CausalLM sarmalayıcısı (`bundle.model(...)`, 151.936
     kelimelik `lm_head` projeksiyonunu tetikler) ÇAĞRILMAMALI; taban model
-    (`bundle.model.model(...)`) `use_cache=False` ile çağrılmalı. `ml`
-    extra'sını (torch) gerektirdiği için `gpu` işaretli, ama CPU'da,
-    saniyenin altında koşar — gerçek model indirmeye ya da CUDA'ya ihtiyaç
-    duymaz.
+    (`bundle.model.model(...)`) `use_cache=False` ile çağrılmalı.
+
+    Marker `ml`, `gpu` DEĞİL: yalnızca sahte `torch.nn.Module`'lar kullanır,
+    ne CUDA ne gerçek model ister, saniyenin altında koşar. Tek marker'lı
+    düzende `gpu` işaretliydi ve varsayılan koşuda ATLANIYORDU — yani bu
+    modülün (spec Bölüm 10: "yanlış tensörü yakalamak sessiz ve ölümcül")
+    tek ucuz doğruluk sınaması hiç çalışmıyordu.
     """
     import torch
 
@@ -234,12 +237,12 @@ def test_mean_ignores_padding_cpu_float32():
     ama float32'nin kendi toplama-sırası gürültüsünü (~0.0007) rahatça
     geçer.
 
-    `@pytest.mark.gpu` ile işaretli: cihaz CPU olsa da test hâlâ `ml`
-    extra'sını (torch/transformers) ve gerçek 1.7B modelin belleğe
-    yüklenmesini gerektiriyor — bu depoda marker'ın pratik anlamı "ml
-    extra'sı gerektirir, varsayılan hızlı koşuda atlanır", salt "CUDA
-    gerektirir" değil. Diziler kısa tutuldu ki CPU çıkarımı hızlı kalsın;
-    model float32'de CPU'da ~7 GB RAM kullanır (makinede 30 GB var).
+    `@pytest.mark.gpu` ile işaretli: cihaz CPU olsa da test GERÇEK 1.7B
+    modelin belleğe yüklenmesini gerektiriyor. Marker ayrımı (bkz.
+    `pyproject.toml`): `ml` = torch gerekir ama CUDA/gerçek model gerekmez,
+    `gpu` = CUDA ya da gerçek model yüklenmesi gerekir. Bu test ikincisi.
+    Diziler kısa tutuldu ki CPU çıkarımı hızlı kalsın; model float32'de
+    CPU'da ~7 GB RAM kullanır (makinede 30 GB var).
     """
     import torch
 
