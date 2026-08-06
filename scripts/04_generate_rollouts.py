@@ -34,12 +34,37 @@ os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
 import argparse
 import json
+import sys
 
 from aax import config
 from aax.prompts import build_default_specs, build_role_specs, load_role_catalog, to_chat_messages
-from aax.rollouts import rollout_record, write_rollouts
+from aax.rollouts import rollout_record, write_rollouts, write_rollouts_meta
 
 OUT_PATH = config.DATA_DIR / "rollouts.jsonl"
+# `rollouts.jsonl`'ın künyesi: `limit`/`n`/`run_id`. Aşama 0'ın
+# `roles.json` zarfıyla aynı işi görür — bir PİLOT artefaktının kanonik
+# sanılmasını yapısal olarak imkânsız kılar (bkz. `aax.rollouts`).
+META_PATH = config.DATA_DIR / "rollouts_meta.json"
+
+
+def stride_sample(specs: list, n: int) -> list:
+    """Gruptan `n` öğeyi EŞİT ARALIKLARLA seç — baştan `n` tane değil.
+
+    `role_specs` rol-ana sıralıdır (rol × sistem promptu × soru): tam
+    ölçekte her rol 120 ardışık satır kaplar. Bu yüzden `role_specs[:90]`
+    doksan satırın TAMAMINI ilk rolden alır — duman testi tek bir sistem
+    promptu ailesini sınar ve rol çeşitliliğini hiç görmez. Adım örneklemesi
+    aynı `n` sayısını grubun tamamına yayar.
+
+    Determinizm: `i * len(specs) // n` saf tamsayı aritmetiğidir, rastgelelik
+    ya da tohum yok — aynı girdi her koşuda aynı seçimi verir. Grubun kendi
+    iç sırası korunur (indeksler artan).
+    """
+    if n <= 0:
+        return []
+    if n >= len(specs):
+        return list(specs)
+    return [specs[i * len(specs) // n] for i in range(n)]
 
 
 def select_specs(
@@ -53,7 +78,12 @@ def select_specs(
     `system_prompt=None` olan, yapısal olarak farklı default-Assistant
     durumunu (`to_chat_messages` sistem mesajını tamamen atlar) hiç sınamaz.
     Bunun yerine her iki gruptan tam kümenin oranını koruyacak şekilde
-    orantılı örnekleriz; her grubun kendi iç sırası değişmeden korunur.
+    orantılı örnekleriz.
+
+    Grup İÇİNDE de dilimlemek yerine adım örneklemesi yapılır
+    (`stride_sample`): oran düzeltmesi `kind` çeşitliliğini geri getirmişti
+    ama ROL çeşitliliğini değil — `role_specs` rol-ana sıralı olduğu için
+    `--limit 100`'ün 90 rol satırının hepsi rol 0'dan geliyordu.
 
     Döner: (seçilen spec'ler, seçilen role sayısı, seçilen default sayısı).
     """
@@ -63,7 +93,11 @@ def select_specs(
     role_fraction = len(role_specs) / total if total else 0.0
     n_role = min(len(role_specs), round(limit * role_fraction))
     n_default = min(len(default_specs), limit - n_role)
-    return role_specs[:n_role] + default_specs[:n_default], n_role, n_default
+    return (
+        stride_sample(role_specs, n_role) + stride_sample(default_specs, n_default),
+        n_role,
+        n_default,
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -95,8 +129,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = build_arg_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
 
     catalog = load_role_catalog(config.DATA_DIR / "roles.json")
     questions = json.loads(
@@ -145,11 +179,24 @@ def main() -> int:
         records.append(rollout_record(spec, answer))
 
     write_rollouts(OUT_PATH, records)
+    meta = write_rollouts_meta(META_PATH, records, args.limit)
     print(f"Yazıldı: {OUT_PATH} ({len(records)} kayıt, {empty} boş yanıt atlandı)")
+    print(f"Yazıldı: {META_PATH} (limit={meta['limit']}, run_id={meta['run_id']})")
+    if meta["limit"] is not None:
+        # Aşama 0'ın pilot uyarısıyla aynı: dosya kanonik yolda duruyor ama
+        # kanonik DEĞİL. Aşağı akış (`05_capture_activations.py`) künyeye
+        # bakıp reddedecek; operatörün bunu burada da görmesi gerekir.
+        print(
+            f"PİLOT KOŞU (--limit={meta['limit']}): {OUT_PATH.name} kanonik rollout "
+            "kümesi DEĞİLDİR.\n"
+            "  scripts/05_capture_activations.py bunu reddeder (--allow-pilot ile "
+            "bilinçli olarak geçilebilir).\n"
+            "  Tam koşu için --limit vermeden tekrar çalıştırın."
+        )
     if empty > len(specs) * 0.02:
         print(f"UYARI: boş yanıt oranı %{100*empty/len(specs):.1f} — max_model_len'i kontrol et")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
