@@ -26,6 +26,15 @@ Kullanım:
     # (machine_score sütunu YOK — puanlar data/judge_gate_machine.json'da,
     # --score'a kadar saklı tutulur)
     uv run python scripts/03_judge_gate.py --score
+
+ÇIKIŞ KODLARI (`--score`):
+    0  KAPI AÇIK — uyum eşiği geçti
+    1  KAPI KAPALI — uyum eşiğin altında; bu GERÇEK bir kapı reddidir
+    2  ölçüm YAPILAMADI — önkoşul/kurulum/dosya bütünlüğü hatası (ör. eksik
+       worksheet, idx uyuşmazlığı, geçersiz human_score, asgari örneklem
+       altı). Minor: bu yollar eskiden `SystemExit` fırlatıp yorumlayıcıyı
+       çıkış 1 ile sonlandırıyordu — kapının GERÇEK reddiyle AYIRT
+       EDİLEMEZ bir kod. Artık hepsi açıkça 2.
 """
 from __future__ import annotations
 
@@ -90,8 +99,17 @@ def gate_passed(agreement: float) -> bool:
 
 
 def _load_pilot() -> list[dict]:
+    """Pilot rollout'ları oku.
+
+    Eskiden eksik dosyada `raise SystemExit(mesaj)` fırlatırdı: yorumlayıcı
+    bunu yakalanmamış bir istisna gibi çıkış kodu **1** ile sonlandırırdı —
+    kapının GERÇEK reddiyle (`--score`'un `agreement < THRESHOLD` durumunda
+    döndürdüğü, "KAPI KAPALI" anlamına gelen aynı kod) AYIRT EDİLEMEZ bir
+    kod. `FileNotFoundError` fırlatır; çağıran taraf (`run_machine`) bunu
+    yakalayıp temiz bir tanı ve çıkış kodu 2 ile raporlar.
+    """
     if not PILOT_PATH.exists():
-        raise SystemExit(
+        raise FileNotFoundError(
             f"{PILOT_PATH} yok. Önce: uv run --extra ml python scripts/02_pilot_rollouts.py"
         )
     return [json.loads(line) for line in PILOT_PATH.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -117,7 +135,14 @@ def _parse_human_score(raw: str) -> int:
 
 
 def run_machine(client) -> int:
-    records = _load_pilot()
+    # Minor: eskiden `_load_pilot()`'un `SystemExit`'i buradan sarmasız
+    # geçerdi — yorumlayıcı çıkış kodu 1 ile sonlanırdı, kapının GERÇEK
+    # reddiyle ayırt edilemez bir kod. Bkz. `_load_pilot` docstring'i.
+    try:
+        records = _load_pilot()
+    except FileNotFoundError as exc:
+        print(f"BAŞARISIZ: {exc}", file=sys.stderr)
+        return 2
 
     # Kapı, ÜRETİMDE koşacak hakemi doğrulamalı — ona yakın bir şeyi değil.
     # Burada açıklama `f"the role of a {role}"` diye ÜRETİLİYORDU, oysa
@@ -147,6 +172,19 @@ def run_machine(client) -> int:
             f"  {exc}\n"
             "  Aşama 0'ı (scripts/00_generate_role_data.py) --allow-partial OLMADAN "
             "tamamlayıp tekrar deneyin.",
+            file=sys.stderr,
+        )
+        return 2
+    except KeyError as exc:
+        # Minor: `r["description"]` çıplak indekslemesi — üstteki iki
+        # doğrulama `.get()`/yapı kontrolü kullanırken bu satır bir katalog
+        # kaydında `description` anahtarı eksikse çıplak bir `KeyError`
+        # fırlatırdı ve yakalanmadan yorumlayıcıyı çıkış 1 ile sonlandırırdı
+        # — kapının GERÇEK reddiyle ayırt edilemez bir kod.
+        print(
+            f"BAŞARISIZ: {ROLES_PATH} içinde bir rol kaydında {exc} anahtarı yok.\n"
+            "  Katalog bozuk — Aşama 0'ı (scripts/00_generate_role_data.py) tekrar "
+            "çalıştırın.",
             file=sys.stderr,
         )
         return 2
@@ -230,10 +268,24 @@ def run_machine(client) -> int:
 
 
 def run_score(min_labelled: int = MIN_LABELLED) -> int:
+    """`--score`: kör çalışma sayfasını ve makine puanlarını birleştirip kapıyı değerlendir.
+
+    Minor: bu fonksiyonun yapısal hataları (eksik dosya, bozuk JSON, idx
+    uyuşmazlığı, geçersiz `human_score`) eskiden `raise SystemExit(mesaj)`
+    ile bildiriliyordu. Yorumlayıcı bunu yakalanmamış bir istisna gibi çıkış
+    kodu **1** ile sonlandırırdı — bu script'te 1, `agreement < THRESHOLD`
+    olduğunda "KAPI KAPALI" anlamına gelen AYNI kod. Bir kör çalışma
+    sayfasının eksik olması ile hakemin gerçekten insanla uyuşmaması,
+    çağıran bir kabuk pipeline'ı için AYIRT EDİLEMEZDİ. Artık hepsi temiz
+    bir "BAŞARISIZ" tanısı + çıkış kodu 2 (`len(machine) < min_labelled`
+    dalıyla AYNI desen, birkaç satır altta).
+    """
     if not LABELS_PATH.exists():
-        raise SystemExit(f"{LABELS_PATH} yok. Önce --machine çalıştır.")
+        print(f"BAŞARISIZ: {LABELS_PATH} yok. Önce --machine çalıştır.", file=sys.stderr)
+        return 2
     if not MACHINE_PATH.exists():
-        raise SystemExit(f"{MACHINE_PATH} yok. Önce --machine çalıştır.")
+        print(f"BAŞARISIZ: {MACHINE_PATH} yok. Önce --machine çalıştır.", file=sys.stderr)
+        return 2
 
     with LABELS_PATH.open(encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -242,7 +294,8 @@ def run_score(min_labelled: int = MIN_LABELLED) -> int:
         raw_machine = json.loads(MACHINE_PATH.read_text(encoding="utf-8"))
         machine_by_idx: dict[int, int] = {int(k): int(v) for k, v in raw_machine.items()}
     except (ValueError, TypeError, AttributeError) as exc:
-        raise SystemExit(f"{MACHINE_PATH} okunamadı/ayrıştırılamadı: {exc}") from exc
+        print(f"BAŞARISIZ: {MACHINE_PATH} okunamadı/ayrıştırılamadı: {exc}", file=sys.stderr)
+        return 2
 
     # İki dosya idx üzerinden birleşiyor. Biri diğerinde olmayan bir idx
     # içeriyorsa bu SESSİZCE atlanacak bir şey değil — dosyalar birbirine
@@ -264,12 +317,14 @@ def run_score(min_labelled: int = MIN_LABELLED) -> int:
                 f"{len(only_machine)} idx yalnızca {MACHINE_PATH.name} içinde var "
                 f"(örnek: {only_machine[:5]})"
             )
-        raise SystemExit(
-            "KRİTİK: worksheet ve makine puanları arasında idx uyuşmazlığı — "
+        print(
+            "BAŞARISIZ: KRİTİK: worksheet ve makine puanları arasında idx uyuşmazlığı — "
             + "; ".join(parts)
             + ". Dosyalar birbirine karışmış olabilir; --machine'i baştan çalıştırıp "
-            "her iki dosyayı da yeniden üret."
+            "her iki dosyayı da yeniden üret.",
+            file=sys.stderr,
         )
+        return 2
 
     bad_rows: list[tuple[int, str, str]] = []
     machine: list[int] = []
@@ -294,13 +349,16 @@ def run_score(min_labelled: int = MIN_LABELLED) -> int:
         lines = "\n".join(
             f"  idx={idx}: {message} (girilen: {raw!r})" for idx, raw, message in bad_rows
         )
-        raise SystemExit(
-            f"{len(bad_rows)} satırda geçersiz human_score:\n{lines}\n"
-            "Bu satırları düzelt ve tekrar dene."
+        print(
+            f"BAŞARISIZ: {len(bad_rows)} satırda geçersiz human_score:\n{lines}\n"
+            "Bu satırları düzelt ve tekrar dene.",
+            file=sys.stderr,
         )
+        return 2
 
     if not machine:
-        raise SystemExit("Hiç human_score doldurulmamış.")
+        print("BAŞARISIZ: Hiç human_score doldurulmamış.", file=sys.stderr)
+        return 2
 
     # Boş satırlar sessizce atlanıyor ve tek taban "en az bir tane"ydi: elle
     # doldurulmuş 3 satır tesadüfen tutarsa "Uyum: %100.0 — KAPI AÇIK" basılıp
