@@ -65,6 +65,35 @@ def test_probe_reports_low_agreement_on_pure_noise():
     assert probe.holdout_agreement < 0.75
 
 
+def test_probe_handles_all_three_production_categories():
+    """Üretimde etiketler HER ZAMAN üç kategoridir (fully/somewhat/no).
+
+    Yukarıdaki testlerin tamamı ikili etiketle çalışıyor — bu, gerçek bir
+    çok sınıflı (multiclass) bozulmayı (ör. sklearn çağrısının sessizce
+    ikili davranışa geri düşmesi ya da üçüncü sınıfın kaybolması) saklayacak
+    en olası boşluktu.
+    """
+    rng = np.random.default_rng(0)
+    n = 150
+    fully = rng.normal(loc=+5.0, scale=0.5, size=(n, 8))
+    somewhat = rng.normal(loc=0.0, scale=0.5, size=(n, 8))
+    no = rng.normal(loc=-5.0, scale=0.5, size=(n, 8))
+    embeddings = np.vstack([fully, somewhat, no])
+    labels = ["fully"] * n + ["somewhat"] * n + ["no"] * n
+
+    probe = RoleExpressionProbe(seed=0)
+    probe.fit(embeddings, labels)
+    assert probe.holdout_agreement > 0.9
+
+    fresh_fully = rng.normal(loc=+5.0, scale=0.5, size=(5, 8))
+    fresh_somewhat = rng.normal(loc=0.0, scale=0.5, size=(5, 8))
+    fresh_no = rng.normal(loc=-5.0, scale=0.5, size=(5, 8))
+
+    assert probe.predict(fresh_fully) == ["fully"] * 5
+    assert probe.predict(fresh_somewhat) == ["somewhat"] * 5
+    assert probe.predict(fresh_no) == ["no"] * 5
+
+
 def test_probe_predict_returns_one_label_per_row():
     rng = np.random.default_rng(0)
     embeddings = np.vstack([
