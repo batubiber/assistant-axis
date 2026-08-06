@@ -119,7 +119,7 @@ def _write_dataset(
 # --- Kritik 1: eksen rol vektörlerinden kurulur, ham satırlardan değil --------
 
 
-def test_axis_is_built_from_fully_role_vectors_not_raw_rows(tmp_path, monkeypatch, capsys):
+def test_axis_is_built_from_fully_role_vectors_not_raw_rows(tmp_path, monkeypatch):
     """Ham "fully" satırlarını havuzlamak iki hata birden yapardı.
 
     Burada `az` rolünün yalnızca 4 "fully" satırı var — >=10 kuralıyla elenir,
@@ -192,6 +192,89 @@ def test_fails_loudly_when_no_role_vector_is_fully(tmp_path, monkeypatch, capsys
     assert "BAŞARISIZ" in captured.err
     assert "fully" in captured.err
     assert not (tmp_path / "axis" / "criterion_a.json").exists()
+
+
+# --- Önemli 1: boş default_idx çıkış 1'e (DÜŞTÜ) değil 2'ye düşmeli ---------
+
+
+def test_empty_default_idx_exits_2_not_1(tmp_path, monkeypatch, capsys):
+    """`fully` tarafındaki boş-dilim NaN'ının İKİZİ: hiç 'default' satırı
+    yoksa `acts[default_idx].mean(axis=0)` NaN döner. Düzeltme öncesi kod bu
+    NaN'ı korumasız bırakıp `contrast_axis`'e taşıyordu; orada fırlayan
+    `ValueError` yakalanmadığı için yorumlayıcı çıkış kodu 1 ile dönüyordu —
+    "A KRİTERİ DÜŞTÜ" anlamına gelen kod. Bir çökme asla bilimsel bir sonuç
+    olarak kaydedilemez; doğru kod 2'dir (BAŞARISIZ, karar DEĞİL)."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+        n_default=0,
+    )
+
+    assert ea.main() == 2
+
+    captured = capsys.readouterr()
+    assert "GEÇTİ" not in captured.out
+    assert "DÜŞTÜ" not in captured.out
+    assert "BAŞARISIZ" in captured.err
+    assert "default" in captured.err
+    assert not (tmp_path / "axis" / "criterion_a.json").exists()
+    assert not (tmp_path / "axis" / "assistant_axis.npy").exists()
+
+
+def test_wraps_a_numeric_valueerror_as_exit_2_not_1(tmp_path, monkeypatch, capsys):
+    """`contrast_axis`/`cosine`/`n_components_for_variance`'ın fırlattığı HER
+    `ValueError` çıkış koduna 1 (DÜŞTÜ) değil 2'ye (BAŞARISIZ) çevrilmeli —
+    ör. default ve fully ortalamaları tesadüfen eşitse (sıfır normlu
+    kontrast) ya da aktivasyon verisinde başka bir nedenle NaN/inf varsa.
+    Doğrudan `contrast_axis`'i patlatarak sarmalayıcının genel olduğunu (yalnızca
+    boş-default özel durumuna bağlı olmadığını) doğrular."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+    )
+
+    def boom(*_args, **_kwargs):
+        raise ValueError("simüle edilmiş sayısal hata")
+
+    monkeypatch.setattr(ea, "contrast_axis", boom)
+
+    assert ea.main() == 2
+
+    captured = capsys.readouterr()
+    assert "GEÇTİ" not in captured.out
+    assert "DÜŞTÜ" not in captured.out
+    assert "BAŞARISIZ" in captured.err
+    assert "simüle edilmiş sayısal hata" in captured.err
+    assert not (tmp_path / "axis" / "criterion_a.json").exists()
+
+
+def test_no_partial_artifact_when_a_late_numeric_step_raises(tmp_path, monkeypatch, capsys):
+    """Düzeltme öncesi `assistant_axis.npy`/`role_vectors.npy`,
+    `n_components_for_70pct` hesaplanmadan ÖNCE yazılıyordu — geç bir raise,
+    önceki bir koşudan kalma bir `criterion_a.json` yanında yarım bir
+    `assistant_axis.npy`/`role_vectors.npy` bırakabilirdi. Artık hiçbir
+    değer yazılmadan ÖNCE TÜM sayısal hesap tamamlanmış olmalı: bu testte
+    `n_components_for_variance` (bloktaki SON çağrı) patlatılır ve HİÇBİR
+    artefaktın diske gitmediği doğrulanır."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+    )
+
+    def boom(*_args, **_kwargs):
+        raise ValueError("simüle edilmiş geç hata")
+
+    monkeypatch.setattr(ea, "n_components_for_variance", boom)
+
+    assert ea.main() == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    for name in ("assistant_axis.npy", "role_vectors.npy", "role_names.json", "criterion_a.json"):
+        assert not (tmp_path / "axis" / name).exists()
 
 
 # --- Bulgu 6: bayat role_expression.json ------------------------------------

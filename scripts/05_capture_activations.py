@@ -10,6 +10,7 @@ Kullanım:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 
 import numpy as np
@@ -22,6 +23,27 @@ from aax.rollouts import read_rollouts
 
 ACTS_PATH = config.DATA_DIR / "activations.npy"
 INDEX_PATH = config.DATA_DIR / "activations_index.json"
+
+
+def compute_run_id(records: list[dict]) -> str:
+    """Yakalanan rollout kayıtlarından türetilen koşu kimliği.
+
+    `scripts/00_generate_role_data.py::compute_run_id` ile aynı desen (bkz.
+    orada): saatten değil İÇERİKTEN türetilir. Öncesinde
+    `activations_index.json` hiç `run_id` yazmıyordu — `07_extract_axis.py`
+    `index.get("run_id")` okuyup `criterion_a.json`'a `null` basıyordu ve
+    verdict artefaktının kaynak koşuya (bu `rollouts.jsonl` kümesine) geri
+    bağlantısı hiç kurulmuyordu.
+
+    Blob, satır sırasıyla `kind`/`role`/`system_prompt`/`question` alanlarını
+    birleştirir: aynı rollout kümesi (aynı sıra, aynı içerik) her zaman aynı
+    kimliği üretir; roller, sistem promptları ya da sorular değişirse kimlik
+    de değişir.
+    """
+    blob = "\n".join(
+        f"{r['kind']}\t{r['role']}\t{r['system_prompt']}\t{r['question']}" for r in records
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -74,6 +96,7 @@ def main() -> int:
                 "n_layers": int(acts.shape[1]),
                 "d_model": int(acts.shape[2]),
                 "model": config.TARGET_MODEL,
+                "run_id": compute_run_id(records),
                 "middle_layer": bundle.middle_layer,
                 "rows": [
                     {"kind": r["kind"], "role": r["role"], "system_prompt": r["system_prompt"]}

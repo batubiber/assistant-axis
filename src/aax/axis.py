@@ -13,6 +13,14 @@ import numpy as np
 
 COS_THRESHOLD = 0.6
 TOP_DECILE = 0.9
+# `1 - TOP_DECILE` GÖRÜNÜŞTE aynı şeydir ama değildir: ikili kayan noktada
+# `1 - 0.9 == 0.09999999999999998`, yani tam `0.1` persentili (`percentile =
+# k/n` roller üzerinde, n 10'un katıysa ulaşılabilir — beklenen ölçekte
+# rutin) alt desil testini KAÇIRIR, oysa aynalı `0.9` üst desil testini
+# geçer. A kriteri ön kaydedilmiş: sınır tam olmalı, bir ULP'lik asimetri
+# olmamalı. `BOTTOM_DECILE` bu yüzden `1 - TOP_DECILE` olarak DEĞİL, açıkça
+# `0.1` olarak tanımlanır.
+BOTTOM_DECILE = 0.1
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -159,8 +167,30 @@ def n_components_for_variance(
 
 
 def projection_percentile(value: float, distribution: np.ndarray) -> float:
-    """`value`'nun dağılım içindeki konumu, 0-1 arası."""
+    """`value`'nun dağılım içindeki konumu, 0-1 arası.
+
+    `cosine`/`contrast_axis` ile aynı gerekçe, ama burada YÖN daha kritik:
+    sonlu olmayan (NaN/inf) bir `value` kontrolsüz bırakılırsa
+    `(dist <= nan).sum()` her zaman `0` verir, yani persentil sessizce
+    `0.0`'a çözülür — ve `evaluate_criterion_a(0.9, 0.0)` bunu ALT desilin
+    İÇİNDE sayıp `passed: True` üretir. Modülün geri kalanındaki her NaN
+    koruması BAŞARISIZLIĞA doğru yanılır; bu satır korumasız kalırsa tam
+    tersi yönde, GEÇTİ'ye doğru yanılırdı — ön kaydedilmiş bir kriter için
+    yanlış yön. Script'te bugün erişilemez (her iki girdi de yukarı akışta
+    sonlu olduğu doğrulanır), ama modüldeki son korumasız NaN geçişi
+    buydu.
+    """
+    value = float(value)
     dist = np.asarray(distribution, dtype=np.float64)
+    if not math.isfinite(value):
+        raise ValueError(
+            "persentil sonlu olmayan (NaN/inf) bir `value` için tanımsız — "
+            "girdi büyük olasılıkla boş bir dilimin ortalamasından geliyor"
+        )
+    if not np.isfinite(dist).all():
+        raise ValueError(
+            "persentil sonlu olmayan (NaN/inf) değer içeren bir dağılımla tanımsız"
+        )
     return float((dist <= value).sum() / len(dist))
 
 
@@ -184,7 +214,7 @@ def evaluate_criterion_a(cos_pc1_axis: float, default_percentile: float) -> dict
 
     magnitude = abs(cos_value)
     in_extreme_decile = percentile_is_finite and (
-        percentile_value >= TOP_DECILE or percentile_value <= 1 - TOP_DECILE
+        percentile_value >= TOP_DECILE or percentile_value <= BOTTOM_DECILE
     )
 
     reasons = []
