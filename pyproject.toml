@@ -9,6 +9,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+ml = [
+    "torch>=2.6",
+    "transformers>=4.51",
+    "accelerate>=1.0",
+    "sentence-transformers>=3.0",
+    "scikit-learn>=1.5",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+]
+gen = ["vllm>=0.8"]
 
 [build-system]
 requires = ["hatchling"]
@@ -20,3 +30,23 @@ packages = ["src/aax"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# İki AYRI marker. Eskiden tek bir `gpu` marker'ı hem "CUDA lazım" hem
+# "torch import ediliyor" anlamına geliyordu ve varsayılan koşu ikisini de
+# atlıyordu. Sonuç: `tests/test_activations.py`'nin 10 testinden 6'sı hiç
+# koşmuyordu — oysa biri (`test_capture_layer_outputs_calls_base_model_with_
+# use_cache_false`) yalnızca sahte `torch.nn.Module`'lar kullanıyor, ne CUDA
+# ne gerçek model istiyor, saniyenin altında bitiyor. `activations.py` tam da
+# spec Bölüm 10'un "yanlış tensörü yakalamak sessiz ve ölümcül" dediği modül.
+#
+#   ml   -> torch/transformers (ml extra) gerekir; CPU'da koşar
+#   gpu  -> CUDA ya da gerçek 1.7B modelin yüklenmesi gerekir
+#
+# Varsayılan koşu yalnızca `gpu`'yu eler: `uv run --extra dev --extra ml
+# pytest -q` artık `ml` testlerini de koşar. `ml` extra'sı kurulu değilse
+# bu testler import hatası verir — o yüzden `--extra dev` tek başına
+# koşulurken `-m "not gpu and not ml"` kullanılır.
+markers = [
+    "gpu: CUDA ya da gerçek model yüklemesi gerektirir, varsayılan koşuda atlanır",
+    "ml: torch/transformers (ml extra) gerektirir ama CUDA gerektirmez",
+]
+addopts = "-m 'not gpu'"
