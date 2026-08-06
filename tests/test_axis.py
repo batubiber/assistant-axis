@@ -172,6 +172,22 @@ def test_projection_percentile_at_extremes():
     assert projection_percentile(200.0, dist) == pytest.approx(1.0)
 
 
+def test_projection_percentile_rejects_non_finite_value():
+    """NaN sessizce 0.0'a çözülürse `evaluate_criterion_a` bunu alt desilin
+    İÇİNDE sayıp yanlış yönde (GEÇTİ'ye doğru) bir sonuç üretir."""
+    dist = np.arange(10.0)
+    with pytest.raises(ValueError, match="sonlu olmayan"):
+        projection_percentile(float("nan"), dist)
+    with pytest.raises(ValueError, match="sonlu olmayan"):
+        projection_percentile(float("inf"), dist)
+
+
+def test_projection_percentile_rejects_non_finite_distribution():
+    dist = np.array([1.0, np.nan, 3.0])
+    with pytest.raises(ValueError, match="sonlu olmayan"):
+        projection_percentile(1.0, dist)
+
+
 def test_criterion_a_passes_when_both_conditions_hold():
     result = evaluate_criterion_a(cos_pc1_axis=0.72, default_percentile=0.95)
     assert result["passed"] is True
@@ -218,3 +234,19 @@ def test_criterion_a_rejects_infinite_values():
         result = evaluate_criterion_a(cos_pc1_axis=cos_value, default_percentile=percentile)
         assert result["passed"] is False
         assert "sonlu değil" in result["reason"]
+
+
+def test_criterion_a_boundary_bottom_decile_exactly_0_1_passes():
+    """`1 - TOP_DECILE` ikili kayan noktada `0.09999999999999998`'tir —
+    tam `0.1` persentili (n 10'un katıysa `k/n` ile ATTAINABLE, beklenen
+    ölçekte rutin) bu ifadeyle KAÇARDI. `BOTTOM_DECILE = 0.1` sabiti bunu
+    düzeltir; sınır ULP'siz, ayna simetrik olmalı."""
+    result = evaluate_criterion_a(cos_pc1_axis=0.9, default_percentile=0.1)
+    assert result["passed"] is True
+
+
+def test_criterion_a_boundary_top_decile_exactly_0_9_passes():
+    """Aynalı üst sınır — regresyon: bu her zaman geçiyordu, alt sınırla
+    aynı davranması gerektiğini doğrulamak için burada."""
+    result = evaluate_criterion_a(cos_pc1_axis=0.9, default_percentile=0.9)
+    assert result["passed"] is True

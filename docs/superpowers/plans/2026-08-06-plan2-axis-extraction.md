@@ -2139,7 +2139,7 @@ git commit -m "feat: hook tabanlı aktivasyon yakalama"
 - Create: `scripts/05_capture_activations.py`
 - Test: `tests/test_rollouts.py`
 - Test (Fix Round 1): `tests/test_generate_rollouts.py` — `04_generate_rollouts.py`'nin saf mantığı (`select_specs`, `build_arg_parser`, FlashInfer varsayılanı)
-- Test (Fix Round 1): `tests/test_capture_activations.py` — `05_capture_activations.py`'nin `build_arg_parser`'ı
+- Test (Fix Round 1): `tests/test_capture_activations.py` — `05_capture_activations.py`'nin `build_arg_parser`'ı; Fix Round 2 `compute_run_id`'yi ekledi
 
 **Interfaces:**
 - Consumes: `aax.prompts` (Task 2), `aax.model` (Task 1), `aax.activations` (Task 4)
@@ -2515,9 +2515,16 @@ doğrular (bkz. p2-task-5-report.md, Fix Round 1). 8 test.
 
 - [ ] **Step 6: `scripts/05_capture_activations.py` yaz**
 
-**Fix Round 1 sonrası nihai hâli** (bkz. p2-task-5-report.md, Fix Round 1,
-Bulgu 4): `--batch-size` için `help=` eklendi; argparse kurulumu test
-edilebilmesi için `build_arg_parser()`'a çıkarıldı. `to_chat_messages` /
+**Fix Round 2 sonrası nihai hâli** (bkz. p2-task-7-report.md, Fix Round 2,
+"Also fix — run_id provenance"): `compute_run_id(records)` eklendi ve
+`activations_index.json`'a `run_id` alanı olarak yazılıyor.
+`00_generate_role_data.py::compute_run_id`'yle aynı desen — saatten değil
+İÇERİKTEN türetilir (burada: satır sırasıyla `kind`/`role`/`system_prompt`/
+`question`'ın hash'i). Öncesinde bu dosya hiç `run_id` yazmıyordu;
+`07_extract_axis.py` `index.get("run_id")` okuyup `criterion_a.json`'a
+`null` basıyordu ve verdict artefaktının kaynak rollout kümesine geri
+bağlantısı hiç kurulmuyordu. (Fix Round 1'de eklenen `--batch-size` `help=`
+ve `build_arg_parser()` çıkarımı aynen korunuyor.) `to_chat_messages` /
 `apply_chat_template` çağrısı `04_generate_rollouts.py` ile **argüman argüman
 birebir aynı** kalmalı — bu dosyanın en kritik özelliği (prompt/response
 sınırının vLLM ile HF arasında tutarlılığı).
@@ -2541,6 +2548,7 @@ Kullanım:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 
 import numpy as np
@@ -2553,6 +2561,20 @@ from aax.rollouts import read_rollouts
 
 ACTS_PATH = config.DATA_DIR / "activations.npy"
 INDEX_PATH = config.DATA_DIR / "activations_index.json"
+
+
+def compute_run_id(records: list[dict]) -> str:
+    """Yakalanan rollout kayıtlarından türetilen koşu kimliği.
+
+    `00_generate_role_data.py::compute_run_id` ile aynı desen: saatten değil
+    İÇERİKTEN türetilir. Blob, satır sırasıyla `kind`/`role`/`system_prompt`/
+    `question` alanlarını birleştirir; aynı rollout kümesi her zaman aynı
+    kimliği üretir.
+    """
+    blob = "\n".join(
+        f"{r['kind']}\t{r['role']}\t{r['system_prompt']}\t{r['question']}" for r in records
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2605,6 +2627,7 @@ def main() -> int:
                 "n_layers": int(acts.shape[1]),
                 "d_model": int(acts.shape[2]),
                 "model": config.TARGET_MODEL,
+                "run_id": compute_run_id(records),
                 "middle_layer": bundle.middle_layer,
                 "rows": [
                     {"kind": r["kind"], "role": r["role"], "system_prompt": r["system_prompt"]}
@@ -2624,9 +2647,11 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-`tests/test_capture_activations.py` (Fix Round 1, yeni — script dosya adı
-rakamla başladığı için `importlib` ile yüklenir) `build_arg_parser`'ın
-`--batch-size` için `help=` taşıdığını doğrular. 2 test.
+`tests/test_capture_activations.py` (Fix Round 1'de `build_arg_parser`'ın
+`--batch-size` için `help=` taşıdığını doğrulayan 2 test olarak açıldı; Fix
+Round 2 `compute_run_id`'nin içerikten türediğini, içerik değişince
+değiştiğini ve saate bağlı olmadığını doğrulayan 3 test ekledi — toplam
+5 test, bkz. p2-task-7-report.md, Fix Round 2).
 
 - [ ] **Step 7: Duman testi — 100 rollout**
 
@@ -2665,6 +2690,12 @@ Fix Round 1 (Bulgu 1/2/3/4) ayrı bir takip commit'idir — değişen dosyalar:
 `tests/test_rollouts.py`, `tests/test_generate_rollouts.py` (yeni),
 `tests/test_capture_activations.py` (yeni). Ayrıntı: p2-task-5-report.md,
 Fix Round 1.
+
+Task 7'nin Fix Round 2'si (`run_id` provenance — bkz. Task 7, "Also fix")
+`scripts/05_capture_activations.py`'ye `compute_run_id()` ekledi ve
+`activations_index.json`'a `run_id` alanı yazdırdı; `tests/test_capture_activations.py`'ye
+3 test ekledi (2 → 5). Yukarıdaki Step 6 kod bloğu bu tur sonrasının hâlini
+gösterir. Ayrıntı: p2-task-7-report.md, Fix Round 2.
 
 - [ ] **Step 9: OPERATÖR ADIMI — tam koşu**
 
@@ -3263,13 +3294,13 @@ Bu planın nihai çıktısı. `axis.py` tamamen saf numpy: model, GPU, ağ yok. 
   - `aax.axis.pca_components(vectors, n_components) -> tuple[np.ndarray, np.ndarray]` — `(components, explained_variance_ratio)`
   - `aax.axis.n_components_for_variance(explained_variance_ratio, threshold=0.70) -> int | None` — kesilmiş spektrum eşiğe ulaşmıyorsa `None` (doyan `searchsorted` yerine)
   - `aax.axis.cosine(a, b) -> float` — sonlu olmayan girdi/çıktıda `ValueError`
-  - `aax.axis.projection_percentile(value, distribution) -> float`
-  - `aax.axis.evaluate_criterion_a(cos_pc1_axis, default_percentile) -> dict` — sonlu olmayan kosinüs/persentil SERT BAŞARISIZLIK (asla `passed: True`)
-  - Artifact: `results/axis/` — vektörler, PCA, figür, `criterion_a.json` (künye: `model`, `run_id`, `n_layers`, `d_model`; saatten türetilen alan yok)
+  - `aax.axis.projection_percentile(value, distribution) -> float` — sonlu olmayan `value`/dağılımda `ValueError` (Fix Round 2: eskiden NaN sessizce `0.0`'a, yani GEÇTİ'ye doğru yanılıyordu)
+  - `aax.axis.evaluate_criterion_a(cos_pc1_axis, default_percentile) -> dict` — sonlu olmayan kosinüs/persentil SERT BAŞARISIZLIK (asla `passed: True`); desil sınırı `TOP_DECILE`/`BOTTOM_DECILE` (Fix Round 2: `BOTTOM_DECILE = 0.1` açık sabit, `1 - TOP_DECILE`'ın ULP hatasını (`0.09999999999999998`) düzeltir — tam `0.1` artık tam `0.9` ile simetrik geçer)
+  - Artifact: `results/axis/` — vektörler, PCA, figür, `criterion_a.json` (künye: `model`, `run_id` — Fix Round 2'den sonra `05_capture_activations.py` gerçek bir değer yazıyor —, `n_layers`, `d_model`; saatten türetilen alan yok). Fix Round 2: hiçbir artefakt, sayısal hesabın TAMAMI başarıyla bitmeden diske yazılmaz; `contrast_axis`/`cosine`/`n_components_for_variance`'dan gelen her `ValueError` (boş `default_idx` dahil) çıkış kodu 2'ye çevrilir, asla yakalanmayan bir çökmeyle çıkış 1'e (DÜŞTÜ ile karışacak şekilde) düşmez.
 
 - [ ] **Step 1: Failing test'leri yaz**
 
-`tests/test_axis.py` (22 test — saf modül):
+`tests/test_axis.py` (26 test — saf modül; Fix Round 2, 4 yeni: `BOTTOM_DECILE` sınırında `0.1`/`0.9` simetrisi, `projection_percentile`'ın sonlu olmayan `value`/dağılımı reddetmesi):
 
 ```python
 import numpy as np
@@ -3446,6 +3477,22 @@ def test_projection_percentile_at_extremes():
     assert projection_percentile(200.0, dist) == pytest.approx(1.0)
 
 
+def test_projection_percentile_rejects_non_finite_value():
+    """NaN sessizce 0.0'a çözülürse `evaluate_criterion_a` bunu alt desilin
+    İÇİNDE sayıp yanlış yönde (GEÇTİ'ye doğru) bir sonuç üretir."""
+    dist = np.arange(10.0)
+    with pytest.raises(ValueError, match="sonlu olmayan"):
+        projection_percentile(float("nan"), dist)
+    with pytest.raises(ValueError, match="sonlu olmayan"):
+        projection_percentile(float("inf"), dist)
+
+
+def test_projection_percentile_rejects_non_finite_distribution():
+    dist = np.array([1.0, np.nan, 3.0])
+    with pytest.raises(ValueError, match="sonlu olmayan"):
+        projection_percentile(1.0, dist)
+
+
 def test_criterion_a_passes_when_both_conditions_hold():
     result = evaluate_criterion_a(cos_pc1_axis=0.72, default_percentile=0.95)
     assert result["passed"] is True
@@ -3492,9 +3539,25 @@ def test_criterion_a_rejects_infinite_values():
         result = evaluate_criterion_a(cos_pc1_axis=cos_value, default_percentile=percentile)
         assert result["passed"] is False
         assert "sonlu değil" in result["reason"]
+
+
+def test_criterion_a_boundary_bottom_decile_exactly_0_1_passes():
+    """`1 - TOP_DECILE` ikili kayan noktada `0.09999999999999998`'tir —
+    tam `0.1` persentili (n 10'un katıysa `k/n` ile ATTAINABLE, beklenen
+    ölçekte rutin) bu ifadeyle KAÇARDI. `BOTTOM_DECILE = 0.1` sabiti bunu
+    düzeltir; sınır ULP'siz, ayna simetrik olmalı."""
+    result = evaluate_criterion_a(cos_pc1_axis=0.9, default_percentile=0.1)
+    assert result["passed"] is True
+
+
+def test_criterion_a_boundary_top_decile_exactly_0_9_passes():
+    """Aynalı üst sınır — regresyon: bu her zaman geçiyordu, alt sınırla
+    aynı davranması gerektiğini doğrulamak için burada."""
+    result = evaluate_criterion_a(cos_pc1_axis=0.9, default_percentile=0.9)
+    assert result["passed"] is True
 ```
 
-`tests/test_extract_axis.py` (7 test — script karar mantığı; model/GPU/ağ yok, tüm veri sentetik):
+`tests/test_extract_axis.py` (10 test — script karar mantığı; model/GPU/ağ yok, tüm veri sentetik; Fix Round 2, 3 yeni: boş `default_idx` çıkış 2'ye düşer (1'e değil), sayısal bölümdeki herhangi bir `ValueError` çıkış 2'ye sarmalanır, geç bir hata hiçbir kısmi artefakt bırakmaz):
 
 ```python
 """`scripts/07_extract_axis.py` karar mantığı testleri.
@@ -3618,7 +3681,7 @@ def _write_dataset(
 # --- Kritik 1: eksen rol vektörlerinden kurulur, ham satırlardan değil --------
 
 
-def test_axis_is_built_from_fully_role_vectors_not_raw_rows(tmp_path, monkeypatch, capsys):
+def test_axis_is_built_from_fully_role_vectors_not_raw_rows(tmp_path, monkeypatch):
     """Ham "fully" satırlarını havuzlamak iki hata birden yapardı.
 
     Burada `az` rolünün yalnızca 4 "fully" satırı var — >=10 kuralıyla elenir,
@@ -3691,6 +3754,89 @@ def test_fails_loudly_when_no_role_vector_is_fully(tmp_path, monkeypatch, capsys
     assert "BAŞARISIZ" in captured.err
     assert "fully" in captured.err
     assert not (tmp_path / "axis" / "criterion_a.json").exists()
+
+
+# --- Önemli 1: boş default_idx çıkış 1'e (DÜŞTÜ) değil 2'ye düşmeli ---------
+
+
+def test_empty_default_idx_exits_2_not_1(tmp_path, monkeypatch, capsys):
+    """`fully` tarafındaki boş-dilim NaN'ının İKİZİ: hiç 'default' satırı
+    yoksa `acts[default_idx].mean(axis=0)` NaN döner. Düzeltme öncesi kod bu
+    NaN'ı korumasız bırakıp `contrast_axis`'e taşıyordu; orada fırlayan
+    `ValueError` yakalanmadığı için yorumlayıcı çıkış kodu 1 ile dönüyordu —
+    "A KRİTERİ DÜŞTÜ" anlamına gelen kod. Bir çökme asla bilimsel bir sonuç
+    olarak kaydedilemez; doğru kod 2'dir (BAŞARISIZ, karar DEĞİL)."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+        n_default=0,
+    )
+
+    assert ea.main() == 2
+
+    captured = capsys.readouterr()
+    assert "GEÇTİ" not in captured.out
+    assert "DÜŞTÜ" not in captured.out
+    assert "BAŞARISIZ" in captured.err
+    assert "default" in captured.err
+    assert not (tmp_path / "axis" / "criterion_a.json").exists()
+    assert not (tmp_path / "axis" / "assistant_axis.npy").exists()
+
+
+def test_wraps_a_numeric_valueerror_as_exit_2_not_1(tmp_path, monkeypatch, capsys):
+    """`contrast_axis`/`cosine`/`n_components_for_variance`'ın fırlattığı HER
+    `ValueError` çıkış koduna 1 (DÜŞTÜ) değil 2'ye (BAŞARISIZ) çevrilmeli —
+    ör. default ve fully ortalamaları tesadüfen eşitse (sıfır normlu
+    kontrast) ya da aktivasyon verisinde başka bir nedenle NaN/inf varsa.
+    Doğrudan `contrast_axis`'i patlatarak sarmalayıcının genel olduğunu (yalnızca
+    boş-default özel durumuna bağlı olmadığını) doğrular."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+    )
+
+    def boom(*_args, **_kwargs):
+        raise ValueError("simüle edilmiş sayısal hata")
+
+    monkeypatch.setattr(ea, "contrast_axis", boom)
+
+    assert ea.main() == 2
+
+    captured = capsys.readouterr()
+    assert "GEÇTİ" not in captured.out
+    assert "DÜŞTÜ" not in captured.out
+    assert "BAŞARISIZ" in captured.err
+    assert "simüle edilmiş sayısal hata" in captured.err
+    assert not (tmp_path / "axis" / "criterion_a.json").exists()
+
+
+def test_no_partial_artifact_when_a_late_numeric_step_raises(tmp_path, monkeypatch, capsys):
+    """Düzeltme öncesi `assistant_axis.npy`/`role_vectors.npy`,
+    `n_components_for_70pct` hesaplanmadan ÖNCE yazılıyordu — geç bir raise,
+    önceki bir koşudan kalma bir `criterion_a.json` yanında yarım bir
+    `assistant_axis.npy`/`role_vectors.npy` bırakabilirdi. Artık hiçbir
+    değer yazılmadan ÖNCE TÜM sayısal hesap tamamlanmış olmalı: bu testte
+    `n_components_for_variance` (bloktaki SON çağrı) patlatılır ve HİÇBİR
+    artefaktın diske gitmediği doğrulanır."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+    )
+
+    def boom(*_args, **_kwargs):
+        raise ValueError("simüle edilmiş geç hata")
+
+    monkeypatch.setattr(ea, "n_components_for_variance", boom)
+
+    assert ea.main() == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    for name in ("assistant_axis.npy", "role_vectors.npy", "role_names.json", "criterion_a.json"):
+        assert not (tmp_path / "axis" / name).exists()
 
 
 # --- Bulgu 6: bayat role_expression.json ------------------------------------
@@ -3834,6 +3980,14 @@ import numpy as np
 
 COS_THRESHOLD = 0.6
 TOP_DECILE = 0.9
+# `1 - TOP_DECILE` GÖRÜNÜŞTE aynı şeydir ama değildir: ikili kayan noktada
+# `1 - 0.9 == 0.09999999999999998`, yani tam `0.1` persentili (`percentile =
+# k/n` roller üzerinde, n 10'un katıysa ulaşılabilir — beklenen ölçekte
+# rutin) alt desil testini KAÇIRIR, oysa aynalı `0.9` üst desil testini
+# geçer. A kriteri ön kaydedilmiş: sınır tam olmalı, bir ULP'lik asimetri
+# olmamalı. `BOTTOM_DECILE` bu yüzden `1 - TOP_DECILE` olarak DEĞİL, açıkça
+# `0.1` olarak tanımlanır.
+BOTTOM_DECILE = 0.1
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -3980,8 +4134,30 @@ def n_components_for_variance(
 
 
 def projection_percentile(value: float, distribution: np.ndarray) -> float:
-    """`value`'nun dağılım içindeki konumu, 0-1 arası."""
+    """`value`'nun dağılım içindeki konumu, 0-1 arası.
+
+    `cosine`/`contrast_axis` ile aynı gerekçe, ama burada YÖN daha kritik:
+    sonlu olmayan (NaN/inf) bir `value` kontrolsüz bırakılırsa
+    `(dist <= nan).sum()` her zaman `0` verir, yani persentil sessizce
+    `0.0`'a çözülür — ve `evaluate_criterion_a(0.9, 0.0)` bunu ALT desilin
+    İÇİNDE sayıp `passed: True` üretir. Modülün geri kalanındaki her NaN
+    koruması BAŞARISIZLIĞA doğru yanılır; bu satır korumasız kalırsa tam
+    tersi yönde, GEÇTİ'ye doğru yanılırdı — ön kaydedilmiş bir kriter için
+    yanlış yön. Script'te bugün erişilemez (her iki girdi de yukarı akışta
+    sonlu olduğu doğrulanır), ama modüldeki son korumasız NaN geçişi
+    buydu.
+    """
+    value = float(value)
     dist = np.asarray(distribution, dtype=np.float64)
+    if not math.isfinite(value):
+        raise ValueError(
+            "persentil sonlu olmayan (NaN/inf) bir `value` için tanımsız — "
+            "girdi büyük olasılıkla boş bir dilimin ortalamasından geliyor"
+        )
+    if not np.isfinite(dist).all():
+        raise ValueError(
+            "persentil sonlu olmayan (NaN/inf) değer içeren bir dağılımla tanımsız"
+        )
     return float((dist <= value).sum() / len(dist))
 
 
@@ -4005,7 +4181,7 @@ def evaluate_criterion_a(cos_pc1_axis: float, default_percentile: float) -> dict
 
     magnitude = abs(cos_value)
     in_extreme_decile = percentile_is_finite and (
-        percentile_value >= TOP_DECILE or percentile_value <= 1 - TOP_DECILE
+        percentile_value >= TOP_DECILE or percentile_value <= BOTTOM_DECILE
     )
 
     reasons = []
@@ -4037,7 +4213,7 @@ def evaluate_criterion_a(cos_pc1_axis: float, default_percentile: float) -> dict
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
 Run: `cd ~/assistant-axis && uv run --extra dev --extra ml pytest tests/test_axis.py tests/test_extract_axis.py -v`
-Expected: PASS, 29 passed (22 + 7). (Bu satır önceden "15 passed" diyordu; blok o hâlinde 14 test içeriyordu — Fix Round 1'de hem sayı düzeltildi hem de 15 test eklendi.)
+Expected: PASS, 36 passed (26 + 10). (Bu satır önceden "15 passed" diyordu; blok o hâlinde 14 test içeriyordu — Fix Round 1'de hem sayı düzeltildi hem de 15 test eklendi, sonuç 29 (22 + 7) oldu. Fix Round 2, 4 + 3 = 7 test daha ekledi: 29 → 36.)
 
 - [ ] **Step 5: `scripts/07_extract_axis.py` yaz**
 
@@ -4072,7 +4248,12 @@ ROLE_EXPRESSION_PATH = config.DATA_DIR / "role_expression.json"
 
 
 def main() -> int:
-    acts = np.load(config.DATA_DIR / "activations.npy")
+    # `mmap_mode="r"`: planlanan ölçekte (16.000 × 28 × 2048 float32) bu
+    # dosya ~3.5 GB'dir. Tam yükleme onu belleğe kopyalar; aşağıdaki
+    # `acts[role_idx]`/`acts[default_idx]` fantezi indekslemesi zaten SEÇİLEN
+    # satırların bir kopyasını (~3.7 GB'a kadar) çıkarır. mmap ile yalnızca
+    # seçilen satırlar maddîleşir — dosyanın tamamı iki kez belleğe alınmaz.
+    acts = np.load(config.DATA_DIR / "activations.npy", mmap_mode="r")
     index = json.loads((config.DATA_DIR / "activations_index.json").read_text(encoding="utf-8"))
 
     # 06_label_and_train_probe.py ile aynı desen: brief'in Adım 5 kod bloğunda
@@ -4105,6 +4286,30 @@ def main() -> int:
 
     role_idx = [i for i, r in enumerate(rows) if r["kind"] == "role"]
     default_idx = [i for i, r in enumerate(rows) if r["kind"] == "default"]
+
+    # `len(names) == 0` koruması (altta) "fully" tarafındaki boş-dilim NaN'ını
+    # yakalıyordu; bu onun default tarafındaki İKİZİ. `acts[default_idx]` boş
+    # bir dizi olursa `.mean(axis=0)` yalnızca bir RuntimeWarning ile NaN
+    # döner (bkz. `default_mean_all` altta) — o NaN korumasız bırakılırsa
+    # `contrast_axis`'e kadar sessizce yayılır, orada `ValueError` fırlatır,
+    # bu da yakalanmazsa yorumlayıcı çıkış kodu 1 ile döner. Çıkış 1, "A
+    # KRİTERİ DÜŞTÜ" anlamına gelen koddur — bir çökme asla bilimsel bir
+    # sonuç olarak kaydedilemez, bu yüzden burada erkenden, ucuzca kontrol
+    # edilir.
+    if len(default_idx) == 0:
+        print(
+            "BAŞARISIZ: activations_index.json içinde 'default' türünde hiç satır "
+            "yok — default ortalaması tanımsız.\n"
+            "  Assistant Axis mean(default) − mean(fully rol vektörleri) olarak "
+            "tanımlı; default satır yoksa hesaplanacak bir şey yok.\n"
+            "  Kontrol edin: scripts/04_generate_rollouts.py'nin default rollout'ları "
+            "ürettiğini ve scripts/05_capture_activations.py'nin bunları "
+            "activations_index.json'a yazdığını.\n"
+            "  Bu bir BAŞARISIZLIKTIR, A kriteri kararı DEĞİLDİR: tanımsız veriden "
+            "GEÇTİ/DÜŞTÜ çıkarılamaz.",
+            file=sys.stderr,
+        )
+        return 2
 
     # Bayatlık kontrolü: `expression.get(str(i), "no")` eşleşmeyen her satırı
     # sessizce "no" sayar. Tek bir taze koşuda sorun değil, ama farklı bir
@@ -4185,35 +4390,82 @@ def main() -> int:
     role_mean_all = vectors[fully_positions].astype(np.float64).mean(axis=0)  # [L, D]
     print(f"  bunların {len(fully_positions)} tanesi 'fully' — eksen bunlardan hesaplanıyor")
 
-    axis_per_layer = np.stack(
-        [contrast_axis(default_mean_all[l], role_mean_all[l]) for l in range(acts.shape[1])]
-    )
+    # Sayısal adımların TAMAMI bu blokta: `contrast_axis`/`cosine`/
+    # `n_components_for_variance` sonlu olmayan (NaN/inf) bir değere ya da
+    # sıfır normlu bir kontrast vektörüne çarparsa `ValueError` fırlatır
+    # (bkz. `aax.axis`). Yukarıdaki iki koruma (`default_idx` boş, hiç
+    # `fully` yok) en olası iki NaN kaynağını erkenden kapatıyor, ama aynı
+    # çarpışma başka yollardan da gerçekleşebilir — ör. default ve fully
+    # ortalamaları TESADÜFEN eşitse (sıfır normlu kontrast) ya da
+    # `activations.npy` içinde başka bir nedenle bozuk (NaN/inf) bir satır
+    # varsa. Yakalanmayan bir `ValueError` burada yorumlayıcıyı çıkış kodu
+    # 1 ile döndürür — "A KRİTERİ DÜŞTÜ" anlamına gelen kod. Bir çökme asla
+    # bilimsel bir sonuç olarak kaydedilemez; bu yüzden buradan itibaren her
+    # şey yakalanır ve çıkış 2'ye (BAŞARISIZ, karar DEĞİL) çevrilir. Hiçbir
+    # artefakt bu blok TAMAMLANMADAN (yani her değer başarıyla
+    # hesaplanmadan) diske YAZILMAZ — aksi hâlde geç bir raise, önceki bir
+    # koşudan kalma `criterion_a.json` yanında yarım `assistant_axis.npy` /
+    # `role_vectors.npy` bırakabilirdi ve `results/` commit'lendiği için bu
+    # tutarsız kombinasyon depoda kalıcı hâle gelirdi.
+    try:
+        axis_per_layer = np.stack(
+            [contrast_axis(default_mean_all[l], role_mean_all[l]) for l in range(acts.shape[1])]
+        )
 
-    cos_by_layer = []
-    for layer in range(acts.shape[1]):
-        components, _ = pca_components(vectors[:, layer, :], n_components=1)
-        cos_by_layer.append(cosine(components[0], axis_per_layer[layer]))
+        cos_by_layer = []
+        for layer in range(acts.shape[1]):
+            components, _ = pca_components(vectors[:, layer, :], n_components=1)
+            cos_by_layer.append(cosine(components[0], axis_per_layer[layer]))
 
-    # Tam spektrum isteniyor: n_components_for_70pct yalnızca ilk 10 orandan
-    # hesaplanırsa gerçek cevap 10'u aştığında doyuma ulaşıp hep 11 der ve
-    # "persona uzayı düşük boyutlu" iddiasını yapay olarak destekler.
-    # Raporlanan `explained_variance_ratio` yine ilk 10 bileşendir.
-    components_mid, ratios_full = pca_components(
-        vectors[:, middle, :], n_components=vectors.shape[0]
-    )
-    ratios_mid = ratios_full[:10]
-    pc1 = components_mid[0]
-    role_projections = vectors[:, middle, :] @ pc1
-    default_projection = float(default_mean_all[middle] @ pc1)
-    percentile = projection_percentile(default_projection, role_projections)
+        # Tam spektrum isteniyor: n_components_for_70pct yalnızca ilk 10
+        # orandan hesaplansaydı gerçek cevap 10'u aştığında doyuma ulaşıp
+        # hep 11 derdi ve "persona uzayı düşük boyutlu" iddiasını yapay
+        # olarak destekler. Raporlanan `explained_variance_ratio` yine ilk
+        # 10 bileşendir.
+        components_mid, ratios_full = pca_components(
+            vectors[:, middle, :], n_components=vectors.shape[0]
+        )
+        ratios_mid = ratios_full[:10]
+        pc1 = components_mid[0]
+        role_projections = vectors[:, middle, :] @ pc1
+        default_projection = float(default_mean_all[middle] @ pc1)
+        percentile = projection_percentile(default_projection, role_projections)
 
-    verdict = evaluate_criterion_a(cos_by_layer[middle], percentile)
+        verdict = evaluate_criterion_a(cos_by_layer[middle], percentile)
+
+        # `ratios_full` burada TAM spektrumdur (`n_components=vectors.shape[0]`
+        # yukarıda), yani toplamı her zaman 1.0'dır (PCA'nın tanımı gereği:
+        # `ratios = variance / variance.sum()`) — kümülatif toplam %70 eşiğini
+        # er ya da geç MUTLAKA aşar. `n_components_for_variance` yalnızca
+        # KESİLMİŞ bir spektrum verildiğinde `None` dönebilir (bkz. modül
+        # docstring'i); burada asla olmamalı. Olursa yukarıdaki varsayım bir
+        # yerde bozulmuş demektir — sessizce `None`/">k" yazıp devam etmek
+        # yerine (eski davranış) açıkça BAŞARISIZ olunur, `n_components_for_70pct`
+        # alanı böylece tek bir tipte (`int`) kalır.
+        n_for_70 = n_components_for_variance(ratios_full, 0.70)
+        if n_for_70 is None:
+            raise ValueError(
+                "n_components_for_variance tam spektrumla None döndü — "
+                "beklenmeyen durum, tam spektrumun toplamı 1.0 olmalıydı"
+            )
+    except ValueError as exc:
+        print(
+            "BAŞARISIZ: sayısal hesaplama sonlu olmayan (NaN/inf) bir değere ya da "
+            "sıfır normlu bir vektöre çarptı.\n"
+            f"  Ayrıntı: {exc}\n"
+            "  Olası neden: default veya fully rol ortalaması boş bir dilimden "
+            "geliyor, ikisi tesadüfen eşit ya da activations.npy'de bozuk bir satır "
+            "var.\n"
+            "  Bu bir BAŞARISIZLIKTIR, A kriteri kararı DEĞİLDİR: tanımsız veriden "
+            "GEÇTİ/DÜŞTÜ çıkarılamaz. Hiçbir artefakt yazılmadı.",
+            file=sys.stderr,
+        )
+        return 2
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     np.save(OUT_DIR / "assistant_axis.npy", axis_per_layer)
     np.save(OUT_DIR / "role_vectors.npy", vectors)
     (OUT_DIR / "role_names.json").write_text(json.dumps(names, ensure_ascii=False), encoding="utf-8")
-    n_for_70 = n_components_for_variance(ratios_full, 0.70)
     (OUT_DIR / "criterion_a.json").write_text(
         json.dumps(
             {
@@ -4230,11 +4482,7 @@ def main() -> int:
                 "n_fully_role_vectors": len(fully_positions),
                 "cos_by_layer": cos_by_layer,
                 "explained_variance_ratio": ratios_mid.tolist(),
-                # Tam spektrum eşiğe hiç ulaşmazsa kesin sayı yerine alt sınır
-                # yazılır — desteklenemeyen bir sayı yazmaktansa ">k" dürüsttür.
-                "n_components_for_70pct": (
-                    n_for_70 if n_for_70 is not None else f">{len(ratios_full)}"
-                ),
+                "n_components_for_70pct": n_for_70,
             },
             ensure_ascii=False,
             indent=2,
@@ -4263,7 +4511,7 @@ if __name__ == "__main__":
 - [ ] **Step 6: Tam test paketinin yeşil olduğunu doğrula**
 
 Run: `cd ~/assistant-axis && uv run --extra dev --extra ml pytest -q`
-Expected: PASS. Fix Round 1 sonrası: 332 passed, 7 deselected (Fix Round 1 öncesi 317).
+Expected: PASS. Fix Round 2 sonrası: 342 passed, 7 deselected (Fix Round 1 sonrası 332, Fix Round 1 öncesi 317). Fix Round 2 toplam 10 yeni test ekledi: `tests/test_axis.py` +4, `tests/test_extract_axis.py` +3, `tests/test_capture_activations.py` +3 (`compute_run_id`).
 
 - [ ] **Step 7: Commit**
 
@@ -4280,14 +4528,22 @@ cd ~/assistant-axis && uv run --extra ml python scripts/07_extract_axis.py
 
 Çıktı `results/axis/criterion_a.json`'a yazılır ve commit edilir.
 
-**GEÇTİ** (çıkış 0) → Plan 3 (Aşama 4-5: steering sweep ve persona drift) yazılabilir.
-**DÜŞTÜ** (çıkış 1) → bu da bir sonuçtur: "Assistant Axis 1.7B ölçeğinde oluşmuyor". Eşik gevşetilmez. Bu durumda Llama-3.2-3B ile tekrarlamak veya çalışmayı burada sonlandırıp negatif bulguyu raporlamak arasında karar verilir.
-**BAŞARISIZ** (çıkış 2) → bir karar DEĞİLDİR: girdi eksik/bayat ya da eksen tanımsız (hiç `fully` rol vektörü yok). Veri düzeltilip tekrar koşulur; bu çıktı `criterion_a.json`'a yazılmaz.
+| Çıkış | Anlam | Ne zaman |
+|------:|-------|----------|
+| **0** | **GEÇTİ** | A kriterinin İKİ koşulu da sağlandı → Plan 3 (Aşama 4-5: steering sweep ve persona drift) yazılabilir. |
+| **1** | **DÜŞTÜ** | A kriteri TAM olarak değerlendirildi ve sağlanmadı — bu da bir bilimsel sonuçtur: "Assistant Axis 1.7B ölçeğinde oluşmuyor". Eşik gevşetilmez. Llama-3.2-3B ile tekrarlamak veya çalışmayı burada sonlandırıp negatif bulguyu raporlamak arasında karar verilir. |
+| **2** | **BAŞARISIZ** | Bir karar DEĞİLDİR — girdi eksik/bayat/tanımsız (`role_expression.json` yok/bozuk, ifade haritası bayat, hiç `fully` yok, hiç `default` yok) YA DA sayısal bölümde bir `ValueError` (Fix Round 2: `contrast_axis`/`cosine`/`n_components_for_variance`'ın attığı HER `ValueError` — sıfır normlu kontrast, aktivasyonda NaN/inf — artık burada yakalanır; eskiden yakalanmayan bir `ValueError` yorumlayıcıyı çıkış 1 ile döndürüyordu, yani "DÜŞTÜ" ile AYIRT EDİLEMEZ bir çökme oluyordu). Veri düzeltilip tekrar koşulur; bu çıktı `criterion_a.json`'a yazılmaz (Fix Round 2: hiçbir artefakt de yazılmaz — hesaplama tamamlanmadan hiçbir `np.save`/`write_text` çağrılmaz). |
 
 Fix Round 1 (Kritik 1/2, Bulgu 3/5/6, Minor) ayrı bir takip commit'idir — değişen dosyalar:
 `src/aax/axis.py`, `scripts/07_extract_axis.py`, `tests/test_axis.py`,
-`tests/test_extract_axis.py` (yeni). Yukarıdaki kod blokları ve test sayıları
-bu tur sonrasının hâlini gösterir. Ayrıntı: p2-task-7-report.md, Fix Round 1.
+`tests/test_extract_axis.py` (yeni). Ayrıntı: p2-task-7-report.md, Fix Round 1.
+
+Fix Round 2 (Önemli 1/2, "Also fix" — run_id, `n_components_for_70pct` tipi,
+bellek, kullanılmayan `capsys`) ayrı bir takip commit'idir — değişen dosyalar:
+`src/aax/axis.py`, `scripts/07_extract_axis.py`, `scripts/05_capture_activations.py`,
+`tests/test_axis.py`, `tests/test_extract_axis.py`, `tests/test_capture_activations.py`.
+Yukarıdaki kod blokları ve test sayıları bu tur sonrasının hâlini gösterir.
+Ayrıntı: p2-task-7-report.md, Fix Round 2.
 
 ---
 
