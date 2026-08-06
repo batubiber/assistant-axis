@@ -126,14 +126,14 @@ def test_load_hf_model_reads_geometry_from_config():
     """Katman sayısı ve genişlik config'ten okunmalı, sabit yazılmamalı."""
     from aax.model import load_hf_model
 
-    bundle = load_hf_model("Qwen/Qwen3-0.6B")
+    bundle = load_hf_model()  # config.TARGET_MODEL
     assert bundle.n_layers == bundle.model.config.num_hidden_layers
     assert bundle.d_model == bundle.model.config.hidden_size
     assert bundle.middle_layer == bundle.n_layers // 2
     assert len(bundle.model.model.layers) == bundle.n_layers
 ```
 
-Testler Qwen3-0.6B kullanıyor çünkü cache'te hazır ve hızlı; geometri iddiaları modelden bağımsız.
+GPU testleri `load_hf_model()` ile **hedef modelin kendisini** (Qwen3-1.7B) kullanır. Başlangıçta daha küçük bir model düşünülmüştü ama HF cache'inde ağırlığı olan uygun bir model yok; ayrıca hedef modelde test etmek daha güçlü: küçük modelde geçip hedefte patlayan bir mimari farkı olamaz. Maliyet birkaç forward pass, yani saniyeler.
 
 - [ ] **Step 3: Test'in başarısız olduğunu doğrula**
 
@@ -224,7 +224,9 @@ Expected: PASS, 2 passed, 1 deselected (GPU testi atlandı)
 - [ ] **Step 6: GPU testini açıkça koş**
 
 Run: `cd ~/assistant-axis && uv run --extra dev --extra ml pytest tests/test_model.py -v -m gpu`
-Expected: PASS, 1 passed. İlk koşuda Qwen3-0.6B zaten cache'te olduğu için indirme olmaz.
+Expected: PASS, 1 passed. Bu test hedef modeli yükler; Step 7'de indirilmişse cache'ten gelir, indirilmemişse bu adımı Step 7'den sonra koş.
+
+**Not:** `tests/conftest.py`'nin autouse fixture'ı `HF_HUB_OFFLINE=1` de ayarlar. Sebebi: `huggingface_hub`'ın yeni sürümü cache'teki bir modeli yüklerken bile etag kontrolü için ağa çıkmaya çalışıyor ve soket kilidimizin fırlattığı özel `RuntimeError`'ı "ağ yok, cache'e düş" sinyali olarak tanımıyor (yalnızca `httpx.ConnectError` ve `TimeoutException`'ı tanıyor), bu yüzden hata `OSError: Can't load the configuration` diye maskelenerek yukarı sızıyor. `HF_HUB_OFFLINE=1` kilidi zayıflatmaz, tamamlar: HF denemeden cache'e düşer, soketler aynen kapalı kalır. Bu yalnızca testleri etkiler — script'ler pytest altında koşmadığı için indirme yapabilir.
 
 - [ ] **Step 7: Hedef modeli indir ve VRAM'e sığdığını doğrula**
 
@@ -1012,7 +1014,7 @@ def test_hook_output_equals_hidden_states_from_forward():
     from aax.activations import capture_layer_outputs
     from aax.model import load_hf_model
 
-    bundle = load_hf_model("Qwen/Qwen3-0.6B")
+    bundle = load_hf_model()  # config.TARGET_MODEL
     tok = bundle.tokenizer
     enc = tok("Merhaba dünya, bu bir testtir.", return_tensors="pt").to(bundle.model.device)
 
@@ -1035,7 +1037,7 @@ def test_mean_response_activations_shape_and_dtype():
     from aax.activations import mean_response_activations
     from aax.model import load_hf_model
 
-    bundle = load_hf_model("Qwen/Qwen3-0.6B")
+    bundle = load_hf_model()  # config.TARGET_MODEL
     tok = bundle.tokenizer
     items = []
     for prompt, answer in [("Soru bir?", "Cevap bir."), ("Soru iki?", "Cevap iki daha uzun.")]:
@@ -1056,7 +1058,7 @@ def test_mean_ignores_padding():
     from aax.activations import mean_response_activations
     from aax.model import load_hf_model
 
-    bundle = load_hf_model("Qwen/Qwen3-0.6B")
+    bundle = load_hf_model()  # config.TARGET_MODEL
     tok = bundle.tokenizer
     short = (
         tok("Kısa?", add_special_tokens=False)["input_ids"],
