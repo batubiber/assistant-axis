@@ -9,6 +9,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+ml = [
+    "torch>=2.6",
+    "transformers>=4.51",
+    "accelerate>=1.0",
+    "sentence-transformers>=3.0",
+    "scikit-learn>=1.5",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+]
+gen = ["vllm>=0.8"]
 
 [build-system]
 requires = ["hatchling"]
@@ -20,3 +30,5 @@ packages = ["src/aax"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = ["gpu: GPU gerektirir, varsayılan koşuda atlanır"]
+addopts = "-m 'not gpu'"

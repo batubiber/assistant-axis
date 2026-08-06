@@ -46,11 +46,21 @@ def ag_erisimi_kapali(monkeypatch):
     standart kütüphanenin kendi iç kullanımlarını bozmamak için) — engellenen
     şey karşı tarafa **bağlanmak**: `connect`, `connect_ex`,
     `create_connection` ve isim çözümleme.
+
+    `HF_HUB_OFFLINE=1` de aynı nedenle burada: cache'te olan bir model bile
+    `huggingface_hub`'ın etag/güncellik kontrolü yüzünden ağa çıkmayı dener.
+    O deneme yukarıdaki soket kilidine çarpıp özel bir hata fırlatıyor, ama
+    `huggingface_hub` bu hatayı "bağlantı yok, cache'e düş" sinyali olarak
+    tanımıyor (yalnızca `httpx.ConnectError`/`TimeoutException` bekliyor) —
+    sonuç, gerçek nedeni gizleyen genel bir `OSError`. Bu değişken
+    `huggingface_hub`'ı hiç denemeden doğrudan cache'e yönlendirir; soket
+    kilidi olduğu gibi, ikinci bir savunma katmanı olarak duruyor.
     """
     monkeypatch.setattr(socket.socket, "connect", _reddet, raising=True)
     monkeypatch.setattr(socket.socket, "connect_ex", _reddet, raising=True)
     monkeypatch.setattr(socket, "create_connection", _reddet, raising=True)
     monkeypatch.setattr(socket, "getaddrinfo", _reddet, raising=True)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     yield
 
 
