@@ -143,6 +143,39 @@ def _build_prompt(role: str, description: str, batch: list[tuple[str, str]]) -> 
     )
 
 
+# Hakem çağrısının payload parametreleri. Sabit olarak duruyorlar çünkü
+# `--dry-run` ön kontrolü `GatewayClient.would_call(...)` ile AYNI payload'ı
+# kurmak zorunda: cache anahtarı mesajlardan + sıcaklıktan + max_tokens'tan
+# türetilir, biri kaydığında "kaç çağrı atılacak?" tahmini sessizce yanlış
+# olur. `chat()`'in kendi varsayılanlarına (1024) güvenmek yerine burada
+# açıkça yazılıp iki tarafta da bu isimle kullanılıyorlar.
+SCORE_TEMPERATURE = 0.0
+SCORE_MAX_TOKENS = 1024
+
+
+def _batches(
+    items: list[tuple[str, str]], batch_size: int
+) -> list[list[tuple[str, str]]]:
+    return [items[start : start + batch_size] for start in range(0, len(items), batch_size)]
+
+
+def build_role_score_prompts(
+    *,
+    role: str,
+    description: str,
+    items: list[tuple[str, str]],
+    batch_size: int = 10,
+) -> list[str]:
+    """`score_role_expression`'ın atacağı promptlar — istek atmadan.
+
+    `--dry-run` ön kontrolü içindir: planı `client.would_call()` ile
+    kıyaslayabilmek için promptların GERÇEKTEN gönderilecek olanlarla
+    birebir aynı olması gerekir. Batch'leme `score_role_expression` ile aynı
+    `_batches` üzerinden yapılır ki ikisi ayrışamasın.
+    """
+    return [_build_prompt(role, description, batch) for batch in _batches(items, batch_size)]
+
+
 def score_role_expression(
     client: SupportsChat,
     *,
@@ -154,11 +187,13 @@ def score_role_expression(
 ) -> list[int]:
     """Her (soru, yanıt) çifti için 0-3 rol ifadesi puanı döndür."""
     scores: list[int] = []
-    for start in range(0, len(items), batch_size):
-        batch = items[start : start + batch_size]
+    for batch in _batches(items, batch_size):
         prompt = _build_prompt(role, description, batch)
         raw = client.chat(
-            [{"role": "user", "content": prompt}], stage=stage, temperature=0.0
+            [{"role": "user", "content": prompt}],
+            stage=stage,
+            temperature=SCORE_TEMPERATURE,
+            max_tokens=SCORE_MAX_TOKENS,
         )
         parsed = extract_json(raw)
         if not isinstance(parsed, list):

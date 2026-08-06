@@ -131,16 +131,54 @@ class FakeJudgeClient:
 
 def _patch_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(judge_gate, "PILOT_PATH", tmp_path / "pilot_rollouts.jsonl")
+    # C1: kapı artık rol açıklamalarını kanonik katalogdan okuyor. Yol
+    # `tmp_path`'e yönlendirilmezse testler depodaki gerçek `data/roles.json`'a
+    # bağımlı olurdu.
+    monkeypatch.setattr(judge_gate, "ROLES_PATH", tmp_path / "roles.json")
     monkeypatch.setattr(judge_gate, "LABELS_PATH", tmp_path / "judge_gate_labels.csv")
     monkeypatch.setattr(judge_gate, "MACHINE_PATH", tmp_path / "judge_gate_machine.json")
     monkeypatch.setattr(judge_gate, "RESULT_PATH", tmp_path / "judge_gate.json")
 
 
-def _write_pilot(path: Path, records: list[dict]) -> None:
+def _catalog_description(role: str) -> str:
+    """Kataloğun LLM tarafından yazılmış açıklaması — `f"the role of a {role}"`
+    ile BİLEREK farklı, çünkü test edilen şey tam olarak bu fark."""
+    return f"A {role} is a richly described figure with distinctive habits."
+
+
+def _write_catalog(path: Path, roles: list[str]) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "complete": True,
+                "limit": None,
+                "requested": len(roles),
+                "catalog_size": len(roles),
+                "roles": [
+                    {
+                        "role": r,
+                        "description": _catalog_description(r),
+                        "instructions": ["x"],
+                        "questions": ["q"],
+                    }
+                    for r in roles
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_pilot(path: Path, records: list[dict], *, write_catalog: bool = True) -> None:
     path.write_text(
         "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
         encoding="utf-8",
     )
+    if write_catalog:
+        # Pilot hangi rolleri içeriyorsa kanonik katalog da onları içersin;
+        # `run_machine` eksik rolde fail-closed davranıyor.
+        _write_catalog(judge_gate.ROLES_PATH, sorted({r["role"] for r in records}))
 
 
 def _write_labels_csv(path: Path, rows: list[dict]) -> None:
@@ -298,7 +336,7 @@ def test_run_machine_handles_gateway_error(tmp_path, monkeypatch, capsys):
 def test_run_score_missing_labels_file_raises_systemexit(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     with pytest.raises(SystemExit, match="judge_gate_labels.csv yok"):
-        judge_gate.run_score()
+        judge_gate.run_score(min_labelled=1)
 
 
 def test_run_score_missing_machine_file_raises_systemexit(tmp_path, monkeypatch):
@@ -308,7 +346,7 @@ def test_run_score_missing_machine_file_raises_systemexit(tmp_path, monkeypatch)
         [{"idx": 0, "role": "pirate", "question": "q", "answer": "a", "human_score": "3"}],
     )
     with pytest.raises(SystemExit, match="judge_gate_machine.json yok"):
-        judge_gate.run_score()
+        judge_gate.run_score(min_labelled=1)
 
 
 def test_run_score_fails_loudly_when_labels_has_idx_missing_from_machine(
@@ -326,7 +364,7 @@ def test_run_score_fails_loudly_when_labels_has_idx_missing_from_machine(
     _write_machine_json(judge_gate.MACHINE_PATH, {0: 3})  # idx 1 makine dosyasında yok
 
     with pytest.raises(SystemExit) as exc_info:
-        judge_gate.run_score()
+        judge_gate.run_score(min_labelled=1)
 
     message = str(exc_info.value)
     assert "uyuşmazlığı" in message
@@ -344,7 +382,7 @@ def test_run_score_fails_loudly_when_machine_has_extra_idx(tmp_path, monkeypatch
     _write_machine_json(judge_gate.MACHINE_PATH, {0: 3, 1: 2})
 
     with pytest.raises(SystemExit) as exc_info:
-        judge_gate.run_score()
+        judge_gate.run_score(min_labelled=1)
 
     assert "uyuşmazlığı" in str(exc_info.value)
     assert not judge_gate.RESULT_PATH.exists()
@@ -373,7 +411,7 @@ def test_run_score_reports_all_bad_human_score_rows_at_once(tmp_path, monkeypatc
     _write_machine_json(judge_gate.MACHINE_PATH, {0: 3, 1: 1, 2: 0, 3: 2})
 
     with pytest.raises(SystemExit) as exc_info:
-        judge_gate.run_score()
+        judge_gate.run_score(min_labelled=1)
 
     message = str(exc_info.value)
     assert "idx=0" in message
@@ -397,7 +435,7 @@ def test_run_score_skips_blank_human_score_rows(tmp_path, monkeypatch):
     )
     _write_machine_json(judge_gate.MACHINE_PATH, {0: 3, 1: 1})
 
-    exit_code = judge_gate.run_score()
+    exit_code = judge_gate.run_score(min_labelled=1)
 
     assert exit_code == 0
     result = json.loads(judge_gate.RESULT_PATH.read_text(encoding="utf-8"))
@@ -413,7 +451,7 @@ def test_run_score_all_blank_raises_systemexit(tmp_path, monkeypatch):
     _write_machine_json(judge_gate.MACHINE_PATH, {0: 3})
 
     with pytest.raises(SystemExit, match="Hiç human_score doldurulmamış"):
-        judge_gate.run_score()
+        judge_gate.run_score(min_labelled=1)
 
 
 def test_run_score_computes_agreement_and_writes_result(tmp_path, monkeypatch, capsys):
@@ -429,7 +467,7 @@ def test_run_score_computes_agreement_and_writes_result(tmp_path, monkeypatch, c
     )
     _write_machine_json(judge_gate.MACHINE_PATH, {0: 0, 1: 3})
 
-    exit_code = judge_gate.run_score()
+    exit_code = judge_gate.run_score(min_labelled=1)
 
     assert exit_code == 1  # %50 < %75 eşik
     result = json.loads(judge_gate.RESULT_PATH.read_text(encoding="utf-8"))
@@ -454,7 +492,7 @@ def test_run_score_gate_open_at_or_above_threshold(tmp_path, monkeypatch, capsys
     _write_labels_csv(judge_gate.LABELS_PATH, rows)
     _write_machine_json(judge_gate.MACHINE_PATH, {i: 3 for i in range(4)})
 
-    exit_code = judge_gate.run_score()
+    exit_code = judge_gate.run_score(min_labelled=1)
 
     assert exit_code == 0
     out = capsys.readouterr().out
@@ -528,7 +566,7 @@ def test_main_score_does_not_build_a_gateway_client(tmp_path, monkeypatch):
 
     monkeypatch.setattr(judge_gate, "build_default_client", patlar)
 
-    exit_code = judge_gate.main(["--score"])
+    exit_code = judge_gate.main(["--score", "--min-labelled", "1"])
 
     assert exit_code == 0
 
@@ -544,3 +582,158 @@ def test_main_machine_happy_path_end_to_end(tmp_path, monkeypatch, capsys):
     assert exit_code == 0
     assert judge_gate.LABELS_PATH.exists()
     assert judge_gate.MACHINE_PATH.exists()
+
+
+# --- C1: kapı, ÜRETİMDEKİ promptu doğrulamalı --------------------------------
+
+
+class RecordingJudgeClient(FakeJudgeClient):
+    """Gönderilen promptları saklayan sahte istemci."""
+
+    def __init__(self, responses: list) -> None:
+        super().__init__(responses)
+        self.prompts: list[str] = []
+
+    def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+        self.prompts.append(messages[0]["content"])
+        return super().chat(messages, stage=stage, temperature=temperature, max_tokens=max_tokens)
+
+
+def test_run_machine_scores_with_the_catalog_description(tmp_path, monkeypatch):
+    """Kapı `f"the role of a {role}"` ile puanlıyordu; Aşama 2 (`06`) ise
+    kataloğun LLM tarafından yazılmış tam açıklamasıyla. `judge._build_prompt`
+    bu dizeyi promptun en tanımlayıcı cümlesine gömdüğü için iki prompt en
+    belirleyici alanında farklıydı — kapının onayladığı uyum, 2.000 rollout'u
+    etiketleyecek hakemin uyumu DEĞİLDİ."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_pilot(judge_gate.PILOT_PATH, [{"role": "pirate", "question": "q1", "answer": "a1"}])
+    client = RecordingJudgeClient(["[3]"])
+
+    assert judge_gate.run_machine(client) == 0
+
+    prompt = client.prompts[0]
+    assert _catalog_description("pirate") in prompt
+    assert "the role of a pirate" not in prompt
+
+
+def test_run_machine_and_stage2_build_the_same_prompt(tmp_path, monkeypatch):
+    """Sözleşmenin kendisi: kapının gönderdiği prompt, `06`'nın aynı (rol,
+    açıklama, öğe) için göndereceğiyle BİREBİR aynı olmalı."""
+    from aax.judge import build_role_score_prompts
+
+    _patch_paths(monkeypatch, tmp_path)
+    _write_pilot(judge_gate.PILOT_PATH, [{"role": "pirate", "question": "q1", "answer": "a1"}])
+    client = RecordingJudgeClient(["[3]"])
+
+    judge_gate.run_machine(client)
+
+    stage2_prompt = build_role_score_prompts(
+        role="pirate",
+        description=_catalog_description("pirate"),
+        items=[("q1", "a1")],
+    )[0]
+    assert client.prompts[0] == stage2_prompt
+
+
+def test_run_machine_fails_cleanly_when_the_catalog_is_missing(tmp_path, monkeypatch, capsys):
+    _patch_paths(monkeypatch, tmp_path)
+    _write_pilot(
+        judge_gate.PILOT_PATH,
+        [{"role": "pirate", "question": "q1", "answer": "a1"}],
+        write_catalog=False,
+    )
+    client = FakeJudgeClient(["[3]"])
+
+    assert judge_gate.run_machine(client) == 2
+
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "roles.json" in err
+    assert client.calls == 0, "katalog yokken tek bir hakem çağrısı bile atılmamalı"
+
+
+def test_run_machine_fails_closed_when_a_pilot_role_is_not_in_the_catalog(
+    tmp_path, monkeypatch, capsys
+):
+    """`06` ile aynı fail-closed kural: eksik rol için jenerik bir açıklama
+    uydurmak, düzeltilen hatanın ta kendisidir."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_pilot(
+        judge_gate.PILOT_PATH,
+        [{"role": "pirate", "question": "q1", "answer": "a1"}],
+        write_catalog=False,
+    )
+    _write_catalog(judge_gate.ROLES_PATH, ["sage"])  # pirate YOK
+    client = FakeJudgeClient(["[3]"])
+
+    assert judge_gate.run_machine(client) == 2
+
+    err = capsys.readouterr().err
+    assert "pirate" in err
+    assert client.calls == 0
+
+
+# --- C2: bloklayıcı kapının asgari örneklem sayısı ---------------------------
+
+
+def _fill_labels(n: int) -> list[dict]:
+    return [
+        {"idx": i, "role": "pirate", "question": f"q{i}", "answer": f"a{i}", "human_score": "3"}
+        for i in range(n)
+    ]
+
+
+def test_run_score_refuses_to_open_the_gate_below_the_minimum(tmp_path, monkeypatch, capsys):
+    """Üç dolu satır tesadüfen uyuşursa 'Uyum: %100.0 — KAPI AÇIK' basılıp
+    16.000 rollout'luk aşama serbest bırakılıyordu. Spec Bölüm 5: 40."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_labels_csv(judge_gate.LABELS_PATH, _fill_labels(3))
+    _write_machine_json(judge_gate.MACHINE_PATH, {i: 3 for i in range(3)})
+
+    exit_code = judge_gate.run_score()  # varsayılan taban 40
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "3 satır" in err  # kaç etiketlenmiş
+    assert "40" in err  # kaç gerekiyor
+    assert "--min-labelled" in err
+    assert not judge_gate.RESULT_PATH.exists(), "kapı kararı yazılmamalı"
+
+
+def test_run_score_counts_only_filled_rows_against_the_minimum(tmp_path, monkeypatch, capsys):
+    """Boş satırlar sessizce atlanıyor: 45 satırlık bir sayfada 5'i dolu ise
+    ölçüm 5 örnek üzerinedir, 45 değil."""
+    _patch_paths(monkeypatch, tmp_path)
+    rows = _fill_labels(45)
+    for row in rows[5:]:
+        row["human_score"] = ""
+    _write_labels_csv(judge_gate.LABELS_PATH, rows)
+    _write_machine_json(judge_gate.MACHINE_PATH, {i: 3 for i in range(45)})
+
+    assert judge_gate.run_score() == 2
+
+    err = capsys.readouterr().err
+    assert "5 satır" in err
+    assert "40 satırda boş" in err
+
+
+def test_run_score_opens_the_gate_at_the_minimum(tmp_path, monkeypatch, capsys):
+    _patch_paths(monkeypatch, tmp_path)
+    _write_labels_csv(judge_gate.LABELS_PATH, _fill_labels(40))
+    _write_machine_json(judge_gate.MACHINE_PATH, {i: 3 for i in range(40)})
+
+    assert judge_gate.run_score() == 0
+
+    out = capsys.readouterr().out
+    assert "KAPI AÇIK" in out
+    assert "Etiketli örnek: 40 (asgari 40)" in out
+
+
+def test_min_labelled_flag_is_wired_through_main(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    _write_labels_csv(judge_gate.LABELS_PATH, _fill_labels(3))
+    _write_machine_json(judge_gate.MACHINE_PATH, {i: 3 for i in range(3)})
+
+    assert judge_gate.main(["--score"]) == 2
+    assert judge_gate.main(["--score", "--min-labelled", "3"]) == 0
