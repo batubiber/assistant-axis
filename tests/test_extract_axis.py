@@ -398,10 +398,13 @@ def test_n_components_for_70pct_is_computed_against_the_full_spectrum(tmp_path, 
     # D6: kesilmiş `explained_variance_ratio` ile tam spektruma karşı sayılan
     # `n_components_for_70pct` tek başına bağdaştırılamıyordu. Bu alan köprü:
     # ilk 10 bileşen %70'e ulaşmıyorsa cevabın 10'dan büyük olması ZORUNLU.
-    assert report["cumulative_variance_at_10"] == pytest.approx(
+    assert report["cumulative_variance_top_components"] == pytest.approx(
         float(np.cumsum(ratios_first10)[-1])
     )
-    assert report["cumulative_variance_at_10"] < 0.70
+    assert report["cumulative_variance_top_components"] < 0.70
+    # Minor: burada toplanan bileşen sayısı tam olarak 10 — alan adı artık
+    # bu sayıyı hardcode etmiyor, ayrı bir alanda AÇIKÇA duruyor.
+    assert report["cumulative_variance_n_components"] == 10
 
 
 # --- Minor: künye -------------------------------------------------------------
@@ -583,6 +586,47 @@ def test_min_role_vectors_override_is_respected(tmp_path, monkeypatch):
     assert (tmp_path / "axis" / "criterion_a.json").exists()
 
 
+def test_criterion_a_records_the_min_role_vectors_floor_actually_used(tmp_path, monkeypatch):
+    """Minor: gevşetilmiş bir taban ön kaydedilmiş bir hüküm için MADDİ bir
+    sapmadır ve eskiden yalnızca `n_role_vectors >= 40` mı diye BAKARAK
+    dolaylı çıkarılabilirdi. `criterion_a.json` artık fiilen KULLANILAN
+    `--min-role-vectors` değerini AÇIKÇA taşıyor."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0), ("c", "fully", 12, 9.0)],
+    )
+
+    assert ea.main(["--min-role-vectors", "3"]) in (0, 1)
+
+    report = json.loads((tmp_path / "axis" / "criterion_a.json").read_text(encoding="utf-8"))
+    assert report["min_role_vectors"] == 3
+
+
+def test_cumulative_variance_n_components_reflects_fewer_than_10_role_vectors(
+    tmp_path, monkeypatch
+):
+    """Minor: `cumulative_variance_at_10` adı sabit "10" varsayıyordu ama
+    `ratios_mid = ratios_full[:10]` yalnızca EN FAZLA 10 eleman taşır —
+    `--min-role-vectors` spec tabanının (40) altına bilinçli gevşetilirse
+    (burada 3 rol vektörüyle) bu sayı 10'un ALTINDA kalır. Alan adı artık
+    sayıyı hardcode etmiyor; kaç bileşenin fiilen toplandığı ayrı bir alanda
+    (`cumulative_variance_n_components`) AÇIKÇA duruyor."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0), ("c", "fully", 12, 9.0)],
+    )
+
+    assert ea.main(["--min-role-vectors", "3"]) in (0, 1)
+
+    report = json.loads((tmp_path / "axis" / "criterion_a.json").read_text(encoding="utf-8"))
+    # Yalnızca 3 rol vektörü var: PCA en fazla 3 bileşen üretebilir.
+    assert len(report["explained_variance_ratio"]) == 3
+    assert report["cumulative_variance_n_components"] == 3
+    assert report["cumulative_variance_n_components"] < 10
+
+
 # --- B3: bütünlük alanları yazılıyordu ama okunmuyordu -----------------------
 
 
@@ -652,3 +696,66 @@ def test_matching_run_ids_pass_the_integrity_check(tmp_path, monkeypatch):
     assert ea.main(_ARGS) in (0, 1)
     report = json.loads((tmp_path / "axis" / "criterion_a.json").read_text(encoding="utf-8"))
     assert report["run_id"] == "aynı"
+
+
+# --- Kritik 1: aynı spec'ler + farklı cevaplar -> farklı run_id -> reddedilir -
+
+
+def test_rejects_when_index_and_expression_come_from_identical_specs_but_different_answers(
+    tmp_path, monkeypatch, capsys
+):
+    """Kritik 1'in tam senaryosu, uçtan uca: `04` `temperature=1.0` ile
+    örnekler, yani aynı spec'lerle (`kind`/`role`/`system_prompt`/`question`)
+    iki ayrı üretim koşusu FARKLI `answer` üretebilir — hayatta kalan kayıt
+    listesi (boş yanıtlar hariç) değişmediği sürece bu, düzeltme öncesi
+    `run_id`'yi DEĞİŞTİRMEZDİ. `05` cevabı aktivasyona tokenize eder, `06`'nın
+    hakem etiketleri cevap metni üzerinden verilir; `run_id` cevaba duyarlı
+    olmayınca `activations_index.json` (cevap kümesi A'dan) ve
+    `role_expression.json` (cevap kümesi B'den) AYNI `run_id`'yi taşıyıp
+    `07`'nin üç bütünlük kontrolünün (satır sayısı, anahtar kapsaması,
+    `run_id` eşitliği) HEPSİNİ geçebilirdi — satır *i*'nin etiketi cevap B'yi
+    tarif ederken satır *i*'nin aktivasyonu cevap A'yı kodlardı, sessizce.
+
+    Düzeltmeden sonra `rollouts_run_id` cevabı da hash'e katıyor: aynı
+    spec'lerin iki farklı cevap kümesi FARKLI bir `run_id` üretir ve `07`
+    bunu (zaten var olan) `run_id` eşleşmezliği kontrolüyle reddeder."""
+    from aax.prompts import RolloutSpec
+    from aax.rollouts import rollout_record, rollouts_run_id
+
+    def _records_for_answers(answers: list[str]) -> list[dict]:
+        return [
+            rollout_record(
+                RolloutSpec(
+                    kind="role",
+                    role="a",
+                    system_prompt="a ol",
+                    question="q?",
+                    sample_index=0,
+                ),
+                answer,
+            )
+            for answer in answers
+        ]
+
+    # Aynı spec'ler (kind/role/system_prompt/question), FARKLI cevaplar —
+    # tıpkı `04`'ün temperature=1.0 ile iki ayrı üretiminin verdiği gibi.
+    run_a = rollouts_run_id(_records_for_answers([f"cevap-{i}" for i in range(12)]))
+    run_b = rollouts_run_id(_records_for_answers([f"BAMBAŞKA-{i}" for i in range(12)]))
+    assert run_a != run_b, "Kritik 1'in ön koşulu: farklı cevap -> farklı run_id"
+
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+        run_id=run_a,  # activations_index.json: 05'in yakaladığı cevap kümesi
+        expression_run_id=run_b,  # role_expression.json: 06'nın etikettelediği cevap kümesi
+    )
+
+    assert ea.main(_ARGS) == 2
+
+    captured = capsys.readouterr()
+    assert "GEÇTİ" not in captured.out
+    assert "BAŞARISIZ" in captured.err
+    assert run_a in captured.err
+    assert run_b in captured.err
+    assert not (tmp_path / "axis" / "criterion_a.json").exists()

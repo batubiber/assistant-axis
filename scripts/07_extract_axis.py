@@ -443,17 +443,30 @@ def _run(argv: list[str] | None) -> int:
                 "n_layers": int(acts.shape[1]),
                 "d_model": int(acts.shape[2]),
                 "middle_layer": middle,
+                # Minor: `--min-role-vectors` fiilen KULLANILAN taban — spec'in
+                # 40'ı bilinçli olarak gevşetilmiş olabilir (`--min-role-vectors
+                # N`). Bu, ön kaydedilmiş bir hüküm için MADDİ bir sapmadır; eskiden
+                # yalnızca `n_role_vectors >= 40` mı diye BAKARAK dolaylı çıkarılabilirdi
+                # — 40'ın tam üstünde bir sayı, varsayılan tabanla mı yoksa gevşetilmiş
+                # bir tabanla mı geçildiğini ayırt ettirmezdi.
+                "min_role_vectors": args.min_role_vectors,
                 "n_role_vectors": len(names),
                 "n_fully_role_vectors": len(fully_positions),
                 "cos_by_layer": cos_by_layer,
                 "explained_variance_ratio": ratios_mid.tolist(),
-                # `explained_variance_ratio` ilk 10 bileşene KESİLMİŞ,
-                # `n_components_for_70pct` ise TAM spektruma karşı sayılır.
-                # İkisi tek başına birbiriyle bağdaştırılamıyordu: 12 gören
-                # bir okur, listedeki 10 oranın toplamının %70'in altında mı
-                # üstünde mi olduğunu göremezdi. Bu alan köprüyü kurar —
-                # `cumulative_variance_at_10 < 0.70` ise `n > 10` zorunludur.
-                "cumulative_variance_at_10": float(ratios_mid.sum()),
+                # Minor: eski ad `cumulative_variance_at_10` sabit "10" varsayıyordu,
+                # ama `ratios_mid = ratios_full[:10]` yalnızca EN FAZLA 10 eleman
+                # taşır — `--min-role-vectors` spec tabanının (40) altına bilinçli
+                # gevşetilirse (ör. testlerde ya da <10 rol vektörüyle) bu sayı
+                # 10'un altında kalabilir ve alan adı kendi içeriğiyle çelişirdi.
+                # Ad artık sayıyı hardcode etmiyor; kaç bileşenin toplandığı ayrı bir
+                # alanda (`cumulative_variance_n_components`) AÇIKÇA duruyor. Köprü
+                # anlamı korunuyor: `explained_variance_ratio` ilk 10 bileşene
+                # KESİLMİŞ, `n_components_for_70pct` ise TAM spektruma karşı sayılır
+                # — `cumulative_variance_top_components < 0.70` ise
+                # `n_components_for_70pct > cumulative_variance_n_components` zorunludur.
+                "cumulative_variance_top_components": float(ratios_mid.sum()),
+                "cumulative_variance_n_components": int(len(ratios_mid)),
                 "n_components_for_70pct": n_for_70,
             },
             ensure_ascii=False,
