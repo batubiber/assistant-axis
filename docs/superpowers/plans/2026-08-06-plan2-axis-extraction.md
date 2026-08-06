@@ -20,8 +20,8 @@
 - Rol vektörü tanımı: rolü yeterince ifade eden yanıtların **response token'ları** üzerinden alınan **post-MLP residual stream** ortalaması. HF'te bu `model.model.layers[l]` forward çıktısının **ilk elemanıdır**.
 - Gateway kısıtlarının tamamı Plan 1'den aynen geçerli: 1 istek/sn, 2 eşzamanlı, global tavan 1500, aşama alt bütçeleri, `BudgetExceeded` sessizce yutulmaz. Bu plan `stage05_judge_gate` (15) ve `stage2_probe_labels` (300) anahtarlarını kullanır.
 - `APP_KEY_JAILBREAK` yalnızca ortam değişkeninden okunur; hiçbir dosyaya, log'a, teste veya commit'e yazılmaz.
-- **Testler ağa çıkmaz** — `tests/conftest.py` connect/DNS/httpx'i engeller. GPU gerektiren testler `@pytest.mark.gpu` ile işaretlenir ve varsayılan koşuda atlanır.
-- `data/` gitignore'dadır. `results/` commit edilir.
+- **Testler ağa çıkmaz** — `tests/conftest.py` connect/DNS/httpx'i engeller. Marker'lar İKİYE ayrılmıştır (Final Fix Wave, D2): `@pytest.mark.ml` = torch/transformers gerekir ama CUDA gerekmez (varsayılan koşuda **KOŞAR**), `@pytest.mark.gpu` = CUDA ya da gerçek modelin yüklenmesi gerekir (varsayılan koşuda atlanır).
+- `data/` gitignore'dadır. `results/` commit edilir — `results/**/*.npy` dahil (`.gitignore`'daki global `*.npy` kuralının negasyonu, Final Fix Wave D4).
 - Türkçe docstring ve mesajlar repo geneli kuraldır.
 
 ---
@@ -3295,7 +3295,7 @@ Bu planın nihai çıktısı. `axis.py` tamamen saf numpy: model, GPU, ağ yok. 
   - `aax.axis.n_components_for_variance(explained_variance_ratio, threshold=0.70) -> int | None` — kesilmiş spektrum eşiğe ulaşmıyorsa `None` (doyan `searchsorted` yerine)
   - `aax.axis.cosine(a, b) -> float` — sonlu olmayan girdi/çıktıda `ValueError`
   - `aax.axis.projection_percentile(value, distribution) -> float` — sonlu olmayan `value`/dağılımda `ValueError` (Fix Round 2: eskiden NaN sessizce `0.0`'a, yani GEÇTİ'ye doğru yanılıyordu)
-  - `aax.axis.evaluate_criterion_a(cos_pc1_axis, default_percentile) -> dict` — sonlu olmayan kosinüs/persentil SERT BAŞARISIZLIK (asla `passed: True`); desil sınırı `TOP_DECILE`/`BOTTOM_DECILE` (Fix Round 2: `BOTTOM_DECILE = 0.1` açık sabit, `1 - TOP_DECILE`'ın ULP hatasını (`0.09999999999999998`) düzeltir — tam `0.1` artık tam `0.9` ile simetrik geçer)
+  - `aax.axis.evaluate_criterion_a(cos_pc1_axis, default_percentile) -> dict` — sonlu olmayan kosinüs/persentil SERT BAŞARISIZLIK (asla `passed: True`); desil sınırı `TOP_DECILE`/`BOTTOM_DECILE` (Fix Round 2: `BOTTOM_DECILE = 0.1` açık sabit, `1 - TOP_DECILE`'ın ULP hatasını (`0.09999999999999998`) düzeltir — tam `0.1` artık tam `0.9` ile simetrik geçer). **Final Fix Wave (A1): iki koşul artık EŞLEŞTİRİLMİŞ** — `s = sign(cos)`; `s > 0` ise ÜST desil, `s < 0` ise ALT desil ŞART. Bağımsız yazımda `cos=+0.95, persentil=0.0` geçiyordu; bu hipotezin ALEYHİNE delildir. Dönüşe `required_decile` (`"top"`/`"bottom"`/`None`) alanı eklendi.
   - Artifact: `results/axis/` — vektörler, PCA, figür, `criterion_a.json` (künye: `model`, `run_id` — Fix Round 2'den sonra `05_capture_activations.py` gerçek bir değer yazıyor —, `n_layers`, `d_model`; saatten türetilen alan yok). Fix Round 2: hiçbir artefakt, sayısal hesabın TAMAMI başarıyla bitmeden diske yazılmaz; `contrast_axis`/`cosine`/`n_components_for_variance`'dan gelen her `ValueError` (boş `default_idx` dahil) çıkış kodu 2'ye çevrilir, asla yakalanmayan bir çökmeyle çıkış 1'e (DÜŞTÜ ile karışacak şekilde) düşmez.
 
 - [ ] **Step 1: Failing test'leri yaz**
@@ -4547,11 +4547,46 @@ Ayrıntı: p2-task-7-report.md, Fix Round 2.
 
 ---
 
+## Final Fix Wave — dal geneli kod incelemesi (2026-08-06)
+
+Dalın "hazır" ilan edilmesinden önceki son düzeltme dalgası. **Yukarıdaki Task
+bölümlerindeki kod blokları bu dalgadan ÖNCEKİ hâli gösterir**; çelişki hâlinde
+kaynak kod ve bu bölüm geçerlidir. Ayrıntılı gerekçe, ölçüm ve test eşlemesi:
+`.superpowers/sdd/p2-final-fix-report.md`.
+
+| # | Bulgu | Değişen | Test |
+|---|---|---|---|
+| A1 | A kriterinin iki koşulu bağımsızdı; geçme bölgesinin yarısı hipotezin aleyhineydi (`cos=+0.95, persentil=0.0` → `passed: True`) | `src/aax/axis.py`, spec Bölüm 7 | `tests/test_axis.py` — dört işaret×desil kombinasyonu |
+| B1 | `07`'de yalnızca sayısal blok sarılıydı; eksik `activations.npy` (FileNotFoundError) ve indeks/matris boyu uyuşmazlığı (IndexError) **çıkış 1** = "A KRİTERİ DÜŞTÜ" veriyordu | `scripts/07_extract_axis.py` — `main()` gövdesinin tamamı sarıldı, `activations.npy`/`activations_index.json` için açık korumalar | `tests/test_extract_axis.py` — eksik/bozuk dosya, uzun `rows`, aralık dışı `middle_layer`, öngörülmemiş istisna, Ctrl-C yutulmuyor |
+| B2 | 2 rol vektöründen `passed: True` üretilebiliyordu (yalnızca `UYARI:` basılıp devam ediliyordu) | `scripts/07` — `--min-role-vectors` (varsayılan 40, spec Bölüm 9), altında çıkış 2 | `tests/test_extract_axis.py` — taban ve bilinçli gevşetme |
+| B3 | `n_rows`/`run_id` yazılıyor ama okunmuyordu; `06` hiç `run_id` yazmıyordu | `scripts/05`, `scripts/06`, `scripts/07`, `src/aax/rollouts.py::rollouts_run_id` (tek kaynak) | `tests/test_extract_axis.py`, `tests/test_label_and_train_probe.py`, `tests/test_rollouts.py` |
+| C1 | Kapı `f"the role of a {role}"` ile puanlıyordu, üretim ise katalog açıklamasıyla — doğrulanan prompt üretimdeki prompt DEĞİLDİ | `scripts/03_judge_gate.py` katalogdan okuyor | `tests/test_judge_gate.py` — iki promptun birebir aynı olduğu |
+| C2 | Bloklayıcı kapıda asgari `n` yoktu; 3 dolu satır "KAPI AÇIK" diyebiliyordu | `scripts/03` — `--min-labelled` (varsayılan 40) | `tests/test_judge_gate.py` |
+| C3 | `06 --dry-run` statik tavanla kıyaslıyor, cache'i yok sayıyordu | `scripts/06::run_dry_run` — `would_call` + `remaining_budget` (`00` deseni); `src/aax/judge.py::build_role_score_prompts` | `tests/test_label_and_train_probe.py` |
+| C4 | `05` ~2.000 batch'i sessizce koşuyordu; tek hata tüm geçişi çöpe atıyordu | `scripts/05` — batch başına ilerleme, checkpoint, `--start-row` | `tests/test_capture_activations.py` |
+| C5 | `04 --limit` kanonik `rollouts.jsonl`'ı işaretsiz eziyordu | `data/rollouts_meta.json` (`limit`/`n`/`run_id`), `05` pilotu `--allow-pilot` olmadan reddediyor | `tests/test_generate_rollouts.py`, `tests/test_capture_activations.py`, `tests/test_rollouts.py` |
+| C6 | `select_specs` bitişik dilim alıyordu; `--limit 100`'ün 90 rol satırı tek rolden geliyordu | `scripts/04::stride_sample` | `tests/test_generate_rollouts.py` |
+| D1 | `prompts.py` `payload["roles"]` → çıplak `KeyError`, `06`'da çıkış 1 ("probe güvenilmez") | `src/aax/prompts.py` | `tests/test_prompts.py` |
+| D2 | `gpu` marker'ı hem "CUDA" hem "torch" demekti; `activations.py`'nin ucuz doğruluk sınaması hiç koşmuyordu | `pyproject.toml` (`ml`/`gpu`), `tests/test_activations.py` | varsayılan koşu artık `ml` testini içeriyor |
+| D3 | `04`/`05`'in `main()`'i ve satır kimliği sözleşmesi test edilmiyordu | — | `tests/test_generate_rollouts.py`, `tests/test_capture_activations.py` |
+| D4 | `results/axis/*.npy` global `*.npy` kuralına takılıyordu | `.gitignore` negasyonu | — (manuel `git check-ignore` doğrulaması) |
+| D5 | `02` kayıtları elle kuruyor, boş yanıt korumasını atlıyordu | `scripts/02_pilot_rollouts.py` → `rollout_record` | `tests/test_pilot_rollouts.py` (yeni) |
+| D6 | `criterion_a.json` kendi içinde bağdaştırılamıyordu | `07` — `cumulative_variance_at_10` | `tests/test_extract_axis.py` |
+| D7 | `06`'da kullanılmayan `import numpy as np` | `scripts/06` | — |
+| D8 | `06` iki ayrı durum için 1 döndürüyordu | `--dry-run` bütçe reddi artık 2 | `tests/test_label_and_train_probe.py` |
+
+**Kapsam dışı bırakıldı (bilinçli):** spec'in probe geri çekilme kuralı (rol
+başına 15 rollout, ~180 çağrı) uygulanmadı. `06`'nın hata mesajı artık bunu
+AÇIKÇA söylüyor ve operatöre iki gerçek seçeneği + harcanan/kalan bütçeyi
+yazıyor. Boşluk proje sahibine ayrıca bildirildi.
+
+---
+
 ## Plan 2 Tamamlanma Kriterleri
 
-- [ ] `uv run --extra dev --extra ml pytest -q` yeşil; GPU testleri `-m gpu` ile ayrıca geçiyor
-- [ ] `data/judge_gate.json` — `passed: true`, uyum ≥ %75
-- [ ] `data/rollouts.jsonl` — ~16.000 kayıt
+- [ ] `uv run --extra dev --extra ml pytest -q` yeşil; `-m ml` ve `-m gpu` ayrıca geçiyor
+- [ ] `data/judge_gate.json` — `passed: true`, uyum ≥ %75, `n` ≥ 40
+- [ ] `data/rollouts.jsonl` + `data/rollouts_meta.json` — ~16.000 kayıt, `limit: null`
 - [ ] `data/activations.npy` — `[~16000, L, d_model]` float32
 - [ ] `data/role_expression.json` — held-out uyum raporlanmış
 - [ ] `results/axis/criterion_a.json` — A kriteri kararı, commit edilmiş

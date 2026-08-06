@@ -161,6 +161,17 @@ elle etiketle, uyumu ölç.
 - Uyum **< %75** → hakem promptu düzeltilir; ikinci denemede de tutmazsa hakem promptu Türkçeleştirilir
   (yanıtlar İngilizce kalır). Bu da tutmazsa proje durur ve alternatif hakem aranır.
 
+**Kapının doğruladığı prompt, üretimde koşacak promptun aynısı olmalıdır.** Rol açıklaması hakem
+promptunun en tanımlayıcı alanıdır (`judge._build_prompt` onu framing cümlesine gömer); kapı
+`f"the role of a {role}"` gibi türetilmiş bir dize kullanırsa ölçtüğü uyum, Aşama 2'nin 2.000
+rollout'u etiketleyecek hakeminin uyumu değildir. Bu yüzden `03_judge_gate.py` de rol açıklamasını
+**kanonik katalogdan** (`data/roles.json`) okur, tıpkı `06_label_and_train_probe.py` gibi.
+
+Yukarıdaki **40 bir alt sınırdır, hedef değil**: `--score`, elle doldurulmuş satır sayısı 40'ın
+altındaysa kapıyı açmaz da kapamaz da — çıkış kodu 2 ile "ölçüm yapılamadı" der (`--min-labelled`
+ile bilinçli olarak düşürülebilir). Boş satırlar sessizce atlandığı için 45 satırlık bir sayfada
+5 dolu satır 5 örnek demektir, 45 değil.
+
 Pahalı hiçbir aşama bu kapı geçilmeden başlamaz.
 
 ### Aşama 1 — Rollout ve aktivasyon · 0 çağrı · ~35 dk
@@ -173,7 +184,23 @@ Pahalı hiçbir aşama bu kapı geçilmeden başlamaz.
 Üretim vLLM ile (~25 dk). Ardından HF + hook ile teacher-forced tek prefill; **her katmanda**
 response token'larının ortalaması alınır (~10 dk). Rollout başına saklanan `[L, d_model]` bir tensör.
 
-Çıktı: `data/rollouts.jsonl`, `data/activations.npy`.
+**Satır kimliği sözleşmesi:** `activations.npy`'nin *i*'nci satırı `rollouts.jsonl`'ın *i*'nci
+kaydına aittir ve `activations_index.json`'ın `rows[i]`'si onu tarif eder. Aşama 3'ün rol/default
+ayrımının tamamı buna dayanır.
+
+**Pilot işareti.** `--limit` ile üretilen bir duman testi kanonik yola (`data/rollouts.jsonl`)
+yazar ve dosyanın kendisinde bunu belli eden hiçbir şey yoktur — Aşama 0'ın `roles.json` zarfının
+çözdüğü problemin aynısı. Bu yüzden `04` yanına `data/rollouts_meta.json` yazar (`limit`, `n`,
+içerikten türetilen `run_id`) ve `05` pilot bir künyeyi `--allow-pilot` verilmedikçe **reddeder**.
+
+**Kesinti kurtarma.** Yakalama geçişi ~2.000 batch sürer; `05` her batch'te ilerleme basar, kısmi
+sonucu diske kaydeder ve bir batch patlarsa hangi batch olduğunu + `--start-row N` ile nasıl devam
+edileceğini yazar. Üretim (vLLM) tekrarlanmak zorunda değildir. `activations_index.json` **yalnızca
+geçiş eksiksiz bittiğinde** yazılır: yarım bir matrisin yanında eksiksiz görünümlü bir indeks,
+Aşama 3'ün sıfır satırları gerçek aktivasyon sanması demektir.
+
+Çıktı: `data/rollouts.jsonl`, `data/rollouts_meta.json`, `data/activations.npy`,
+`data/activations_index.json`.
 
 ### Aşama 2 — Rol ifadesi filtresi · ~250 çağrı
 
@@ -192,6 +219,17 @@ response token'larının ortalaması alınır (~10 dk). Rollout başına saklana
 hakeme sorulup rol düzeyinde tut/at kararı verilir (~180 çağrı). Bu daha kaba bir filtredir ve
 sonuçlarda böyle raporlanır.
 
+> **UYGULAMA DURUMU (2026-08-06):** Bu otomatik geri çekilme **kodda yok**. `06` uyum eşiğin
+> altındaysa çıkış kodu 1 ile durur ve operatöre iki gerçek seçeneği yazar: daha büyük bir
+> `--sample-size` ile tekrar koşmak (harcanan/kalan bütçeyi de basar) ya da `somewhat`
+> vektörleriyle devam edip probe'un güvenilmez olduğunu sonuçlarda açıkça raporlamak. Boşluk
+> bilinçli olarak açık bırakıldı ve proje sahibine ayrıca bildirildi.
+
+`role_expression.json`, üretildiği rollout kümesinin içerikten türetilen `run_id`'sini taşır;
+Aşama 3 bunun `activations_index.json`'daki kimlikle **eşit olmasını şart koşar**. Aksi hâlde
+Aşama 1'in aynı satır sayısı ve sırasıyla farklı bir rol kümesiyle yeniden koşturulması,
+sayı ve kapsama kontrollerinin ikisini de geçip *fully/somewhat* ayrımını sessizce kaydırırdı.
+
 Makalenin kuralı korunur: bir rol vektörü, o kategoride **en az 10 yanıt** varsa hesaplanır.
 *fully* ve *somewhat* ayrı vektörler üretir (makale gibi).
 
@@ -205,7 +243,17 @@ Aşama bütçesi 250 = 200 (etiketleme) + 50 (yedek: geri çekilme senaryosu ve 
 4. **Ana grafik:** katman başına `cos(PC1_l, v_l)` — makalenin Şekil 27'sinin muadili.
 5. Default Assistant projeksiyonunun PC1 dağılımındaki yeri (Şekil 2 muadili).
 
-Çıktı: `results/axis/` — vektörler, PCA, figürler.
+**Asgari rol vektörü sayısı: 40** (`--min-role-vectors` ile bilinçli olarak düşürülebilir). Altında
+A kriteri **değerlendirilmez**, çıkış kodu 2'dir. Gerekçe Bölüm 9'un ilk riskiyle aynı: *n* rol
+vektörüyle persentil yalnızca `k/n` değerlerini alabilir, yani küçük *n*'de "uç desil" koşulu
+neredeyse otomatik sağlanır — ölçülen şey veri değil, örneklem büyüklüğü olur.
+
+**Çıkış kodları** (bu aşamanın ürünü projenin ön kaydedilmiş hükmü olduğu için sözleşmedir):
+`0` = A kriteri GEÇTİ, `1` = A kriteri DÜŞTÜ (gerçek, değerlendirilmiş bir sonuç), `2` = BAŞARISIZ,
+karar üretilemedi. `1` **yalnızca** kriter fiilen değerlendirilip sağlanmadığında üretilir; eksik
+girdi, bayat artefakt, yetersiz rol vektörü ve her türlü çökme 2'dir.
+
+Çıktı: `results/axis/` — vektörler, PCA, figürler, `criterion_a.json`.
 
 ### Aşama 4 — Steering ile rol yatkınlığı · ~175 çağrı
 
@@ -341,7 +389,7 @@ Sonradan rasyonalizasyonu engellemek için önceden sabitlenmiştir.
 
 | # | Kriter | Geçme eşiği |
 |---|---|---|
-| A | Eksen var mı | Orta katmanda `cos(PC1, v) > 0.6` **ve** default Assistant projeksiyonu PC1'in en üst desilinde |
+| A | Eksen var mı | Orta katmanda `\|cos(PC1, v)\| > 0.6` **ve** default Assistant projeksiyonu, `cos`'un **işaretinin gerektirdiği** desilde: `cos > 0` ise PC1'in **üst** desilinde (≥ 0.9), `cos < 0` ise **alt** desilinde (≤ 0.1) |
 | B | Nedensellik | Uzağa steering, Assistant-dışı persona oranını sweep boyunca **≥25 puan** artırıyor |
 | C | Drift | Terapi/felsefe yörüngeleri coding/writing'den **≥1 standart sapma** aşağıda bitiyor |
 | D | Capping | Bir konfig zararlı oranı **göreli ≥%30** düşürürken GSM8k/IFEval'de **<%5 mutlak** kayıp |
@@ -349,6 +397,30 @@ Sonradan rasyonalizasyonu engellemek için önceden sabitlenmiştir.
 
 Negatif sonuç da sonuçtur. A kriteri düşerse bu, "Assistant Axis 1.7B ölçeğinde oluşmuyor" bulgusudur
 ve raporlanır — kriter gevşetilmez.
+
+**A kriterinin işaret değişmezliği ve neden iki koşul EŞLEŞTİRİLMİŞ.**
+PC1, rol vektörlerinin SVD'sinden gelir ve **SVD'nin tekil vektör işareti keyfîdir**: `+PC1` ile `-PC1`
+aynı ana bileşenin iki eşdeğer yazımıdır, hangisinin döneceği kütüphane sürümüne kadar giden bir
+uygulama ayrıntısıdır. Bu yüzden kriter ham `cos > 0.6` üzerine kurulamaz — bir sonraki numpy sürümü
+işareti çevirdiğinde aynı veri "geçti"den "düştü"ye dönerdi. Büyüklük (`|cos|`) işaretten bağımsızdır.
+
+Ama `|cos| > 0.6` **ve** "persentil uç desillerden **herhangi birinde**" iki **bağımsız** test olarak
+yazılırsa geçme bölgesi ikiye katlanır ve **bu bölgenin yarısı hipotezin aleyhine delildir**. Somut
+örnek: `cos = +0.95, persentil = 0.0`. Kontrast vektörü `v = mean(default) − mean(rol)` tanımı gereği
+**rollerden default'a** doğru bakar; PC1 onunla aynı yöndeyken default projeksiyonunun **her rol
+vektörünün altında** kalması, "default Assistant PC1'in Assistant ucundadır" iddiasının tam tersidir.
+Bağımsız yazımda bu `geçti` sayılırdı.
+
+Doğru biçim, iki koşulu **eşleştirmektir**: işaret hangi desilin **beklendiğini** belirler, desil de o
+beklentiyi doğrular. `s = sign(cos(PC1, v))` olmak üzere geçme koşulu
+
+> `|cos| > 0.6` **ve** ( `s > 0` → persentil ≥ 0.9 ; `s < 0` → persentil ≤ 0.1 )
+
+Böylece kriter işaret çevirmesi altında **değişmez** (hem `cos` hem beklenen desil birlikte döner),
+ama geçme bölgesi genişlemez. Kod karşılığı: `src/aax/axis.py::evaluate_criterion_a`. Alt desil sınırı
+`1 − 0.9` ile **hesaplanmaz**, `BOTTOM_DECILE = 0.1` sabiti olarak yazılır: ikili kayan noktada
+`1 − 0.9 = 0.09999999999999998`'dir ve persentil `k/n` biçiminde tam `0.1` değerini rol vektörü sayısı
+10'un katı olduğunda (beklenen ölçekte rutin) alır — sınır bir ULP kaydığında ayna simetrisi bozulurdu.
 
 ## 8. Makaleden sapmalar
 
@@ -369,7 +441,7 @@ Hepsi bilinçli ve gerekçelidir; sonuç raporunda bu tabloyla birlikte sunulur.
 
 | Risk | Nerede yakalanır | Çıkış yolu |
 |---|---|---|
-| 1.7B rolü üstlenemiyor, <40 rol kalıyor | Aşama 2 sonu — ucuz ve erken | *fully* yerine *somewhat* vektörleri; olmazsa Llama-3.2-3B-Instruct batch 2 |
+| 1.7B rolü üstlenemiyor, <40 rol kalıyor | Aşama 2 sonu — ucuz ve erken; Aşama 3 bunu **zorunlu kılar** (çıkış 2) | *fully* yerine *somewhat* vektörleri; olmazsa Llama-3.2-3B-Instruct batch 2 |
 | hakem-llm kötü İngilizce hakem | Aşama 0.5 — 5 çağrı, blokleyici kapı | Prompt düzelt → Türkçeleştir → proje dur |
 | Probe yetersiz | Aşama 2 held-out ölçümü | Rol düzeyinde tut/at filtresine geri çekil (~180 çağrı) |
 | Capping sweep'te OOM | Aşama 6 başı | En fazla 8 katman hook, `no_grad`, batch 4, aktivasyon kopyalamadan in-place |
@@ -389,7 +461,16 @@ kapsam yüzdesine değil. TDD: her biri implementasyondan önce yazılır.
 | `gateway.py` | Sahte transport ile: bütçe aşımı `BudgetExceeded` fırlatıyor, cache hit istek atmıyor, 3 hatada devre kesiliyor | **Sıfır gerçek istek** ile production güvenliğini doğrular |
 | `judge.py` | Bozuk JSON, eksik alan, fazladan markdown fence — hepsi düzgün ele alınıyor | Küçük modellerin JSON'u güvenilmez |
 
-Ek olarak her aşamanın `--dry-run` modu, bütçeyi harcamadan çağrı sayısını doğrular.
+Ek olarak her aşamanın `--dry-run` modu, bütçeyi harcamadan çağrı sayısını doğrular. Ön kontrol
+planı **aşama tavanıyla değil, diskteki sayaca göre KALAN bütçeyle** kıyaslar
+(`GatewayClient.remaining_budget`) ve cache'te olan çağrıları saymaz (`would_call`); global 1500'lük
+tavan da ayrıca kontrol edilir.
+
+**Marker'lar** (`pyproject.toml`): `ml` = torch/transformers gerekir ama CUDA gerekmez, `gpu` = CUDA
+ya da gerçek 1.7B modelin yüklenmesi gerekir. Varsayılan koşu **yalnızca `gpu`'yu** eler. Tek
+marker'lı düzende `activations.py`'nin sahte modüllerle koşan (ne CUDA ne model isteyen) doğruluk
+sınaması da atlanıyordu — yani yukarıdaki tabloda "sessiz ve ölümcül" diye işaretlenen modülün tek
+ucuz koruması varsayılan koşuda hiç çalışmıyordu.
 
 ## 11. Kapsam dışı (YAGNI)
 
@@ -410,4 +491,6 @@ Bilinçli olarak yapılmayacaklar:
   eski adda boşluk vardı ve her kabuk komutunda tırnak gerektiriyordu. Kod hiçbir zaman
   mutlak yol içermedi (`config.py` yolları `__file__`'dan türetiyor), bu yüzden taşıma
   yalnızca iki dokümanı ve bir izin girdisini etkiledi.
-- `data/`, `.env`, `*.npy` ve tüm anahtarlar `.gitignore`'da.
+- `data/`, `.env`, `*.npy` ve tüm anahtarlar `.gitignore`'da. **İstisna:** `results/**/*.npy`
+  commit EDİLİR — `results/axis/assistant_axis.npy` Plan 3-4'ün girdisidir ve onu üreten kararla
+  (`criterion_a.json`) aynı commit'te durmalıdır.
