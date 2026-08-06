@@ -3,11 +3,28 @@
 
 Kullanım:
     uv run --extra ml python scripts/07_extract_axis.py
+    uv run --extra ml python scripts/07_extract_axis.py --min-role-vectors 20  # bilinçli gevşetme
+
+ÇIKIŞ KODLARI — bu script'in tek ürünü projenin ön kaydedilmiş hükmüdür,
+bu yüzden kodların anlamı sözleşmedir:
+
+    0  A KRİTERİ GEÇTİ
+    1  A KRİTERİ DÜŞTÜ — gerçek, değerlendirilmiş bir bilimsel sonuç
+    2  BAŞARISIZ — karar ÜRETİLEMEDİ (eksik/bayat/tanımsız girdi, çökme)
+
+`1` yalnızca `evaluate_criterion_a` fiilen çalışıp `passed: False` dediğinde
+üretilir. Başka HİÇBİR yol 1 döndürmez: `main()` gövdesinin tamamı sarılıdır
+ve yakalanmamış her istisna 2'ye çevrilir. Sarmalayıcı olmadan, eksik bir
+`activations.npy` (FileNotFoundError) ya da indeks/aktivasyon boyu
+uyuşmazlığı (IndexError) yorumlayıcıyı çıkış 1 ile döndürüyordu — yani bir
+ÇÖKME, "Assistant Axis 1.7B'de oluşmuyor" bulgusundan ayırt edilemiyordu.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
+import traceback
 
 import numpy as np
 
@@ -26,15 +43,102 @@ OUT_DIR = config.RESULTS_DIR / "axis"
 
 ROLE_EXPRESSION_PATH = config.DATA_DIR / "role_expression.json"
 
+# Spec Bölüm 9'un "<40 rol kalıyor" riski ve Bölüm 5/Aşama 2'nin kuralı ile
+# aynı sayı. Bu bir uyarı eşiği DEĞİL, sert bir tabandır: `n` rol vektörüyle
+# persentil yalnızca `k/n` değerlerini alabilir, yani küçük `n`'de uç bir
+# desil neredeyse otomatiktir. Ölçüldü: 2 rol vektörü ve onların span'ı
+# dışındaki bir default ile A kriteri `passed: True, cos_magnitude: 0.99995`
+# üretiyordu. Böyle bir "GEÇTİ" veriyi değil, örneklem büyüklüğünü ölçer.
+MIN_ROLE_VECTORS = 40
 
-def main() -> int:
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--min-role-vectors",
+        type=int,
+        default=MIN_ROLE_VECTORS,
+        help=(
+            "A kriterinin değerlendirileceği asgari rol vektörü sayısı "
+            f"(varsayılan {MIN_ROLE_VECTORS}, spec Bölüm 9); altında çıkış 2 — "
+            "yalnızca bilinçli bir gevşetme için düşürün"
+        ),
+    )
+    return parser
+
+
+def _run(argv: list[str] | None) -> int:
+    args = build_arg_parser().parse_args(argv)
+
+    acts_path = config.DATA_DIR / "activations.npy"
+    index_path = config.DATA_DIR / "activations_index.json"
+
+    # `role_expression.json` için zaten var olan desenin AYNISI, Aşama 1'in
+    # iki çıktısı için. Bu iki dosya eksikken script çıplak bir
+    # FileNotFoundError ile çöküyordu ve yorumlayıcı çıkış 1 döndürüyordu —
+    # "A KRİTERİ DÜŞTÜ" ile aynı kod (bkz. modül docstring'i).
+    #
     # `mmap_mode="r"`: planlanan ölçekte (16.000 × 28 × 2048 float32) bu
     # dosya ~3.5 GB'dir. Tam yükleme onu belleğe kopyalar; aşağıdaki
     # `acts[role_idx]`/`acts[default_idx]` fantezi indekslemesi zaten SEÇİLEN
     # satırların bir kopyasını (~3.7 GB'a kadar) çıkarır. mmap ile yalnızca
     # seçilen satırlar maddîleşir — dosyanın tamamı iki kez belleğe alınmaz.
-    acts = np.load(config.DATA_DIR / "activations.npy", mmap_mode="r")
-    index = json.loads((config.DATA_DIR / "activations_index.json").read_text(encoding="utf-8"))
+    try:
+        acts = np.load(acts_path, mmap_mode="r")
+    except FileNotFoundError:
+        print(
+            f"BAŞARISIZ: {acts_path} yok.\n"
+            "  Bu dosya Aşama 1'in çıktısıdır — önce "
+            "scripts/05_capture_activations.py çalıştırılmalı.",
+            file=sys.stderr,
+        )
+        return 2
+    except ValueError as exc:
+        print(
+            f"BAŞARISIZ: {acts_path} okunamadı — bozuk veya kırpık .npy.\n"
+            f"  Ayrıntı: {exc}\n"
+            "  scripts/05_capture_activations.py'yi tekrar çalıştırıp dosyayı yeniden üretin.",
+            file=sys.stderr,
+        )
+        return 2
+    if acts.ndim != 3:
+        print(
+            f"BAŞARISIZ: {acts_path} beklenen [satır, katman, d_model] şeklinde değil "
+            f"(shape={tuple(acts.shape)}).\n"
+            "  scripts/05_capture_activations.py'yi tekrar çalıştırıp dosyayı yeniden üretin.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        print(
+            f"BAŞARISIZ: {index_path} yok.\n"
+            "  Bu dosya Aşama 1'in çıktısıdır — önce "
+            "scripts/05_capture_activations.py çalıştırılmalı.\n"
+            "  activations.npy tek başına yetmez: hangi satırın hangi role/kind'a ait "
+            "olduğu yalnızca bu indekste yazar.",
+            file=sys.stderr,
+        )
+        return 2
+    except json.JSONDecodeError as exc:
+        print(
+            f"BAŞARISIZ: {index_path} bozuk — JSON ayrıştırılamadı.\n"
+            f"  Ayrıntı: {exc}\n"
+            "  scripts/05_capture_activations.py'yi tekrar çalıştırıp dosyayı yeniden üretin.",
+            file=sys.stderr,
+        )
+        return 2
+
+    missing_keys = [k for k in ("rows", "middle_layer") if k not in index]
+    if missing_keys:
+        print(
+            f"BAŞARISIZ: {index_path} eksik anahtar içeriyor: {missing_keys}.\n"
+            "  scripts/05_capture_activations.py'yi tekrar çalıştırıp dosyayı yeniden üretin.",
+            file=sys.stderr,
+        )
+        return 2
 
     # 06_label_and_train_probe.py ile aynı desen: brief'in Adım 5 kod bloğunda
     # bu sarmalayıcı yoktu (çıplak `.read_text()["expression"]`), ama görev
@@ -42,7 +146,8 @@ def main() -> int:
     # `role_expression.json`'ı henüz üretmemiş bir operatör için çıplak
     # FileNotFoundError traceback'i bu koşulu karşılamıyor.
     try:
-        expression = json.loads(ROLE_EXPRESSION_PATH.read_text(encoding="utf-8"))["expression"]
+        expression_payload = json.loads(ROLE_EXPRESSION_PATH.read_text(encoding="utf-8"))
+        expression = expression_payload["expression"]
     except FileNotFoundError:
         print(
             f"BAŞARISIZ: {ROLE_EXPRESSION_PATH} yok.\n"
@@ -62,6 +167,65 @@ def main() -> int:
 
     rows = index["rows"]
     middle = index["middle_layer"]
+
+    # Bütünlük alanları YAZILIYOR ama OKUNMUYORDU. `n_rows` ile gerçek satır
+    # sayısının ayrışması, `rows`'un aktivasyon matrisinden uzun olması ve
+    # `middle_layer`'ın katman sayısını aşması — üçü de indeksin
+    # aktivasyonlarla aynı koşudan gelmediğinin işaretidir ve üçü de
+    # kontrolsüz bırakıldığında bir `IndexError` ile (yani çıkış 1 ile)
+    # patlıyordu. `IndexError` bir `ValueError` DEĞİLDİR, sayısal bloğun
+    # sarmalayıcısına da takılmıyordu.
+    if index.get("n_rows") != int(acts.shape[0]):
+        print(
+            "BAŞARISIZ: activations_index.json ile activations.npy uyuşmuyor —\n"
+            f"  indeks n_rows={index.get('n_rows')}, matris {acts.shape[0]} satır.\n"
+            "  İki dosya farklı koşulardan geliyor; scripts/05_capture_activations.py'yi "
+            "tekrar çalıştırıp ikisini birlikte yeniden üretin.",
+            file=sys.stderr,
+        )
+        return 2
+    if len(rows) != int(acts.shape[0]):
+        print(
+            "BAŞARISIZ: activations_index.json 'rows' uzunluğu matris satır sayısıyla "
+            "uyuşmuyor —\n"
+            f"  {len(rows)} indeks satırı, {acts.shape[0]} aktivasyon satırı.\n"
+            "  scripts/05_capture_activations.py'yi tekrar çalıştırıp ikisini birlikte "
+            "yeniden üretin.",
+            file=sys.stderr,
+        )
+        return 2
+    if not isinstance(middle, int) or not 0 <= middle < int(acts.shape[1]):
+        print(
+            f"BAŞARISIZ: middle_layer={middle!r} katman aralığının dışında "
+            f"(0..{int(acts.shape[1]) - 1}).\n"
+            "  scripts/05_capture_activations.py'yi tekrar çalıştırıp indeksi yeniden üretin.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Bayatlık kontrolünün ÜÇÜNCÜSÜ ve en keskini: iki dosyanın içerikten
+    # türetilen koşu kimliği. Aşağıdaki sayı/kapsama kontrolleri, Aşama 1
+    # aynı satır sayısı ve aynı sırayla FARKLI bir rol kümesiyle yeniden
+    # koşturulduğunda ikisi de geçerdi — kimlik karşılaştırması geçmez.
+    index_run_id = index.get("run_id")
+    expression_run_id = expression_payload.get("run_id")
+    if index_run_id is None or expression_run_id is None or index_run_id != expression_run_id:
+        print(
+            "BAŞARISIZ: activations_index.json ile role_expression.json aynı koşudan "
+            "gelmiyor —\n"
+            f"  activations_index.json run_id={index_run_id!r}, "
+            f"role_expression.json run_id={expression_run_id!r}.\n"
+            "  Kimlik içerikten türetilir (rollouts.jsonl satırları): eşleşmiyorsa iki "
+            "dosya farklı rollout kümelerinden geliyor demektir. Satır sayısı ve sıra "
+            "tutsa bile rol kümesi değişmiş olabilir — bu, sessizce yanlış "
+            "fully/somewhat ayrımı demektir.\n"
+            "  `None` görüyorsanız dosya kimlik alanı yazmayan eski bir sürümden kalmış: "
+            "scripts/05_capture_activations.py ve scripts/06_label_and_train_probe.py'yi "
+            "güncel rollouts.jsonl ile tekrar çalıştırın.",
+            file=sys.stderr,
+        )
+        return 2
+
     print(f"{acts.shape[0]} satır, {acts.shape[1]} katman, orta katman {middle}")
 
     role_idx = [i for i, r in enumerate(rows) if r["kind"] == "role"]
@@ -142,8 +306,29 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    if len(names) < 40:
-        print(f"UYARI: yalnızca {len(names)} vektör — PCA kararsız olabilir.")
+    # Eskiden bu bir UYARI'ydı ve koşu devam ediyordu. Uyarı yeterli değil:
+    # `n` rol vektörüyle persentil yalnızca `k/n` değerlerini alabilir, yani
+    # küçük `n`'de "uç desil" koşulu neredeyse otomatik sağlanır. Ölçüldü
+    # (bu düzeltmenin öncesi): 2 rol vektörü ve span dışı bir default ile
+    # `passed: True`, `cos_magnitude: 0.99995`, çıkış kodu 0 — yani ön
+    # kaydedilmiş bir hipotez, iki noktadan "doğrulanmış" oluyordu. Bu bir
+    # DÜŞTÜ de değildir (veri kriteri değerlendirmeye elverişli değil):
+    # çıkış 2.
+    if len(names) < args.min_role_vectors:
+        print(
+            f"BAŞARISIZ: yalnızca {len(names)} rol vektörü var, en az "
+            f"{args.min_role_vectors} gerekiyor.\n"
+            "  Bu bir A kriteri kararı DEĞİLDİR: bu kadar az vektörle PCA kararsızdır ve "
+            f"persentil yalnızca k/{len(names)} değerlerini alabildiği için uç desil "
+            "koşulu neredeyse otomatik sağlanır — ölçülen şey veri değil, örneklem "
+            "büyüklüğü olur.\n"
+            "  Spec Bölüm 9 bu durumu ('<40 rol kalıyor') bir risk olarak adlandırır ve "
+            "çıkış yolunu tanımlar: 'fully' yerine 'somewhat' vektörleriyle devam etmek "
+            "ya da daha büyük bir modele geçmek.\n"
+            "  Tabanı bilinçli olarak düşürmek için: --min-role-vectors N.",
+            file=sys.stderr,
+        )
+        return 2
 
     default_mean_all = acts[default_idx].astype(np.float64).mean(axis=0)  # [L, D]
 
@@ -262,6 +447,13 @@ def main() -> int:
                 "n_fully_role_vectors": len(fully_positions),
                 "cos_by_layer": cos_by_layer,
                 "explained_variance_ratio": ratios_mid.tolist(),
+                # `explained_variance_ratio` ilk 10 bileşene KESİLMİŞ,
+                # `n_components_for_70pct` ise TAM spektruma karşı sayılır.
+                # İkisi tek başına birbiriyle bağdaştırılamıyordu: 12 gören
+                # bir okur, listedeki 10 oranın toplamının %70'in altında mı
+                # üstünde mi olduğunu göremezdi. Bu alan köprüyü kurar —
+                # `cumulative_variance_at_10 < 0.70` ise `n > 10` zorunludur.
+                "cumulative_variance_at_10": float(ratios_mid.sum()),
                 "n_components_for_70pct": n_for_70,
             },
             ensure_ascii=False,
@@ -275,6 +467,7 @@ def main() -> int:
     print(f"PC1 varyans oranı: {ratios_mid[0]:.1%}")
     print(f"cos(PC1, eksen) orta katmanda: {cos_by_layer[middle]:.3f}")
     print(f"default Assistant persentili: {percentile:.3f}")
+    print(f"işaretin gerektirdiği desil: {verdict['required_decile']}")
     print()
     print("PC1'in bir ucu:", [names[i] for i in order[:6]])
     print("PC1'in diğer ucu:", [names[i] for i in order[-6:]])
@@ -284,5 +477,36 @@ def main() -> int:
     return 0 if verdict["passed"] else 1
 
 
+def main(argv: list[str] | None = None) -> int:
+    """Tanı sarmalayıcısı — çıkış 1'i SADECE gerçek bir karara ayırır.
+
+    `_run()`'ın gövdesindeki her adım kendi Türkçe tanısını ve çıkış kodunu
+    üretir; buradaki `except Exception` yalnızca ÖNGÖRÜLMEMİŞ bir çökme için
+    vardır. Bu sarmalayıcı olmadan böyle bir çökme yorumlayıcıyı çıkış 1 ile
+    döndürüyordu (ölçüldü: `activations.npy` yokken `FileNotFoundError`,
+    indeks satırları matristen uzunken `IndexError`) — ve 1, bu projede
+    "A KRİTERİ DÜŞTÜ" demektir. Bir çökmenin bilimsel bir negatif sonuç gibi
+    kaydedilmesi, bu dalın önlemek zorunda olduğu tek şeydir.
+
+    `except Exception`, `SystemExit`/`KeyboardInterrupt` gibi
+    `BaseException`'ları bilerek KAPSAMAZ: operatörün Ctrl-C'si bir
+    "BAŞARISIZ" tanısına dönüşmemeli.
+    """
+    try:
+        return _run(argv)
+    except Exception as exc:  # noqa: BLE001 — kasıtlı geniş yakalama, gerekçe docstring'de
+        print(
+            "BAŞARISIZ: beklenmeyen bir hata yüzünden A kriteri değerlendirilemedi.\n"
+            f"  Ayrıntı: {type(exc).__name__}: {exc}\n"
+            "  Bu bir A kriteri kararı DEĞİLDİR (çıkış 1 değil 2): hesaplama hiç "
+            "tamamlanmadı, GEÇTİ/DÜŞTÜ çıkarılamaz.\n"
+            "  Tam iz aşağıda; girdileri (activations.npy, activations_index.json, "
+            "role_expression.json) kontrol edip tekrar koşun.",
+            file=sys.stderr,
+        )
+        traceback.print_exc()
+        return 2
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

@@ -45,6 +45,17 @@ def test_module_is_registered_in_sys_modules():
 # --- ortak yardımcılar --------------------------------------------------------
 
 
+# Testlerin çoğu 2-3 rol vektörüyle çalışıyor; `--min-role-vectors`'ın
+# varsayılanı 40 (spec Bölüm 9). Taban BİLİNÇLİ olarak geçiliyor — tabanın
+# kendisi ayrıca `test_exits_2_when_role_vector_count_is_below_the_floor` ile
+# sınanıyor.
+_ARGS = ["--min-role-vectors", "1"]
+
+# `activations_index.json` ile `role_expression.json` aynı koşudan geldiğini
+# içerikten türetilen bu kimlikle kanıtlar (07 eşit olmalarını ŞART koşar).
+_RUN_ID = "testrun00000001"
+
+
 def _patch_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(ea.config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(ea, "ROLE_EXPRESSION_PATH", tmp_path / "role_expression.json")
@@ -61,6 +72,8 @@ def _write_dataset(
     d_model: int = 3,
     expression_override: dict[str, str] | None = None,
     index_extra: dict | None = None,
+    run_id: str | None = _RUN_ID,
+    expression_run_id: str | None = _RUN_ID,
 ):
     """Sentetik aktivasyon + indeks + ifade haritası yaz.
 
@@ -93,6 +106,7 @@ def _write_dataset(
         "n_layers": n_layers,
         "d_model": d_model,
         "model": "test/Model-1.7B",
+        "run_id": run_id,
         "middle_layer": n_layers // 2,
         "rows": [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows],
     }
@@ -111,7 +125,10 @@ def _write_dataset(
     if expression_override is not None:
         expression = expression_override
     (tmp_path / "role_expression.json").write_text(
-        json.dumps({"expression": expression}, ensure_ascii=False), encoding="utf-8"
+        json.dumps(
+            {"run_id": expression_run_id, "expression": expression}, ensure_ascii=False
+        ),
+        encoding="utf-8",
     )
     return acts, index, expression
 
@@ -139,7 +156,7 @@ def test_axis_is_built_from_fully_role_vectors_not_raw_rows(tmp_path, monkeypatc
         ],
     )
 
-    assert ea.main() in (0, 1)  # karar ne olursa olsun artefakt yazılmalı
+    assert ea.main(_ARGS) in (0, 1)  # karar ne olursa olsun artefakt yazılmalı
 
     axis = np.load(tmp_path / "axis" / "assistant_axis.npy")
     names = json.loads((tmp_path / "axis" / "role_names.json").read_text(encoding="utf-8"))
@@ -185,7 +202,7 @@ def test_fails_loudly_when_no_role_vector_is_fully(tmp_path, monkeypatch, capsys
         ],
     )
 
-    assert ea.main() == 2
+    assert ea.main(_ARGS) == 2
 
     captured = capsys.readouterr()
     assert "GEÇTİ" not in captured.out
@@ -211,7 +228,7 @@ def test_empty_default_idx_exits_2_not_1(tmp_path, monkeypatch, capsys):
         n_default=0,
     )
 
-    assert ea.main() == 2
+    assert ea.main(_ARGS) == 2
 
     captured = capsys.readouterr()
     assert "GEÇTİ" not in captured.out
@@ -240,7 +257,7 @@ def test_wraps_a_numeric_valueerror_as_exit_2_not_1(tmp_path, monkeypatch, capsy
 
     monkeypatch.setattr(ea, "contrast_axis", boom)
 
-    assert ea.main() == 2
+    assert ea.main(_ARGS) == 2
 
     captured = capsys.readouterr()
     assert "GEÇTİ" not in captured.out
@@ -269,7 +286,7 @@ def test_no_partial_artifact_when_a_late_numeric_step_raises(tmp_path, monkeypat
 
     monkeypatch.setattr(ea, "n_components_for_variance", boom)
 
-    assert ea.main() == 2
+    assert ea.main(_ARGS) == 2
 
     captured = capsys.readouterr()
     assert "BAŞARISIZ" in captured.err
@@ -290,7 +307,7 @@ def test_fails_when_expression_map_size_does_not_match_role_rows(tmp_path, monke
         expression_override={str(i): "fully" for i in range(10)},  # 24 yerine 10
     )
 
-    assert ea.main() == 2
+    assert ea.main(_ARGS) == 2
 
     captured = capsys.readouterr()
     assert "BAŞARISIZ" in captured.err
@@ -307,7 +324,7 @@ def test_fails_when_expression_keys_do_not_cover_role_rows(tmp_path, monkeypatch
         expression_override={str(i + 100): "fully" for i in range(24)},
     )
 
-    assert ea.main() == 2
+    assert ea.main(_ARGS) == 2
 
     captured = capsys.readouterr()
     assert "BAŞARISIZ" in captured.err
@@ -350,6 +367,7 @@ def test_n_components_for_70pct_is_computed_against_the_full_spectrum(tmp_path, 
                 "n_layers": n_layers,
                 "d_model": d_model,
                 "model": "test/Model-1.7B",
+                "run_id": _RUN_ID,
                 "middle_layer": 1,
                 "rows": rows,
             }
@@ -357,11 +375,18 @@ def test_n_components_for_70pct_is_computed_against_the_full_spectrum(tmp_path, 
         encoding="utf-8",
     )
     (tmp_path / "role_expression.json").write_text(
-        json.dumps({"expression": {str(i): "fully" for i in range(n_roles * per_role)}}),
+        json.dumps(
+            {
+                "run_id": _RUN_ID,
+                "expression": {str(i): "fully" for i in range(n_roles * per_role)},
+            }
+        ),
         encoding="utf-8",
     )
 
-    assert ea.main() in (0, 1)
+    # 60 rol vektörü var: burada taban (varsayılan 40) BİLİNÇLİ olarak
+    # geçilmiyor, gerçek koşudaki gibi sağlanıyor.
+    assert ea.main([]) in (0, 1)
 
     report = json.loads((tmp_path / "axis" / "criterion_a.json").read_text(encoding="utf-8"))
     ratios_first10 = np.asarray(report["explained_variance_ratio"])
@@ -370,6 +395,13 @@ def test_n_components_for_70pct_is_computed_against_the_full_spectrum(tmp_path, 
     assert int(np.searchsorted(np.cumsum(ratios_first10), 0.70) + 1) == 11
     assert np.cumsum(ratios_first10)[-1] < 0.70  # ilk 10 eşiğe hiç ulaşmıyor
     assert report["n_components_for_70pct"] > 11
+    # D6: kesilmiş `explained_variance_ratio` ile tam spektruma karşı sayılan
+    # `n_components_for_70pct` tek başına bağdaştırılamıyordu. Bu alan köprü:
+    # ilk 10 bileşen %70'e ulaşmıyorsa cevabın 10'dan büyük olması ZORUNLU.
+    assert report["cumulative_variance_at_10"] == pytest.approx(
+        float(np.cumsum(ratios_first10)[-1])
+    )
+    assert report["cumulative_variance_at_10"] < 0.70
 
 
 # --- Minor: künye -------------------------------------------------------------
@@ -380,10 +412,11 @@ def test_criterion_a_records_provenance_without_a_timestamp(tmp_path, monkeypatc
     _write_dataset(
         tmp_path,
         role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0), ("c", "fully", 12, 9.0)],
-        index_extra={"run_id": "abc123"},
+        run_id="abc123",
+        expression_run_id="abc123",
     )
 
-    assert ea.main() in (0, 1)
+    assert ea.main(_ARGS) in (0, 1)
 
     report = json.loads((tmp_path / "axis" / "criterion_a.json").read_text(encoding="utf-8"))
     assert report["model"] == "test/Model-1.7B"
@@ -393,3 +426,229 @@ def test_criterion_a_records_provenance_without_a_timestamp(tmp_path, monkeypatc
     assert report["middle_layer"] == 1
     # saatten türetilen hiçbir alan yok
     assert not [k for k in report if "time" in k or "date" in k or "stamp" in k]
+
+
+# --- B1: çökme çıkış 1 (DÜŞTÜ) değil, çıkış 2 (BAŞARISIZ) --------------------
+#
+# Düzeltme öncesi ÖLÇÜLDÜ: `main()` gövdesinin yalnızca sayısal bölümü
+# sarılıydı. `activations.npy` yokken `FileNotFoundError` sarmalayıcının
+# DIŞINDA kalıyor, `raise SystemExit(main())` hiç çalışmıyor ve yorumlayıcı
+# yakalanmamış istisna için çıkış kodu 1 döndürüyordu — bu projede "A KRİTERİ
+# DÜŞTÜ" demek olan kod. Hiçbir tanı da basılmıyordu.
+
+
+def test_missing_activations_file_exits_2_with_a_diagnostic(tmp_path, monkeypatch, capsys):
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(tmp_path, role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)])
+    (tmp_path / "activations.npy").unlink()
+
+    assert ea.main(_ARGS) == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "activations.npy" in captured.err
+    assert "05_capture_activations.py" in captured.err
+    assert "DÜŞTÜ" not in captured.out
+
+
+def test_missing_activations_index_exits_2_with_a_diagnostic(tmp_path, monkeypatch, capsys):
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(tmp_path, role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)])
+    (tmp_path / "activations_index.json").unlink()
+
+    assert ea.main(_ARGS) == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "activations_index.json" in captured.err
+
+
+def test_corrupt_activations_index_exits_2(tmp_path, monkeypatch, capsys):
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(tmp_path, role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)])
+    (tmp_path / "activations_index.json").write_text("{bozuk json", encoding="utf-8")
+
+    assert ea.main(_ARGS) == 2
+
+    assert "BAŞARISIZ" in capsys.readouterr().err
+
+
+def test_index_rows_longer_than_activations_exits_2_not_1(tmp_path, monkeypatch, capsys):
+    """Ölçülen ikinci çökme yolu: `rows` matristen uzunsa `acts[role_idx]`
+    bir `IndexError` fırlatıyordu. `IndexError` bir `ValueError` DEĞİLDİR —
+    sayısal bloğun sarmalayıcısına da takılmadan çıkış 1'e düşüyordu."""
+    _patch_paths(monkeypatch, tmp_path)
+    _, index, _ = _write_dataset(
+        tmp_path, role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)]
+    )
+    index["rows"] = index["rows"] + [{"kind": "role", "role": "hayalet", "system_prompt": "x"}] * 5
+    (tmp_path / "activations_index.json").write_text(
+        json.dumps(index, ensure_ascii=False), encoding="utf-8"
+    )
+
+    assert ea.main(_ARGS) == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "DÜŞTÜ" not in captured.out
+
+
+def test_middle_layer_out_of_range_exits_2(tmp_path, monkeypatch, capsys):
+    """`middle >= n_layers` de bir `IndexError`'dı ve mevcut `except ValueError`
+    sarmalayıcısından KAÇIYORDU."""
+    _patch_paths(monkeypatch, tmp_path)
+    _, index, _ = _write_dataset(
+        tmp_path, role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)]
+    )
+    index["middle_layer"] = 99
+    (tmp_path / "activations_index.json").write_text(
+        json.dumps(index, ensure_ascii=False), encoding="utf-8"
+    )
+
+    assert ea.main(_ARGS) == 2
+
+    assert "middle_layer" in capsys.readouterr().err
+
+
+def test_an_unexpected_exception_becomes_exit_2(tmp_path, monkeypatch, capsys):
+    """Sarmalayıcı GENEL olmalı: öngörülmemiş bir istisna türü de 2'ye
+    çevrilmeli, asla 1'e düşmemeli."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(tmp_path, role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)])
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("öngörülmemiş çökme")
+
+    monkeypatch.setattr(ea, "role_vectors", boom)
+
+    assert ea.main(_ARGS) == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "öngörülmemiş çökme" in captured.err
+    assert "DÜŞTÜ" not in captured.out
+
+
+def test_keyboard_interrupt_is_not_swallowed(tmp_path, monkeypatch):
+    """`except Exception`, `BaseException`'ı KAPSAMAMALI: operatörün Ctrl-C'si
+    bir 'BAŞARISIZ' tanısına dönüşmemeli."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(tmp_path, role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)])
+
+    def boom(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ea, "role_vectors", boom)
+
+    with pytest.raises(KeyboardInterrupt):
+        ea.main(_ARGS)
+
+
+# --- B2: çok az rol vektöründen hüküm çıkmaz ---------------------------------
+
+
+def test_exits_2_when_role_vector_count_is_below_the_floor(tmp_path, monkeypatch, capsys):
+    """Düzeltme öncesi ÖLÇÜLDÜ: 2 rol vektörü ve span dışı bir default ile
+    `passed: True`, `cos_magnitude: 0.99995`, çıkış kodu 0. `n` vektörle
+    persentil yalnızca `k/n` değerlerini alabildiği için uç desil koşulu
+    neredeyse otomatiktir; ölçülen şey veri değil, örneklem büyüklüğüdür.
+    Eski davranış yalnızca bir `UYARI:` basıp devam ediyordu."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0), ("c", "fully", 12, 9.0)],
+    )
+
+    assert ea.main([]) == 2  # varsayılan taban 40
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "3 rol vektörü" in captured.err
+    assert "40" in captured.err
+    assert "--min-role-vectors" in captured.err
+    assert "GEÇTİ" not in captured.out
+    assert "DÜŞTÜ" not in captured.out
+    assert not (tmp_path / "axis" / "criterion_a.json").exists()
+
+
+def test_min_role_vectors_override_is_respected(tmp_path, monkeypatch):
+    """Taban bilinçli olarak düşürülebilmeli — ama yalnızca AÇIKÇA."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0), ("c", "fully", 12, 9.0)],
+    )
+
+    assert ea.main(["--min-role-vectors", "3"]) in (0, 1)
+    assert (tmp_path / "axis" / "criterion_a.json").exists()
+
+
+# --- B3: bütünlük alanları yazılıyordu ama okunmuyordu -----------------------
+
+
+def test_n_rows_mismatch_between_index_and_matrix_exits_2(tmp_path, monkeypatch, capsys):
+    _patch_paths(monkeypatch, tmp_path)
+    _, index, _ = _write_dataset(
+        tmp_path, role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)]
+    )
+    index["n_rows"] = index["n_rows"] + 7
+    (tmp_path / "activations_index.json").write_text(
+        json.dumps(index, ensure_ascii=False), encoding="utf-8"
+    )
+
+    assert ea.main(_ARGS) == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "n_rows" in captured.err
+
+
+def test_run_id_mismatch_between_index_and_expression_exits_2(tmp_path, monkeypatch, capsys):
+    """Sayı ve kapsama kontrollerinin İKİSİNİ de geçen bayatlık senaryosu:
+    Aşama 1, aynı satır sayısı ve aynı sırayla ama FARKLI bir rol kümesiyle
+    yeniden koşturulmuş. Tek yakalayan şey içerikten türetilen kimlik."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+        run_id="koşu-A",
+        expression_run_id="koşu-B",
+    )
+
+    assert ea.main(_ARGS) == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "koşu-A" in captured.err  # her iki kimlik de adlandırılmalı
+    assert "koşu-B" in captured.err
+    assert "GEÇTİ" not in captured.out
+
+
+def test_missing_run_id_in_expression_exits_2(tmp_path, monkeypatch, capsys):
+    """Kimlik alanı yazmayan eski bir `role_expression.json` sessizce
+    geçmemeli — iki `None` birbirine eşit sayılırsa kontrol hiç yoktur."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+        expression_run_id=None,
+    )
+
+    assert ea.main(_ARGS) == 2
+
+    assert "run_id" in capsys.readouterr().err
+
+
+def test_matching_run_ids_pass_the_integrity_check(tmp_path, monkeypatch):
+    """Pozitif kontrol: aynı kimlik taşıyan iki dosya kabul edilmeli."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+        run_id="aynı",
+        expression_run_id="aynı",
+    )
+
+    assert ea.main(_ARGS) in (0, 1)
+    report = json.loads((tmp_path / "axis" / "criterion_a.json").read_text(encoding="utf-8"))
+    assert report["run_id"] == "aynı"
