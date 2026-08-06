@@ -270,12 +270,22 @@ def test_run_machine_prints_blind_worksheet_instructions(tmp_path, monkeypatch, 
     assert str(judge_gate.MACHINE_PATH) in out
 
 
-def test_run_machine_missing_pilot_file_raises_systemexit(tmp_path, monkeypatch):
+def test_run_machine_missing_pilot_file_produces_a_clean_diagnostic_not_exit_1(
+    tmp_path, monkeypatch, capsys
+):
+    """Minor: eskiden `raise SystemExit(mesaj)` fırlatılırdı — yorumlayıcı
+    bunu yakalanmamış bir istisna gibi çıkış kodu 1 ile sonlandırırdı, bu da
+    kapının GERÇEK reddiyle (`agreement < THRESHOLD`, "KAPI KAPALI") AYIRT
+    EDİLEMEZ bir kod. Artık temiz bir BAŞARISIZ tanısı + çıkış kodu 2."""
     _patch_paths(monkeypatch, tmp_path)
     client = FakeJudgeClient([])
 
-    with pytest.raises(SystemExit, match="pilot_rollouts.jsonl yok"):
-        judge_gate.run_machine(client)
+    exit_code = judge_gate.run_machine(client)
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "pilot_rollouts.jsonl yok" in err
 
 
 def test_run_machine_handles_judge_parse_error(tmp_path, monkeypatch, capsys):
@@ -333,24 +343,42 @@ def test_run_machine_handles_gateway_error(tmp_path, monkeypatch, capsys):
 # --- run_score: idx birleştirme ve uyuşmazlık (Bulgu 1) ---------------------
 
 
-def test_run_score_missing_labels_file_raises_systemexit(tmp_path, monkeypatch):
+def test_run_score_missing_labels_file_produces_a_clean_diagnostic_not_exit_1(
+    tmp_path, monkeypatch, capsys
+):
+    """Minor: `run_score`'un yapısal hataları eskiden `raise SystemExit`
+    fırlatırdı — çıkış kodu 1, kapının GERÇEK reddiyle ("KAPI KAPALI") AYIRT
+    EDİLEMEZ. Artık BAŞARISIZ tanısı + çıkış kodu 2 (`min_labelled` dalıyla
+    AYNI desen)."""
     _patch_paths(monkeypatch, tmp_path)
-    with pytest.raises(SystemExit, match="judge_gate_labels.csv yok"):
-        judge_gate.run_score(min_labelled=1)
+
+    exit_code = judge_gate.run_score(min_labelled=1)
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "judge_gate_labels.csv yok" in err
 
 
-def test_run_score_missing_machine_file_raises_systemexit(tmp_path, monkeypatch):
+def test_run_score_missing_machine_file_produces_a_clean_diagnostic_not_exit_1(
+    tmp_path, monkeypatch, capsys
+):
     _patch_paths(monkeypatch, tmp_path)
     _write_labels_csv(
         judge_gate.LABELS_PATH,
         [{"idx": 0, "role": "pirate", "question": "q", "answer": "a", "human_score": "3"}],
     )
-    with pytest.raises(SystemExit, match="judge_gate_machine.json yok"):
-        judge_gate.run_score(min_labelled=1)
+
+    exit_code = judge_gate.run_score(min_labelled=1)
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "judge_gate_machine.json yok" in err
 
 
 def test_run_score_fails_loudly_when_labels_has_idx_missing_from_machine(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ):
     """Bulgu 1: idx yalnızca worksheet'te varsa sessizce atlanmaz, patlar."""
     _patch_paths(monkeypatch, tmp_path)
@@ -363,16 +391,17 @@ def test_run_score_fails_loudly_when_labels_has_idx_missing_from_machine(
     )
     _write_machine_json(judge_gate.MACHINE_PATH, {0: 3})  # idx 1 makine dosyasında yok
 
-    with pytest.raises(SystemExit) as exc_info:
-        judge_gate.run_score(min_labelled=1)
+    exit_code = judge_gate.run_score(min_labelled=1)
 
-    message = str(exc_info.value)
-    assert "uyuşmazlığı" in message
-    assert "1" in message
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "uyuşmazlığı" in err
+    assert "1" in err
     assert not judge_gate.RESULT_PATH.exists()
 
 
-def test_run_score_fails_loudly_when_machine_has_extra_idx(tmp_path, monkeypatch):
+def test_run_score_fails_loudly_when_machine_has_extra_idx(tmp_path, monkeypatch, capsys):
     """Aynı bulgu, ters yön: idx yalnızca makine dosyasında var."""
     _patch_paths(monkeypatch, tmp_path)
     _write_labels_csv(
@@ -381,17 +410,19 @@ def test_run_score_fails_loudly_when_machine_has_extra_idx(tmp_path, monkeypatch
     )
     _write_machine_json(judge_gate.MACHINE_PATH, {0: 3, 1: 2})
 
-    with pytest.raises(SystemExit) as exc_info:
-        judge_gate.run_score(min_labelled=1)
+    exit_code = judge_gate.run_score(min_labelled=1)
 
-    assert "uyuşmazlığı" in str(exc_info.value)
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "uyuşmazlığı" in err
     assert not judge_gate.RESULT_PATH.exists()
 
 
 # --- run_score: elle yazılmış human_score doğrulaması (Bulgu 3) ------------
 
 
-def test_run_score_reports_all_bad_human_score_rows_at_once(tmp_path, monkeypatch):
+def test_run_score_reports_all_bad_human_score_rows_at_once(tmp_path, monkeypatch, capsys):
     _patch_paths(monkeypatch, tmp_path)
     _write_labels_csv(
         judge_gate.LABELS_PATH,
@@ -410,14 +441,15 @@ def test_run_score_reports_all_bad_human_score_rows_at_once(tmp_path, monkeypatc
     )
     _write_machine_json(judge_gate.MACHINE_PATH, {0: 3, 1: 1, 2: 0, 3: 2})
 
-    with pytest.raises(SystemExit) as exc_info:
-        judge_gate.run_score(min_labelled=1)
+    exit_code = judge_gate.run_score(min_labelled=1)
 
-    message = str(exc_info.value)
-    assert "idx=0" in message
-    assert "idx=1" in message
-    assert "idx=2" in message
-    assert "idx=3" not in message, "geçerli satır hata listesine girmemeli"
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "idx=0" in err
+    assert "idx=1" in err
+    assert "idx=2" in err
+    assert "idx=3" not in err, "geçerli satır hata listesine girmemeli"
     assert not judge_gate.RESULT_PATH.exists(), "bozuk satır varken artifact yazılmamalı"
 
 
@@ -442,7 +474,9 @@ def test_run_score_skips_blank_human_score_rows(tmp_path, monkeypatch):
     assert result["n"] == 1
 
 
-def test_run_score_all_blank_raises_systemexit(tmp_path, monkeypatch):
+def test_run_score_all_blank_produces_a_clean_diagnostic_not_exit_1(
+    tmp_path, monkeypatch, capsys
+):
     _patch_paths(monkeypatch, tmp_path)
     _write_labels_csv(
         judge_gate.LABELS_PATH,
@@ -450,8 +484,12 @@ def test_run_score_all_blank_raises_systemexit(tmp_path, monkeypatch):
     )
     _write_machine_json(judge_gate.MACHINE_PATH, {0: 3})
 
-    with pytest.raises(SystemExit, match="Hiç human_score doldurulmamış"):
-        judge_gate.run_score(min_labelled=1)
+    exit_code = judge_gate.run_score(min_labelled=1)
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "Hiç human_score doldurulmamış" in err
 
 
 def test_run_score_computes_agreement_and_writes_result(tmp_path, monkeypatch, capsys):
@@ -671,6 +709,45 @@ def test_run_machine_fails_closed_when_a_pilot_role_is_not_in_the_catalog(
     err = capsys.readouterr().err
     assert "pirate" in err
     assert client.calls == 0
+
+
+def test_run_machine_fails_cleanly_when_a_catalog_entry_has_no_description(
+    tmp_path, monkeypatch, capsys
+):
+    """Minor: `r["description"]` çıplak indekslemesi — üstteki iki doğrulama
+    (`load_role_catalog`'un kendisi) `.get()`/yapı kontrolü kullanırken bu
+    satır bir katalog kaydında `description` anahtarı eksikse ÇIPLAK bir
+    `KeyError` fırlatırdı; yakalanmadan yorumlayıcıyı çıkış 1 ile
+    sonlandırırdı — kapının GERÇEK reddiyle AYIRT EDİLEMEZ bir kod."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_pilot(
+        judge_gate.PILOT_PATH,
+        [{"role": "pirate", "question": "q1", "answer": "a1"}],
+        write_catalog=False,
+    )
+    judge_gate.ROLES_PATH.write_text(
+        json.dumps(
+            {
+                "complete": True,
+                "limit": None,
+                "requested": 1,
+                "catalog_size": 1,
+                "roles": [{"role": "pirate", "instructions": ["x"], "questions": ["q"]}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    client = FakeJudgeClient(["[3]"])
+
+    exit_code = judge_gate.run_machine(client)
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "description" in err
+    assert client.calls == 0
+    assert "Traceback" not in err
 
 
 # --- C2: bloklayıcı kapının asgari örneklem sayısı ---------------------------
