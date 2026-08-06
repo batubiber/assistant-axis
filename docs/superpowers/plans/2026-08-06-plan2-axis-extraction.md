@@ -2138,6 +2138,8 @@ git commit -m "feat: hook tabanlı aktivasyon yakalama"
 - Create: `scripts/04_generate_rollouts.py`
 - Create: `scripts/05_capture_activations.py`
 - Test: `tests/test_rollouts.py`
+- Test (Fix Round 1): `tests/test_generate_rollouts.py` — `04_generate_rollouts.py`'nin saf mantığı (`select_specs`, `build_arg_parser`, FlashInfer varsayılanı)
+- Test (Fix Round 1): `tests/test_capture_activations.py` — `05_capture_activations.py`'nin `build_arg_parser`'ı
 
 **Interfaces:**
 - Consumes: `aax.prompts` (Task 2), `aax.model` (Task 1), `aax.activations` (Task 4)
@@ -2151,7 +2153,14 @@ git commit -m "feat: hook tabanlı aktivasyon yakalama"
 
 - [ ] **Step 1: Failing test'leri yaz**
 
-`tests/test_rollouts.py`:
+`tests/test_rollouts.py` — **Fix Round 1 sonrası nihai hâli** (bkz.
+p2-task-5-report.md, Fix Round 1, Bulgu 3). İlk sürüm 5 testti; Fix Round 1
+`test_write_failure_partway_leaves_no_temp_and_preserves_existing_target`'ı
+ekledi çünkü `test_write_is_atomic_no_temp_left_behind` yalnızca **başarılı**
+bir yazımdan sonra bakıyordu — tempfile hiç kullanmayan naif bir
+`path.write_text(...)` de bu testi aynı şekilde geçerdi. Yeni test yarıda
+kesilen bir yazımı simüle eder ve hem temp dosya kalmadığını hem de var olan
+hedef dosyanın bayt-bayt bozulmadığını doğrular:
 
 ```python
 import json
@@ -2194,6 +2203,41 @@ def test_write_is_atomic_no_temp_left_behind(tmp_path):
     write_rollouts(path, [rollout_record(make_spec(), "x")])
     leftovers = [p.name for p in tmp_path.iterdir() if p.name != "rollouts.jsonl"]
     assert leftovers == []
+
+
+class _BoomPartway:
+    """N kayıttan sonra patlayan sahte kayıt akışı.
+
+    Yarıda kesilen bir yazımı simüle eder: `write_rollouts` bunu iterate
+    ederken bazı kayıtlar diske gitmiş olur, sonra `RuntimeError` fırlar —
+    tıpkı 16.000 kayıtlık gerçek koşuda ortasında kesilen bir işlem gibi.
+    """
+
+    def __init__(self, n_ok: int):
+        self.n_ok = n_ok
+
+    def __iter__(self):
+        for i in range(self.n_ok):
+            yield rollout_record(make_spec(question=f"s{i}"), f"a{i}")
+        raise RuntimeError("yazım ortasında simüle edilmiş çökme")
+
+
+def test_write_failure_partway_leaves_no_temp_and_preserves_existing_target(tmp_path):
+    """Gerçek atomiklik garantisi: yarıda kesilen yazım ne temp dosya bırakır
+    ne de var olan hedefi bozar. Sahte, tempfile'sız bir
+    `path.write_text(...)` bu testi geçemez (hedefi kısmi içerikle üzerine
+    yazardı); `test_write_is_atomic_no_temp_left_behind` bunu ayırt edemezdi
+    çünkü yalnızca başarılı bir yazımdan sonra bakıyordu."""
+    path = tmp_path / "rollouts.jsonl"
+    original = json.dumps(rollout_record(make_spec(), "mevcut"), ensure_ascii=False) + "\n"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="yazım ortasında"):
+        write_rollouts(path, _BoomPartway(n_ok=2))
+
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "rollouts.jsonl"]
+    assert leftovers == []
+    assert path.read_text(encoding="utf-8") == original
 
 
 def test_read_rejects_truncated_file(tmp_path):
@@ -2277,9 +2321,31 @@ def read_rollouts(path: str | Path) -> list[dict]:
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
 Run: `cd ~/assistant-axis && uv run --extra dev pytest tests/test_rollouts.py -v`
-Expected: PASS, 5 passed
+Expected: PASS, 6 passed (Fix Round 1 sonrası; ilk sürümde 5 passed)
 
 - [ ] **Step 5: `scripts/04_generate_rollouts.py` yaz**
+
+**Fix Round 1 sonrası nihai hâli** (bkz. p2-task-5-report.md, Fix Round 1,
+Bulgu 1/2/4). İlk sürüme göre üç değişiklik:
+
+- **Bulgu 1:** `os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")`,
+  herhangi bir vLLM import'undan önce eklendi. Bu makinede vLLM'in
+  varsayılan FlashInfer sampler'ı `nvcc` ile bir CUDA kernel'i JIT-derliyor;
+  sistem `gcc`'si (15.2.0) CUDA 12.8'in `nvcc`'sinin kabul ettiği tavanın
+  (gcc 14) üstünde, `g++-13` kurulu değil, şifresiz sudo yok. Bu satır
+  olmadan `uv run --extra gen python scripts/04_generate_rollouts.py` motor
+  başlatmasında (`LLM(...)`) çöker — tek bir rollout üretilmeden önce.
+  `setdefault` kullanılıyor ki araç zinciri düzeltilmiş bir operatör
+  değişkeni kendi ortamında export ederek geçersiz kılabilsin.
+- **Bulgu 2:** `select_specs()` eklendi. `(role_specs + default_specs)[:limit]`
+  kırpması yanlıştı: role spec'leri listede default'lardan önce geldiği için
+  küçük bir `--limit` (duman testinin `--limit 100`'ü dahil) yalnızca "role"
+  türünü kapsıyor, `system_prompt=None` olan yapısal olarak farklı
+  default-Assistant durumunu hiç sınamıyordu. `select_specs()` artık iki
+  gruptan tam kümenin oranını koruyacak şekilde orantılı örnekliyor.
+- **Bulgu 4:** `--max-new-tokens`, `--gpu-memory-utilization`,
+  `--samples-per-default-prompt` için `help=` eklendi; argparse kurulumu
+  test edilebilmesi için `build_arg_parser()`'a çıkarıldı.
 
 ```python
 #!/usr/bin/env python3
@@ -2299,6 +2365,23 @@ Kullanım:
 """
 from __future__ import annotations
 
+import os
+
+# vLLM'in varsayılan sampler'ı FlashInfer'dır ve ilk kullanımda bir CUDA
+# kernel'ini `nvcc` ile JIT-derler. Bu makinenin sistem `gcc`'si 15.2.0;
+# CUDA 12.8'in `nvcc`'si host derleyici olarak en fazla gcc 14'ü kabul
+# ediyor, `g++-13` kurulu değil ve şifresiz sudo yok — yani araç zincirini
+# yama yapmak bir seçenek değil. Sonuç: JIT derlemesi motor başlatmasında
+# (`LLM(...)` çağrısında) çöker, tek bir rollout üretilmeden önce.
+# `VLLM_USE_FLASHINFER_SAMPLER=0` FlashInfer'i devre dışı bırakıp vLLM'i
+# derleme gerektirmeyen yerli PyTorch top-p/top-k sampler'ına düşürür.
+# `setdefault` kullanıyoruz: araç zinciri düzeltilmiş bir operatör bu
+# değişkeni kendi ortamında export ederek geçersiz kılabilir. Araç zinciri
+# düzeltildiğinde (uygun g++ kurulup nvcc uyumlu hale geldiğinde) bu satır
+# kaldırılmalı. Vllm import edilmeden ÖNCE çalışması şart — aksi halde
+# FlashInfer zaten varsayılan olarak seçilmiş olur.
+os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+
 import argparse
 import json
 
@@ -2309,25 +2392,73 @@ from aax.rollouts import rollout_record, write_rollouts
 OUT_PATH = config.DATA_DIR / "rollouts.jsonl"
 
 
-def main() -> int:
+def select_specs(
+    role_specs: list, default_specs: list, limit: int | None
+) -> tuple[list, int, int]:
+    """`--limit` uygulanırken role/default oranını koru.
+
+    Basit `(role_specs + default_specs)[:limit]` kırpması yanlış: role
+    spec'leri listede default'lardan önce geldiği için küçük bir limit
+    (duman testinin `--limit 100`'ü dahil) yalnızca "role" türünü kapsar ve
+    `system_prompt=None` olan, yapısal olarak farklı default-Assistant
+    durumunu (`to_chat_messages` sistem mesajını tamamen atlar) hiç sınamaz.
+    Bunun yerine her iki gruptan tam kümenin oranını koruyacak şekilde
+    orantılı örnekleriz; her grubun kendi iç sırası değişmeden korunur.
+
+    Döner: (seçilen spec'ler, seçilen role sayısı, seçilen default sayısı).
+    """
+    if limit is None:
+        return role_specs + default_specs, len(role_specs), len(default_specs)
+    total = len(role_specs) + len(default_specs)
+    role_fraction = len(role_specs) / total if total else 0.0
+    n_role = min(len(role_specs), round(limit * role_fraction))
+    n_default = min(len(default_specs), limit - n_role)
+    return role_specs[:n_role] + default_specs[:n_default], n_role, n_default
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=None, help="ilk N spec (duman testi)")
-    parser.add_argument("--max-new-tokens", type=int, default=160)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.70)
-    parser.add_argument("--samples-per-default-prompt", type=int, default=10)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="toplam N spec (rol/varsayılan oranı korunarak, duman testi)",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=160,
+        help="rollout başına üretilecek azami yeni token sayısı",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.70,
+        help="vLLM'e ayrılacak VRAM oranı (TOPLAM bellek üzerinden, kullanılabilir değil)",
+    )
+    parser.add_argument(
+        "--samples-per-default-prompt",
+        type=int,
+        default=10,
+        help="her nötr (default) sistem promptu × soru kombinasyonu için tekrar sayısı",
+    )
+    return parser
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
 
     catalog = load_role_catalog(config.DATA_DIR / "roles.json")
     questions = json.loads(
         (config.DATA_DIR / "questions.json").read_text(encoding="utf-8")
     )["shared_questions"]
 
-    specs = build_role_specs(catalog, questions) + build_default_specs(
+    role_specs = build_role_specs(catalog, questions)
+    default_specs = build_default_specs(
         questions, samples_per_prompt=args.samples_per_default_prompt
     )
-    if args.limit is not None:
-        specs = specs[: args.limit]
-    print(f"{len(specs)} rollout üretilecek")
+    specs, n_role, n_default = select_specs(role_specs, default_specs, args.limit)
+    print(f"{len(specs)} rollout üretilecek ({n_role} role, {n_default} default)")
 
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
@@ -2374,7 +2505,22 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
+`tests/test_generate_rollouts.py` (Fix Round 1, yeni — script dosya adı
+rakamla başladığı için `importlib` ile yüklenir, bkz. `tests/test_judge_gate.py`)
+`select_specs`, `build_arg_parser` ve FlashInfer varsayılanını ağsız test
+eder; en önemlisi `test_small_limit_yields_both_kinds` ve
+`test_limit_preserves_within_group_order_and_ratio` — küçük bir `--limit`'in
+hem role hem default kind'ından spec döndürdüğünü ve oranın korunduğunu
+doğrular (bkz. p2-task-5-report.md, Fix Round 1). 8 test.
+
 - [ ] **Step 6: `scripts/05_capture_activations.py` yaz**
+
+**Fix Round 1 sonrası nihai hâli** (bkz. p2-task-5-report.md, Fix Round 1,
+Bulgu 4): `--batch-size` için `help=` eklendi; argparse kurulumu test
+edilebilmesi için `build_arg_parser()`'a çıkarıldı. `to_chat_messages` /
+`apply_chat_template` çağrısı `04_generate_rollouts.py` ile **argüman argüman
+birebir aynı** kalmalı — bu dosyanın en kritik özelliği (prompt/response
+sınırının vLLM ile HF arasında tutarlılığı).
 
 ```python
 #!/usr/bin/env python3
@@ -2409,10 +2555,19 @@ ACTS_PATH = config.DATA_DIR / "activations.npy"
 INDEX_PATH = config.DATA_DIR / "activations_index.json"
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-size", type=int, default=8)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="aktivasyon yakalamada satır başına batch boyutu (OOM olursa düşür)",
+    )
+    return parser
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
 
     records = read_rollouts(config.DATA_DIR / "rollouts.jsonl")
     print(f"{len(records)} rollout okundu")
@@ -2469,15 +2624,34 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
+`tests/test_capture_activations.py` (Fix Round 1, yeni — script dosya adı
+rakamla başladığı için `importlib` ile yüklenir) `build_arg_parser`'ın
+`--batch-size` için `help=` taşıdığını doğrular. 2 test.
+
 - [ ] **Step 7: Duman testi — 100 rollout**
 
 Run: `cd ~/assistant-axis && uv run --extra gen python scripts/04_generate_rollouts.py --limit 100`
-Expected: `Yazıldı: .../rollouts.jsonl (100 kayıt, 0 boş yanıt atlandı)` civarı. OOM alırsan `--gpu-memory-utilization 0.60` dene ve raporla.
+Expected: `100 rollout üretilecek (N role, M default)` (Fix Round 1 sonrası —
+N/M gerçek katalog boyutuna göre değişir ama ikisi de >0 olmalı; role/default
+oranı ~9:1 olduğundan `--limit 100` için tipik değer 90 role / 10 default'tur),
+sonra `Yazıldı: .../rollouts.jsonl (100 kayıt, 0 boş yanıt atlandı)` civarı.
+Manuel `VLLM_USE_FLASHINFER_SAMPLER=0` export'u **gerekmez** — script artık
+bunu kendi ayarlıyor (bkz. Bulgu 1); araç zinciri düzeltilmiş bir operatör
+kendi export'uyla geçersiz kılabilir. OOM alırsan `--gpu-memory-utilization
+0.60` dene ve raporla.
+
+Fix Round 1'de bu makinede gerçekten koşuldu (env değişkeni elle
+**verilmeden**): `100 rollout üretilecek (90 role, 10 default)`, ardından
+`FlashInfer top-p/top-k sampling disabled via VLLM_USE_FLASHINFER_SAMPLER=0.`
+log satırı ve `Yazıldı: .../rollouts.jsonl (100 kayıt, 0 boş yanıt atlandı)`,
+exit code 0 (bkz. p2-task-5-report.md, Fix Round 1).
 
 Run: `cd ~/assistant-axis && uv run --extra ml python scripts/05_capture_activations.py`
 Expected: `(100, L, D) float32`. Fix Round 2'deki VRAM düzeltmelerinden sonra
 varsayılan `--batch-size 8` ile OOM beklenmiyor (bkz. p2-task-4-report.md);
-yine de olursa `--batch-size 4` dene.
+yine de olursa `--batch-size 4` dene. Fix Round 1'in duman testi bu adımı da
+90 role / 10 default karışık girdiyle (10'u `system_prompt=None` olan
+default satır dahil) sorunsuz geçti — `(100, 28, 2048) float32`, exit code 0.
 
 - [ ] **Step 8: Commit**
 
@@ -2485,6 +2659,12 @@ yine de olursa `--batch-size 4` dene.
 git add src/aax/rollouts.py scripts/04_generate_rollouts.py scripts/05_capture_activations.py tests/test_rollouts.py
 git commit -m "feat: Aşama 1 üretim ve aktivasyon yakalama"
 ```
+
+Fix Round 1 (Bulgu 1/2/3/4) ayrı bir takip commit'idir — değişen dosyalar:
+`scripts/04_generate_rollouts.py`, `scripts/05_capture_activations.py`,
+`tests/test_rollouts.py`, `tests/test_generate_rollouts.py` (yeni),
+`tests/test_capture_activations.py` (yeni). Ayrıntı: p2-task-5-report.md,
+Fix Round 1.
 
 - [ ] **Step 9: OPERATÖR ADIMI — tam koşu**
 
@@ -2495,6 +2675,18 @@ cd ~/assistant-axis && uv run --extra gen python scripts/04_generate_rollouts.py
 ```
 
 Beklenen: ~16.000 rollout, `activations.npy` yaklaşık `16000 × L × d_model × 4` bayt. Qwen3-1.7B için bu ~3-4 GB — disk yeterli (170 GB boş).
+
+**Araç zinciri notu (Fix Round 1, Bulgu 1):** bu makinede vLLM'in varsayılan
+FlashInfer sampler'ı `nvcc` ile bir CUDA kernel'i JIT-derliyor; sistem
+`gcc`'si (15.2.0) CUDA 12.8'in `nvcc`'sinin kabul ettiği tavanın (gcc 14)
+üstünde, `g++-13` kurulu değil, şifresiz sudo yok. `04_generate_rollouts.py`
+artık `os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")` ile bunu
+otomatik devre dışı bırakıyor, yani yukarıdaki komut **ek bir ortam
+değişkeni gerektirmeden** çalışır. Araç zinciri düzeltilmiş (uygun `g++`
+kurulu, `nvcc` uyumlu) bir operatör isterse FlashInfer'i
+`VLLM_USE_FLASHINFER_SAMPLER=1` export ederek geri açabilir — `setdefault`
+zaten böyle bir override'a izin verir. Araç zinciri düzeltildiğinde
+script'teki `setdefault` satırı kaldırılmalı.
 
 ---
 

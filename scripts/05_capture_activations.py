@@ -24,10 +24,19 @@ ACTS_PATH = config.DATA_DIR / "activations.npy"
 INDEX_PATH = config.DATA_DIR / "activations_index.json"
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-size", type=int, default=8)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="aktivasyon yakalamada satır başına batch boyutu (OOM olursa düşür)",
+    )
+    return parser
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
 
     records = read_rollouts(config.DATA_DIR / "rollouts.jsonl")
     print(f"{len(records)} rollout okundu")
