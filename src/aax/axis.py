@@ -195,13 +195,33 @@ def projection_percentile(value: float, distribution: np.ndarray) -> float:
 
 
 def evaluate_criterion_a(cos_pc1_axis: float, default_percentile: float) -> dict:
-    """Spec Bölüm 7, A kriteri.
+    """Spec Bölüm 7, A kriteri — İŞARETLE EŞLEŞTİRİLMİŞ (coupled) biçim.
 
     Geçer: orta katmanda |cos(PC1, kontrast vektörü)| > 0.6 VE default
-    Assistant projeksiyonu PC1'in en üst (veya en alt) desilinde.
+    Assistant projeksiyonu, `cos`'un İŞARETİNİN gerektirdiği desilde:
 
-    PC1'in işareti SVD'nin keyfî bir seçimidir; hem kosinüs hem desil
-    büyüklük üzerinden değerlendirilir.
+        s = sign(cos(PC1, eksen))
+        s > 0  ->  persentil >= TOP_DECILE    (üst desil)
+        s < 0  ->  persentil <= BOTTOM_DECILE (alt desil)
+
+    Neden işaret değişmezliği ŞART: `pca_components` bileşenleri SVD'den
+    alır ve SVD'nin tekil vektör İŞARETİ keyfîdir — `+PC1` ile `-PC1` aynı
+    ana bileşenin iki eşdeğer yazımıdır ve hangisinin döneceği kütüphane
+    sürümüne/BLAS'a kadar giden bir uygulama ayrıntısıdır. Bu yüzden ne
+    kosinüsün işareti ne de projeksiyonun hangi UÇTA olduğu tek başına
+    anlamlıdır; anlamlı olan İKİSİNİN BİRLİKTE tuttuğu bilgidir.
+
+    Neden koşullar EŞLEŞTİRİLMELİ, bağımsız OLMAMALI: `|cos| > 0.6` ve
+    "persentil uç desillerden herhangi birinde" iki BAĞIMSIZ test olarak
+    yazılırsa geçme bölgesi iki katına çıkar ve bu bölgenin YARISI hipotezin
+    ALEYHİNE delildir. Somut örnek (bu düzeltmenin regresyon testi):
+    `cos = +0.95, persentil = 0.0`. Kontrast vektörü ROLLERDEN DEFAULT'A
+    doğru bakar (`mean(default) − mean(rol)`); PC1 onunla aynı yönü
+    gösterirken default projeksiyonunun HER ROL VEKTÖRÜNÜN ALTINDA kalması,
+    "default Assistant PC1'in Assistant ucundadır" iddiasının tam tersidir.
+    Bağımsız testler bunu `passed: True` sayardı. Eşleştirilmiş biçimde
+    işaret hangi desilin BEKLENDİĞİNİ belirler, desil de o beklentiyi
+    doğrular ya da çürütür.
 
     Sonlu olmayan girdi (NaN/inf) SERT BAŞARISIZLIKTIR. NaN ile yapılan her
     karşılaştırma False döndüğü için sessiz bir NaN, hiçbir gerekçe
@@ -213,9 +233,25 @@ def evaluate_criterion_a(cos_pc1_axis: float, default_percentile: float) -> dict
     percentile_is_finite = math.isfinite(percentile_value)
 
     magnitude = abs(cos_value)
-    in_extreme_decile = percentile_is_finite and (
-        percentile_value >= TOP_DECILE or percentile_value <= BOTTOM_DECILE
-    )
+
+    # Hangi desil GEREKLİ: yalnızca işaretten türetilir. `cos == 0` (ya da
+    # sonlu olmayan cos) durumunda işaret yoktur — o zaman istenen desil de
+    # tanımsızdır. Bu bir kaçış yolu değil: `|cos| <= 0.6` zaten kriteri
+    # düşürür, ama gerekçe "hangi desil isteniyordu?" sorusuna da cevap
+    # vermelidir.
+    if not cos_is_finite or cos_value == 0.0:
+        required_decile = None
+    elif cos_value > 0:
+        required_decile = "top"
+    else:
+        required_decile = "bottom"
+
+    if required_decile == "top":
+        in_required_decile = percentile_is_finite and percentile_value >= TOP_DECILE
+    elif required_decile == "bottom":
+        in_required_decile = percentile_is_finite and percentile_value <= BOTTOM_DECILE
+    else:
+        in_required_decile = False
 
     reasons = []
     if not cos_is_finite:
@@ -224,20 +260,40 @@ def evaluate_criterion_a(cos_pc1_axis: float, default_percentile: float) -> dict
         )
     elif magnitude <= COS_THRESHOLD:
         reasons.append(f"|cos| {magnitude:.3f} <= {COS_THRESHOLD}")
+
     if not percentile_is_finite:
         reasons.append(
             f"default persentili sonlu değil ({percentile_value}) — "
             "tanımsız değerden karar çıkarılamaz"
         )
-    elif not in_extreme_decile:
+    elif required_decile is None:
         reasons.append(
-            f"default projeksiyonu uç desilde değil (persentil {percentile_value:.3f})"
+            "istenen desil cos(PC1, eksen)'in İŞARETİNDEN türetilir; işaret "
+            f"tanımsız (cos = {cos_value}) olduğu için desil koşulu değerlendirilemedi"
         )
+    elif not in_required_decile:
+        if required_decile == "top":
+            reasons.append(
+                f"cos(PC1, eksen) POZİTİF ({cos_value:+.3f}) — PC1 eksenle (rollerden "
+                f"default'a) aynı yöne baktığı için default projeksiyonu ÜST desilde "
+                f"(persentil >= {TOP_DECILE}) olmalıydı; ölçülen persentil "
+                f"{percentile_value:.3f}"
+            )
+        else:
+            reasons.append(
+                f"cos(PC1, eksen) NEGATİF ({cos_value:+.3f}) — PC1 eksenin TERSİNE "
+                f"baktığı için default projeksiyonu ALT desilde (persentil <= "
+                f"{BOTTOM_DECILE}) olmalıydı; ölçülen persentil {percentile_value:.3f}"
+            )
 
     return {
         "cos_pc1_axis": cos_value,
         "cos_magnitude": magnitude,
         "default_percentile": percentile_value,
+        # Kararın hangi desile karşı verildiği artefaktta da dursun: aylar
+        # sonra `criterion_a.json`'ı tek başına okuyan biri, persentilin
+        # neden "uç" değil "üst"/"alt" olarak değerlendirildiğini görebilsin.
+        "required_decile": required_decile,
         "passed": not reasons,
         "reason": "; ".join(reasons) if reasons else "her iki koşul da sağlandı",
     }
