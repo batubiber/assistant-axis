@@ -2698,6 +2698,7 @@ Hakeme 16.000 rollout sormak batch'li bile olsa ~1600 çağrı eder ve aşama b�
 - Create: `src/aax/probe.py`
 - Create: `scripts/06_label_and_train_probe.py`
 - Test: `tests/test_probe.py`
+- Test (Fix Round 1): `tests/test_label_and_train_probe.py` — `06_label_and_train_probe.py`'nin karar mantığı (`collapse()`, `--dry-run` bütçe aritmetiği, kurulum-aşaması hata tanıları, `is_trustworthy` kapısı, verbatim etiket önceliği, tek geçişli embedding indekslemesi). 18 test.
 
 **Interfaces:**
 - Consumes: `aax.judge.score_role_expression` (Plan 1), `aax.gateway` (Plan 1), `aax.rollouts.read_rollouts` (Task 5)
@@ -2710,7 +2711,16 @@ Hakeme 16.000 rollout sormak batch'li bile olsa ~1600 çağrı eder ve aşama b�
 
 - [ ] **Step 1: Failing test'leri yaz**
 
-`tests/test_probe.py`:
+`tests/test_probe.py` — **Fix Round 1 sonrası nihai hâli** (bkz.
+p2-task-6-report.md, Fix Round 1). İlk sürüm 8 testti ve hepsi ikili
+(`fully`/`no`) etiket kullanıyordu; brief'in kendi metni "Adım 4: 9 passed"
+diyordu ama Adım 1'in kod bloğu yalnızca 8 `def test_` içeriyordu — bu
+metin/kod tutarsızlığı brief'in kendi hatasıydı. Fix Round 1
+`test_probe_handles_all_three_production_categories`'i ekledi: üretimde
+etiketler HER ZAMAN üç kategoridir (`fully`/`somewhat`/`no`), ikili teste
+sıkışıp kalmak gerçek bir çok sınıflı (multiclass) bozulmayı saklayabilirdi.
+Bu, hem gerçek bir kapsam boşluğunu kapatıyor hem de metin/kod
+tutarsızlığını kod tarafını doğru sayıya (9) çıkararak çözüyor:
 
 ```python
 import numpy as np
@@ -2778,6 +2788,35 @@ def test_probe_reports_low_agreement_on_pure_noise():
     probe = RoleExpressionProbe(seed=0)
     probe.fit(embeddings, labels)
     assert probe.holdout_agreement < 0.75
+
+
+def test_probe_handles_all_three_production_categories():
+    """Üretimde etiketler HER ZAMAN üç kategoridir (fully/somewhat/no).
+
+    Yukarıdaki testlerin tamamı ikili etiketle çalışıyor — bu, gerçek bir
+    çok sınıflı (multiclass) bozulmayı (ör. sklearn çağrısının sessizce
+    ikili davranışa geri düşmesi ya da üçüncü sınıfın kaybolması) saklayacak
+    en olası boşluktu.
+    """
+    rng = np.random.default_rng(0)
+    n = 150
+    fully = rng.normal(loc=+5.0, scale=0.5, size=(n, 8))
+    somewhat = rng.normal(loc=0.0, scale=0.5, size=(n, 8))
+    no = rng.normal(loc=-5.0, scale=0.5, size=(n, 8))
+    embeddings = np.vstack([fully, somewhat, no])
+    labels = ["fully"] * n + ["somewhat"] * n + ["no"] * n
+
+    probe = RoleExpressionProbe(seed=0)
+    probe.fit(embeddings, labels)
+    assert probe.holdout_agreement > 0.9
+
+    fresh_fully = rng.normal(loc=+5.0, scale=0.5, size=(5, 8))
+    fresh_somewhat = rng.normal(loc=0.0, scale=0.5, size=(5, 8))
+    fresh_no = rng.normal(loc=-5.0, scale=0.5, size=(5, 8))
+
+    assert probe.predict(fresh_fully) == ["fully"] * 5
+    assert probe.predict(fresh_somewhat) == ["somewhat"] * 5
+    assert probe.predict(fresh_no) == ["no"] * 5
 
 
 def test_probe_predict_returns_one_label_per_row():
@@ -2910,9 +2949,39 @@ class RoleExpressionProbe:
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
 Run: `cd ~/assistant-axis && uv run --extra dev --extra ml pytest tests/test_probe.py -v`
-Expected: PASS, 9 passed
+Expected: PASS, 9 passed (Fix Round 1 sonrası; ilk sürümde 8 passed)
 
 - [ ] **Step 5: `scripts/06_label_and_train_probe.py` yaz**
+
+**Fix Round 1 sonrası nihai hâli** (bkz. p2-task-6-report.md, Fix Round 1,
+Bulgu 1/2 ve Minor). İlk sürüme göre dört değişiklik:
+
+- **Bulgu 1:** `build_default_client()` çevresindeki tanı sarmalayıcısı üç
+  komşu kurulum hatasına da genişletildi — `stratified_sample(...)`'ın
+  `ValueError`'ı (bu, 90 satırlık smoke veri setine karşı gerçek bir dry-run
+  ile ampirik olarak doğrulandı: `örnek sayısı popülasyondan büyük: 2000 >
+  90`), `load_role_catalog(...)`'un kanonik-olmayan-katalog `ValueError`'ı ve
+  `probe.fit(...)`'in nadir bir kategoriden (ör. `somewhat`) 2'den az örnek
+  kalınca `train_test_split(..., stratify=...)`'tan gelen `ValueError`'ı.
+  Üçü de artık çıplak bir traceback yerine anlaşılır bir Türkçe tanı ve çıkış
+  kodu 2 üretiyor; örnekleme hatası özel olarak istenen boyutu, mevcut
+  popülasyonu ve `--sample-size`'ı işaret ediyor.
+- **Bulgu 2:** `embed_answers` artık TÜM rol yanıtları (~16.000) için TEK
+  SEFERDE çağrılıyor; hakem etiketli ~2.000 satırın embedding'leri bu tek
+  dizinin içinden `role_rows`'taki KONUMLARINA göre indeksleniyor. Eskiden
+  ikinci bir `embed_answers` çağrısı aynı ~2.000 cevabı ikinci kez embed
+  ediyordu (18.000 embedding / 16.000 satır) VE `embed_answers` içeride
+  `SentenceTransformer('BAAI/bge-m3')`'ü her çağrıda yeniden kurduğu için
+  birkaç GB'lık modeli diskten ikinci kez yüklüyordu.
+- **Minor:** `catalog.get(role, f"the role of a {role}")` — hemen üstündeki
+  fail-closed yorumla çelişen sessiz bir jenerik-açıklama ikamesi — kaldırıldı.
+  Örneklenen bir rol kanonik katalogda yoksa (ör. `rollouts.jsonl` farklı bir
+  koşudan geliyorsa) artık gateway istemcisi hiç kurulmadan, hangi rol(ler)in
+  eksik olduğunu adıyla söyleyen bir tanıyla ve çıkış kodu 2 ile reddediliyor.
+- **Test edilebilirlik:** `main()` artık sibling script'lerle (`00`, `01`,
+  `03`) aynı desende opsiyonel bir `argv: list[str] | None = None` parametresi
+  alıyor — `sys.argv`'ye dokunmadan `main(["--dry-run", ...])` gibi
+  çağrılabiliyor. `__main__` bloğu (`raise SystemExit(main())`) değişmedi.
 
 ```python
 #!/usr/bin/env python3
@@ -2955,28 +3024,82 @@ def collapse(score: int) -> str:
     raise ValueError(f"Puan 0-3 aralığı dışında: {score!r}")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--sample-size", type=int, default=LABEL_SAMPLE_SIZE)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     records = read_rollouts(config.DATA_DIR / "rollouts.jsonl")
     role_rows = [i for i, r in enumerate(records) if r["kind"] == "role"]
     role_records = [records[i] for i in role_rows]
 
-    chosen_local = stratified_sample(role_records, n=args.sample_size, seed=SEED)
+    # Kurulum aşamasındaki her hata `build_default_client()` çevresindeki
+    # sarmalayıcıyla aynı desende ele alınır: çıplak bir traceback yerine
+    # anlaşılır bir Türkçe tanı ve sıfırdan farklı bir çıkış kodu (2).
+    try:
+        chosen_local = stratified_sample(role_records, n=args.sample_size, seed=SEED)
+    except ValueError as exc:
+        print(
+            "BAŞARISIZ: örnekleme kurulamadı.\n"
+            f"  İstenen örnek boyutu {args.sample_size}, mevcut rol satırı sayısı "
+            f"{len(role_records)}.\n"
+            "  --sample-size ile mevcut popülasyona sığan daha küçük bir değer verin.\n"
+            f"  Ayrıntı: {exc}",
+            file=sys.stderr,
+        )
+        return 2
     chosen = [role_rows[i] for i in chosen_local]
 
     # load_role_catalog üzerinden: kısmi/pilot bir katalogla etiketleme yapmak,
     # yanlış rol kümesi üzerinde probe eğitmek demek olurdu.
-    catalog = {r["role"]: r["description"] for r in load_role_catalog(config.DATA_DIR / "roles.json")}
+    try:
+        catalog = {
+            r["role"]: r["description"]
+            for r in load_role_catalog(config.DATA_DIR / "roles.json")
+        }
+    except ValueError as exc:
+        print(
+            "BAŞARISIZ: rol kataloğu kanonik değil.\n"
+            f"  {exc}\n"
+            "  Aşama 0'ı (scripts/00_generate_role_data.py) --allow-partial "
+            "OLMADAN tamamlayıp tekrar deneyin.",
+            file=sys.stderr,
+        )
+        return 2
 
     by_role: dict[str, list[int]] = defaultdict(list)
     for row in chosen:
         by_role[records[row]["role"]].append(row)
 
-    client = build_default_client()
+    # Fail-closed: yukarıdaki `load_role_catalog` kanoniklik doğrulaması rol
+    # KÜMESİNİ değil rol İSİMLERİNİN eksiksizliğini garantiler; `rollouts.jsonl`
+    # farklı (ör. daha eski/pilot) bir katalogdan üretilmiş olabilir. Örneklenen
+    # bir rol katalogda yoksa sessizce jenerik bir açıklama uydurmak (eskiden:
+    # `catalog.get(role, f"the role of a {role}")`) yanlış rol kümesi üzerinde
+    # hakemlik yapmak demektir — bu, hemen üstteki yorumun reddettiği tam olarak
+    # aynı hata sınıfıdır.
+    missing_roles = sorted(role for role in by_role if role not in catalog)
+    if missing_roles:
+        print(
+            f"BAŞARISIZ: örneklenen {len(missing_roles)} rol kanonik katalogda yok: "
+            f"{missing_roles}.\n"
+            "  rollouts.jsonl ile roles.json aynı koşudan gelmiyor olabilir — "
+            "Aşama 0 ve Aşama 1'i aynı kanonik katalogla tekrar çalıştırın.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # 00_generate_role_data.py ve 01_smoke_gateway.py ile aynı desen: eksik
+    # `APP_KEY_JAILBREAK` çıplak bir traceback yerine anlaşılır bir Türkçe tanı
+    # ve sıfırdan farklı bir çıkış koduna (2) çevrilir. Brief'in Adım 5 kod
+    # bloğunda bu sarmalayıcı yoktu, ama Adım 6 "anahtar yoksa temiz tanı ve
+    # çıkış kodu 2" bekliyor — bu iki ifadeyi tutarlı kılmak için eklendi.
+    try:
+        client = build_default_client()
+    except RuntimeError as exc:
+        print(f"BAŞARISIZ: gateway istemcisi kurulamadı.\n  {exc}", file=sys.stderr)
+        return 2
 
     if args.dry_run:
         planned = sum(
@@ -2997,7 +3120,7 @@ def main() -> int:
             scores = score_role_expression(
                 client,
                 role=role,
-                description=catalog.get(role, f"the role of a {role}"),
+                description=catalog[role],
                 items=items,
                 stage=STAGE,
             )
@@ -3018,10 +3141,36 @@ def main() -> int:
     )
     print(f"Yazıldı: {LABELS_PATH} ({len(labels)} etiket), gönderilen istek: {client.sends_made}")
 
+    # Tüm rol yanıtlarını TEK GEÇİŞTE embed et. Hakem etiketli ~2.000 satır
+    # rol yanıtlarının (~16.000) bir alt kümesi olduğu için burada AYRICA
+    # `embed_answers([records[i]["answer"] for i in rows])` çağırmak aynı
+    # ~2.000 cümleyi ikinci kez embed ederdi (16.000 satır için 18.000
+    # embedding) VE `embed_answers` içeride `SentenceTransformer('BAAI/bge-m3')`
+    # kurduğu için birkaç GB'lık modeli diskten ikinci kez yüklerdi. Bunun
+    # yerine TEK bir dizi hesaplanır; hakem etiketli satırların embedding'leri
+    # bu dizinin içinden `role_rows`'taki KONUMLARINA (global `row` değil)
+    # göre indekslenir.
+    all_role_answers = [records[i]["answer"] for i in role_rows]
+    all_embeddings = embed_answers(all_role_answers)
+
     rows = sorted(labels)
-    embeddings = embed_answers([records[i]["answer"] for i in rows])
+    role_row_position = {row: position for position, row in enumerate(role_rows)}
+    label_positions = [role_row_position[row] for row in rows]
+    embeddings = all_embeddings[label_positions]
+
     probe = RoleExpressionProbe(seed=SEED)
-    probe.fit(embeddings, [labels[i] for i in rows])
+    try:
+        probe.fit(embeddings, [labels[i] for i in rows])
+    except ValueError as exc:
+        print(
+            "BAŞARISIZ: probe eğitilemedi.\n"
+            f"  {exc}\n"
+            "  Olası neden: nadir bir kategoriden (ör. 'somewhat') 2'den az örnek "
+            "var — train_test_split sınıf başına en az 2 örnek ister. "
+            "--sample-size'ı artırıp tekrar deneyin.",
+            file=sys.stderr,
+        )
+        return 2
     print(f"Probe held-out uyumu: {probe.holdout_agreement:.1%} (eşik %85)")
 
     if not probe.is_trustworthy:
@@ -3032,8 +3181,6 @@ def main() -> int:
         )
         return 1
 
-    all_role_answers = [records[i]["answer"] for i in role_rows]
-    all_embeddings = embed_answers(all_role_answers)
     predicted = probe.predict(all_embeddings)
 
     expression = {str(row): labels.get(row, pred) for row, pred in zip(role_rows, predicted)}
@@ -3059,17 +3206,43 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
+`tests/test_label_and_train_probe.py` (Fix Round 1, yeni — script dosya adı
+rakamla başladığı için `importlib` ile yüklenir, bkz. `tests/test_judge_gate.py`)
+`06_label_and_train_probe.py`'nin karar mantığını ağsız uçtan uca dener:
+`build_default_client` VE `embed_answers` her testte monkeypatch'lenir
+(bge-m3 hiçbir testte yüklenmez/indirilmez). Kapsam: `collapse()`,
+`--dry-run` bütçe aritmetiği, Bulgu 1'in üç kurulum-aşaması tanısı
+(oversized `--sample-size`, kanonik olmayan katalog, `probe.fit`
+stratify hatası) + Minor'ün katalogda-eksik-rol reddi, eksik anahtar tanısı,
+`BudgetExceeded`/`CircuitOpen`/`GatewayError`/`JudgeParseError` durdurma
+yolları, `is_trustworthy` kapısının `role_expression.json`'ı yazmadığını,
+verbatim hakem etiketi önceliğinin (`labels.get(row, pred)`) tahminle
+ezilmediğini VE Bulgu 2'nin tek geçişli embedding indekslemesinin —
+`role_rows`'taki KONUMA göre değil global `row` numarasına göre indekslenirse
+ortaya çıkacak bir kaymayı doğrudan yakalayan bir casus (`SpyProbe`) ile —
+doğru olduğunu. 18 test.
+
 - [ ] **Step 6: Dry-run'ı doğrula**
 
 Run: `cd ~/assistant-axis && uv run python scripts/06_label_and_train_probe.py --dry-run`
-Expected: planlanan çağrı sayısı ve aşama bütçesi (300) basılır, çıkış kodu 0. Anahtar yoksa temiz tanı ve çıkış kodu 2 — bu da beklenen.
+Expected: planlanan çağrı sayısı ve aşama bütçesi (300) basılır, çıkış kodu 0.
+Anahtar yoksa temiz tanı ve çıkış kodu 2 — bu da beklenen. Fix Round 1
+sonrası: 90 satırlık smoke veri setine karşı varsayılan `--sample-size 2000`
+ile de artık çıplak bir traceback DEĞİL, "BAŞARISIZ: örnekleme kurulamadı"
+tanısı ve çıkış kodu 2 basılır (bu makinede ampirik olarak doğrulandı,
+bkz. p2-task-6-report.md, Fix Round 1).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/aax/probe.py scripts/06_label_and_train_probe.py tests/test_probe.py
+git add src/aax/probe.py scripts/06_label_and_train_probe.py tests/test_probe.py tests/test_label_and_train_probe.py
 git commit -m "feat: Aşama 2 rol ifadesi probe'u"
 ```
+
+Fix Round 1 (Bulgu 1/2/Minor) ayrı bir takip commit'idir — değişen dosyalar:
+`scripts/06_label_and_train_probe.py`, `tests/test_probe.py`,
+`tests/test_label_and_train_probe.py` (yeni). Ayrıntı: p2-task-6-report.md,
+Fix Round 1.
 
 ---
 

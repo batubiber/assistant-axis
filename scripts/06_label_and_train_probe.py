@@ -38,26 +38,71 @@ def collapse(score: int) -> str:
     raise ValueError(f"Puan 0-3 aralığı dışında: {score!r}")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--sample-size", type=int, default=LABEL_SAMPLE_SIZE)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     records = read_rollouts(config.DATA_DIR / "rollouts.jsonl")
     role_rows = [i for i, r in enumerate(records) if r["kind"] == "role"]
     role_records = [records[i] for i in role_rows]
 
-    chosen_local = stratified_sample(role_records, n=args.sample_size, seed=SEED)
+    # Kurulum aşamasındaki her hata `build_default_client()` çevresindeki
+    # sarmalayıcıyla aynı desende ele alınır: çıplak bir traceback yerine
+    # anlaşılır bir Türkçe tanı ve sıfırdan farklı bir çıkış kodu (2).
+    try:
+        chosen_local = stratified_sample(role_records, n=args.sample_size, seed=SEED)
+    except ValueError as exc:
+        print(
+            "BAŞARISIZ: örnekleme kurulamadı.\n"
+            f"  İstenen örnek boyutu {args.sample_size}, mevcut rol satırı sayısı "
+            f"{len(role_records)}.\n"
+            "  --sample-size ile mevcut popülasyona sığan daha küçük bir değer verin.\n"
+            f"  Ayrıntı: {exc}",
+            file=sys.stderr,
+        )
+        return 2
     chosen = [role_rows[i] for i in chosen_local]
 
     # load_role_catalog üzerinden: kısmi/pilot bir katalogla etiketleme yapmak,
     # yanlış rol kümesi üzerinde probe eğitmek demek olurdu.
-    catalog = {r["role"]: r["description"] for r in load_role_catalog(config.DATA_DIR / "roles.json")}
+    try:
+        catalog = {
+            r["role"]: r["description"]
+            for r in load_role_catalog(config.DATA_DIR / "roles.json")
+        }
+    except ValueError as exc:
+        print(
+            "BAŞARISIZ: rol kataloğu kanonik değil.\n"
+            f"  {exc}\n"
+            "  Aşama 0'ı (scripts/00_generate_role_data.py) --allow-partial "
+            "OLMADAN tamamlayıp tekrar deneyin.",
+            file=sys.stderr,
+        )
+        return 2
 
     by_role: dict[str, list[int]] = defaultdict(list)
     for row in chosen:
         by_role[records[row]["role"]].append(row)
+
+    # Fail-closed: yukarıdaki `load_role_catalog` kanoniklik doğrulaması rol
+    # KÜMESİNİ değil rol İSİMLERİNİN eksiksizliğini garantiler; `rollouts.jsonl`
+    # farklı (ör. daha eski/pilot) bir katalogdan üretilmiş olabilir. Örneklenen
+    # bir rol katalogda yoksa sessizce jenerik bir açıklama uydurmak (eskiden:
+    # `catalog.get(role, f"the role of a {role}")`) yanlış rol kümesi üzerinde
+    # hakemlik yapmak demektir — bu, hemen üstteki yorumun reddettiği tam olarak
+    # aynı hata sınıfıdır.
+    missing_roles = sorted(role for role in by_role if role not in catalog)
+    if missing_roles:
+        print(
+            f"BAŞARISIZ: örneklenen {len(missing_roles)} rol kanonik katalogda yok: "
+            f"{missing_roles}.\n"
+            "  rollouts.jsonl ile roles.json aynı koşudan gelmiyor olabilir — "
+            "Aşama 0 ve Aşama 1'i aynı kanonik katalogla tekrar çalıştırın.",
+            file=sys.stderr,
+        )
+        return 2
 
     # 00_generate_role_data.py ve 01_smoke_gateway.py ile aynı desen: eksik
     # `APP_KEY_JAILBREAK` çıplak bir traceback yerine anlaşılır bir Türkçe tanı
@@ -89,7 +134,7 @@ def main() -> int:
             scores = score_role_expression(
                 client,
                 role=role,
-                description=catalog.get(role, f"the role of a {role}"),
+                description=catalog[role],
                 items=items,
                 stage=STAGE,
             )
@@ -110,10 +155,36 @@ def main() -> int:
     )
     print(f"Yazıldı: {LABELS_PATH} ({len(labels)} etiket), gönderilen istek: {client.sends_made}")
 
+    # Tüm rol yanıtlarını TEK GEÇİŞTE embed et. Hakem etiketli ~2.000 satır
+    # rol yanıtlarının (~16.000) bir alt kümesi olduğu için burada AYRICA
+    # `embed_answers([records[i]["answer"] for i in rows])` çağırmak aynı
+    # ~2.000 cümleyi ikinci kez embed ederdi (16.000 satır için 18.000
+    # embedding) VE `embed_answers` içeride `SentenceTransformer('BAAI/bge-m3')`
+    # kurduğu için birkaç GB'lık modeli diskten ikinci kez yüklerdi. Bunun
+    # yerine TEK bir dizi hesaplanır; hakem etiketli satırların embedding'leri
+    # bu dizinin içinden `role_rows`'taki KONUMLARINA (global `row` değil)
+    # göre indekslenir.
+    all_role_answers = [records[i]["answer"] for i in role_rows]
+    all_embeddings = embed_answers(all_role_answers)
+
     rows = sorted(labels)
-    embeddings = embed_answers([records[i]["answer"] for i in rows])
+    role_row_position = {row: position for position, row in enumerate(role_rows)}
+    label_positions = [role_row_position[row] for row in rows]
+    embeddings = all_embeddings[label_positions]
+
     probe = RoleExpressionProbe(seed=SEED)
-    probe.fit(embeddings, [labels[i] for i in rows])
+    try:
+        probe.fit(embeddings, [labels[i] for i in rows])
+    except ValueError as exc:
+        print(
+            "BAŞARISIZ: probe eğitilemedi.\n"
+            f"  {exc}\n"
+            "  Olası neden: nadir bir kategoriden (ör. 'somewhat') 2'den az örnek "
+            "var — train_test_split sınıf başına en az 2 örnek ister. "
+            "--sample-size'ı artırıp tekrar deneyin.",
+            file=sys.stderr,
+        )
+        return 2
     print(f"Probe held-out uyumu: {probe.holdout_agreement:.1%} (eşik %85)")
 
     if not probe.is_trustworthy:
@@ -124,8 +195,6 @@ def main() -> int:
         )
         return 1
 
-    all_role_answers = [records[i]["answer"] for i in role_rows]
-    all_embeddings = embed_answers(all_role_answers)
     predicted = probe.predict(all_embeddings)
 
     expression = {str(row): labels.get(row, pred) for row, pred in zip(role_rows, predicted)}
