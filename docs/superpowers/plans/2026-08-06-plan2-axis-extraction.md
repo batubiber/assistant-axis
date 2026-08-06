@@ -3253,22 +3253,23 @@ Bu planın nihai çıktısı. `axis.py` tamamen saf numpy: model, GPU, ağ yok. 
 **Files:**
 - Create: `src/aax/axis.py`
 - Create: `scripts/07_extract_axis.py`
-- Test: `tests/test_axis.py`
+- Test: `tests/test_axis.py` (saf modül), `tests/test_extract_axis.py` (script karar mantığı)
 
 **Interfaces:**
 - Consumes: `data/activations.npy`, `data/role_expression.json` (Task 6), `data/activations_index.json` (Task 5)
 - Produces:
-  - `aax.axis.role_vectors(activations, row_roles, row_categories, *, min_responses=10) -> tuple[np.ndarray, list[str]]`
-  - `aax.axis.contrast_axis(default_mean, role_mean) -> np.ndarray` — L2 normalize
+  - `aax.axis.role_vectors(activations, row_roles, row_categories, *, min_responses=10) -> tuple[np.ndarray, list[str], list[str]]` — `(vektörler, isimler, KATEGORİLER)`. Kategori üçüncü dönüş değeri olarak AÇIKÇA döner: gösterim ismi ("rol::kategori", ya da o rolden tek kategori kaldıysa sadece "rol") tek başına ayırt edici değildir — yalnızca `somewhat`'ı kalan bir rol de sadece "rol" adını alır. Eksen yalnızca `fully` vektörlerinden hesaplandığı için çağıran kategoriyi isimden tahmin edemez.
+  - `aax.axis.contrast_axis(default_mean, role_mean) -> np.ndarray` — L2 normalize; sonlu olmayan girdi/çıktıda `ValueError`
   - `aax.axis.pca_components(vectors, n_components) -> tuple[np.ndarray, np.ndarray]` — `(components, explained_variance_ratio)`
-  - `aax.axis.cosine(a, b) -> float`
+  - `aax.axis.n_components_for_variance(explained_variance_ratio, threshold=0.70) -> int | None` — kesilmiş spektrum eşiğe ulaşmıyorsa `None` (doyan `searchsorted` yerine)
+  - `aax.axis.cosine(a, b) -> float` — sonlu olmayan girdi/çıktıda `ValueError`
   - `aax.axis.projection_percentile(value, distribution) -> float`
-  - `aax.axis.evaluate_criterion_a(cos_pc1_axis, default_percentile) -> dict`
-  - Artifact: `results/axis/` — vektörler, PCA, figür, `criterion_a.json`
+  - `aax.axis.evaluate_criterion_a(cos_pc1_axis, default_percentile) -> dict` — sonlu olmayan kosinüs/persentil SERT BAŞARISIZLIK (asla `passed: True`)
+  - Artifact: `results/axis/` — vektörler, PCA, figür, `criterion_a.json` (künye: `model`, `run_id`, `n_layers`, `d_model`; saatten türetilen alan yok)
 
 - [ ] **Step 1: Failing test'leri yaz**
 
-`tests/test_axis.py`:
+`tests/test_axis.py` (22 test — saf modül):
 
 ```python
 import numpy as np
@@ -3278,6 +3279,7 @@ from aax.axis import (
     contrast_axis,
     cosine,
     evaluate_criterion_a,
+    n_components_for_variance,
     pca_components,
     projection_percentile,
     role_vectors,
@@ -3299,6 +3301,18 @@ def test_cosine_rejects_zero_vector():
         cosine(np.zeros(3), np.ones(3))
 
 
+def test_cosine_rejects_non_finite_input():
+    """NaN yayılmamalı: `na == 0` kontrolü NaN için ateşlemez, o yüzden ayrı
+    bir sonluluk kontrolü şart — yoksa boş dilim ortalaması sessizce geçer."""
+    nan_vector = np.array([np.nan, 0.0, 0.0])
+    with pytest.raises(ValueError, match="sonlu olmayan"):
+        cosine(nan_vector, np.ones(3))
+    with pytest.raises(ValueError, match="sonlu olmayan"):
+        cosine(np.ones(3), nan_vector)
+    with pytest.raises(ValueError, match="sonlu olmayan"):
+        cosine(np.array([np.inf, 0.0, 0.0]), np.ones(3))
+
+
 def test_contrast_axis_is_unit_norm():
     axis = contrast_axis(np.array([5.0, 0.0]), np.array([1.0, 0.0]))
     assert np.linalg.norm(axis) == pytest.approx(1.0)
@@ -3307,6 +3321,15 @@ def test_contrast_axis_is_unit_norm():
 def test_contrast_axis_points_from_roles_toward_default():
     axis = contrast_axis(np.array([10.0, 0.0]), np.array([2.0, 0.0]))
     assert axis[0] > 0
+
+
+def test_contrast_axis_rejects_non_finite_input():
+    """Boş bir dilimin ortalaması NaN'dır; `norm == 0` bunu yakalamaz."""
+    nan_mean = np.full(3, np.nan)
+    with pytest.raises(ValueError, match="sonlu olmayan"):
+        contrast_axis(np.ones(3), nan_mean)
+    with pytest.raises(ValueError, match="sonlu olmayan"):
+        contrast_axis(nan_mean, np.ones(3))
 
 
 def test_pca_recovers_a_planted_direction():
@@ -3322,12 +3345,36 @@ def test_pca_recovers_a_planted_direction():
     assert ratios[0] > 0.9
 
 
+def test_pca_centring_survives_a_large_shared_offset():
+    """Ortalama çıkarma (centring) regresyon koruması.
+
+    `test_pca_recovers_a_planted_direction`'daki sabit tohumlu örneklemin
+    örnek ortalaması zaten ~0 olduğu için centring silinse bile geçiyor.
+    Gerçek aktivasyonlarda ise tüm rollerin paylaştığı BÜYÜK bir ortak
+    ortalama var — centring tam da o zaman kritik. Burada ekilmiş yöne dik,
+    normu varyanstan çok daha büyük bir ofset ekleniyor: centring olmadan
+    SVD'nin ilk sağ tekil vektörü ekilmiş yönü değil ofsetin yönünü bulur ve
+    aşağıdaki kosinüs çöker.
+    """
+    rng = np.random.default_rng(1)
+    planted = np.array([0.0, 1.0, 0.0, 0.0])
+    offset = np.array([50.0, 0.0, 0.0, 0.0])
+    scores = rng.normal(scale=1.0, size=200)
+    noise = rng.normal(scale=0.05, size=(200, 4))
+    vectors = offset[None, :] + scores[:, None] * planted[None, :] + noise
+
+    components, ratios = pca_components(vectors, n_components=2)
+    assert abs(cosine(components[0], planted)) > 0.99
+    assert ratios[0] > 0.9
+
+
 def test_role_vectors_skip_categories_below_minimum():
     acts = np.ones((12, 2, 3), dtype=np.float32)
     roles = ["a"] * 12
     cats = ["fully"] * 9 + ["no"] * 3
-    vectors, names = role_vectors(acts, roles, cats, min_responses=10)
+    vectors, names, categories = role_vectors(acts, roles, cats, min_responses=10)
     assert names == []
+    assert categories == []
 
 
 def test_role_vectors_averages_qualifying_rows():
@@ -3335,8 +3382,9 @@ def test_role_vectors_averages_qualifying_rows():
     acts[:, 0, 0] = 4.0
     roles = ["pirate"] * 10
     cats = ["fully"] * 10
-    vectors, names = role_vectors(acts, roles, cats, min_responses=10)
+    vectors, names, categories = role_vectors(acts, roles, cats, min_responses=10)
     assert names == ["pirate"]
+    assert categories == ["fully"]
     assert vectors.shape == (1, 1, 2)
     assert vectors[0, 0, 0] == pytest.approx(4.0)
 
@@ -3347,8 +3395,49 @@ def test_role_vectors_keeps_fully_and_somewhat_separate():
     acts[10:, 0, 0] = 9.0
     roles = ["bard"] * 20
     cats = ["fully"] * 10 + ["somewhat"] * 10
-    vectors, names = role_vectors(acts, roles, cats, min_responses=10)
+    vectors, names, categories = role_vectors(acts, roles, cats, min_responses=10)
     assert sorted(names) == ["bard::fully", "bard::somewhat"]
+    assert sorted(categories) == ["fully", "somewhat"]
+
+
+def test_role_vectors_reports_category_even_when_name_is_ambiguous():
+    """Gösterim ismi tek başına kategoriyi ayırt etmez.
+
+    Yalnızca `somewhat`'ı eşiği geçen bir rol "rol" adını alır — yalnızca
+    `fully`'si geçen bir rolle aynı. Eksen sadece `fully` vektörlerinden
+    hesaplandığı için çağıranın kategoriyi isimden tahmin etmesi imkânsız;
+    bu yüzden ayrı olarak dönmeli.
+    """
+    acts = np.zeros((30, 1, 2), dtype=np.float32)
+    acts[:10, 0, 0] = 1.0  # sadece_somewhat, 10 satır somewhat
+    acts[10:20, 0, 0] = 2.0  # sadece_fully, 10 satır fully
+    acts[20:, 0, 0] = 3.0  # sadece_fully, 10 satır no (elenir)
+    roles = ["sadece_somewhat"] * 10 + ["sadece_fully"] * 10 + ["sadece_fully"] * 10
+    cats = ["somewhat"] * 10 + ["fully"] * 10 + ["no"] * 10
+
+    vectors, names, categories = role_vectors(acts, roles, cats, min_responses=10)
+
+    assert names == ["sadece_fully", "sadece_somewhat"]
+    assert categories == ["fully", "somewhat"]
+    assert len(categories) == len(names) == vectors.shape[0]
+    # kategori üzerinden seçim: eksen yalnızca bu vektörden hesaplanmalı
+    fully_only = vectors[[i for i, c in enumerate(categories) if c == "fully"]]
+    assert fully_only.shape[0] == 1
+    assert fully_only[0, 0, 0] == pytest.approx(2.0)
+
+
+def test_n_components_for_variance_counts_against_the_full_spectrum():
+    """Kesilmiş spektrumdan kesin sayı okunamaz.
+
+    20 eşit bileşende %70'e ulaşmak 14 bileşen ister. İlk 10 oranla
+    `np.searchsorted(cumsum, 0.70)` doyuma ulaşıp 11 derdi — gerçekten
+    desteklenmeyen, yanıltıcı biçimde DÜŞÜK bir sayı.
+    """
+    full = np.full(20, 1 / 20)
+    assert n_components_for_variance(full, 0.70) == 14
+    assert n_components_for_variance(full[:10], 0.70) is None
+    assert n_components_for_variance(np.array([0.8, 0.2]), 0.70) == 1
+    assert n_components_for_variance(np.array([]), 0.70) is None
 
 
 def test_projection_percentile_at_extremes():
@@ -3378,11 +3467,353 @@ def test_criterion_a_accepts_negative_cosine_by_magnitude():
     """PC1'in işareti keyfîdir; önemli olan büyüklük."""
     result = evaluate_criterion_a(cos_pc1_axis=-0.75, default_percentile=0.02)
     assert result["passed"] is True
+
+
+def test_criterion_a_never_passes_on_a_nan_cosine():
+    """Sahte GEÇTİ yolu.
+
+    NaN ile yapılan her karşılaştırma False döner: `abs(nan) <= 0.6` False
+    olduğu için eski kod hiçbir gerekçe eklemez ve `passed` True çıkardı —
+    yani tanımsız veriden "A KRİTERİ: GEÇTİ".
+    """
+    result = evaluate_criterion_a(cos_pc1_axis=float("nan"), default_percentile=0.95)
+    assert result["passed"] is False
+    assert "sonlu değil" in result["reason"]
+
+
+def test_criterion_a_never_passes_on_a_nan_percentile():
+    result = evaluate_criterion_a(cos_pc1_axis=0.9, default_percentile=float("nan"))
+    assert result["passed"] is False
+    assert "sonlu değil" in result["reason"]
+
+
+def test_criterion_a_rejects_infinite_values():
+    for cos_value, percentile in ((float("inf"), 0.95), (0.9, float("-inf"))):
+        result = evaluate_criterion_a(cos_pc1_axis=cos_value, default_percentile=percentile)
+        assert result["passed"] is False
+        assert "sonlu değil" in result["reason"]
+```
+
+`tests/test_extract_axis.py` (7 test — script karar mantığı; model/GPU/ağ yok, tüm veri sentetik):
+
+```python
+"""`scripts/07_extract_axis.py` karar mantığı testleri.
+
+Bu script'in ürettiği sayı projenin nihai hükmüdür (A kriteri). Buradaki
+testler o hükmü bozan üç yolu kapatır: eksenin YANLIŞ nicelikten kurulması
+(ham "fully" satırları, rol vektörleri yerine), sıfır "fully" durumunda
+tanımsız veriden sahte bir "GEÇTİ" ve bayat bir `role_expression.json` ile
+sessiz kayma.
+
+Model, GPU, ağ yok: tüm veri sentetik, tüm yollar `tmp_path`'e yönlendirilir.
+Script dosya adı bir rakamla başladığı için normal `import` ile içe
+aktarılamaz; `importlib` ile dosya yolundan yüklenir ve repo kuralı gereği
+`sys.modules`'e kaydedilir (bkz. `tests/test_label_and_train_probe.py`).
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from aax.axis import contrast_axis
+
+_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "07_extract_axis.py"
+
+
+def _load_script():
+    spec = importlib.util.spec_from_file_location("extract_axis", _SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+ea = _load_script()
+
+
+def test_module_is_registered_in_sys_modules():
+    assert sys.modules["extract_axis"] is ea
+
+
+# --- ortak yardımcılar --------------------------------------------------------
+
+
+def _patch_paths(monkeypatch, tmp_path):
+    monkeypatch.setattr(ea.config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(ea, "ROLE_EXPRESSION_PATH", tmp_path / "role_expression.json")
+    monkeypatch.setattr(ea, "OUT_DIR", tmp_path / "axis")
+
+
+def _write_dataset(
+    tmp_path,
+    *,
+    role_spec: list[tuple[str, str, int, float]],
+    n_default: int = 6,
+    default_value: float = 7.0,
+    n_layers: int = 2,
+    d_model: int = 3,
+    expression_override: dict[str, str] | None = None,
+    index_extra: dict | None = None,
+):
+    """Sentetik aktivasyon + indeks + ifade haritası yaz.
+
+    `role_spec`: (rol, kategori, satır sayısı, taban değer) listesi. Her rolün
+    satırları d_model boyutunda `taban değer`e dayalı, katmanlar arası hafifçe
+    farklı bir vektör alır — böylece katman başına eksen ayrı ayrı anlamlı olur.
+    """
+    rows = []
+    blocks = []
+    for role, category, count, value in role_spec:
+        for _ in range(count):
+            rows.append({"kind": "role", "role": role, "system_prompt": f"{role} ol"})
+        block = np.zeros((count, n_layers, d_model), dtype=np.float32)
+        for layer in range(n_layers):
+            block[:, layer, :] = [value, value / 2 + layer, -value]
+        blocks.append(block)
+
+    default_block = np.zeros((n_default, n_layers, d_model), dtype=np.float32)
+    for layer in range(n_layers):
+        default_block[:, layer, :] = [default_value, default_value * 3 - layer, 1.0]
+    for _ in range(n_default):
+        rows.append({"kind": "default", "role": None, "system_prompt": ""})
+    blocks.append(default_block)
+
+    acts = np.concatenate(blocks, axis=0)
+    np.save(tmp_path / "activations.npy", acts)
+
+    index = {
+        "n_rows": int(acts.shape[0]),
+        "n_layers": n_layers,
+        "d_model": d_model,
+        "model": "test/Model-1.7B",
+        "middle_layer": n_layers // 2,
+        "rows": [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows],
+    }
+    if index_extra:
+        index.update(index_extra)
+    (tmp_path / "activations_index.json").write_text(
+        json.dumps(index, ensure_ascii=False), encoding="utf-8"
+    )
+
+    expression: dict[str, str] = {}
+    cursor = 0
+    for _role, category, count, _value in role_spec:
+        for offset in range(count):
+            expression[str(cursor + offset)] = category
+        cursor += count
+    if expression_override is not None:
+        expression = expression_override
+    (tmp_path / "role_expression.json").write_text(
+        json.dumps({"expression": expression}, ensure_ascii=False), encoding="utf-8"
+    )
+    return acts, index, expression
+
+
+# --- Kritik 1: eksen rol vektörlerinden kurulur, ham satırlardan değil --------
+
+
+def test_axis_is_built_from_fully_role_vectors_not_raw_rows(tmp_path, monkeypatch, capsys):
+    """Ham "fully" satırlarını havuzlamak iki hata birden yapardı.
+
+    Burada `az` rolünün yalnızca 4 "fully" satırı var — >=10 kuralıyla elenir,
+    ama ham havuzlamada satırları yine ortalamaya karışırdı. `cok` rolünün 30,
+    `orta` rolünün 10 satırı var — ham havuzlamada `cok` ortalamayı ele
+    geçirirdi, oysa tanım her nitelikli rolün EŞİT katkısını ister.
+    Beklenen rol ortalaması: mean(vec_cok, vec_orta).
+    """
+    _patch_paths(monkeypatch, tmp_path)
+    acts, index, _ = _write_dataset(
+        tmp_path,
+        role_spec=[
+            ("cok", "fully", 30, 1.0),
+            ("orta", "fully", 10, 5.0),
+            ("az", "fully", 4, 100.0),
+            ("yalniz_somewhat", "somewhat", 10, 9.0),
+        ],
+    )
+
+    assert ea.main() in (0, 1)  # karar ne olursa olsun artefakt yazılmalı
+
+    axis = np.load(tmp_path / "axis" / "assistant_axis.npy")
+    names = json.loads((tmp_path / "axis" / "role_names.json").read_text(encoding="utf-8"))
+    assert "az" not in names  # >=10 kuralıyla elendi
+
+    n_layers, d_model = index["n_layers"], index["d_model"]
+    default_mean = acts[-6:].astype(np.float64).mean(axis=0)
+    vec_cok = acts[:30].astype(np.float64).mean(axis=0)
+    vec_orta = acts[30:40].astype(np.float64).mean(axis=0)
+    expected_role_mean = (vec_cok + vec_orta) / 2
+
+    for layer in range(n_layers):
+        assert axis[layer] == pytest.approx(
+            contrast_axis(default_mean[layer], expected_role_mean[layer]), rel=1e-5
+        )
+
+    # ham satır havuzlamasıyla AÇIKÇA farklı olmalı (regresyonun kendisi)
+    raw_pool = acts[:44].astype(np.float64).mean(axis=0)
+    wrong_axis = contrast_axis(default_mean[0], raw_pool[0])
+    assert axis[0] != pytest.approx(wrong_axis, rel=1e-3)
+
+    report = json.loads((tmp_path / "axis" / "criterion_a.json").read_text(encoding="utf-8"))
+    assert report["n_role_vectors"] == 3  # cok, orta, yalniz_somewhat
+    assert report["n_fully_role_vectors"] == 2  # az elendi, somewhat sayılmaz
+    assert report["n_layers"] == n_layers
+    assert report["d_model"] == d_model
+
+
+# --- Kritik 2: sıfır "fully" gürültülü başarısızlık, sahte GEÇTİ değil -------
+
+
+def test_fails_loudly_when_no_role_vector_is_fully(tmp_path, monkeypatch, capsys):
+    """Çalışmanın kendi hipotezine yakın senaryo: 1.7B model bir role hiç
+    TAM girmiyorsa `fully` rol vektörü yoktur. Eski kod boş dilimin
+    ortalamasından NaN üretip A KRİTERİ: GEÇTİ basardı."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[
+            ("a", "somewhat", 12, 1.0),
+            ("b", "somewhat", 12, 4.0),
+            ("c", "no", 12, 8.0),
+        ],
+    )
+
+    assert ea.main() == 2
+
+    captured = capsys.readouterr()
+    assert "GEÇTİ" not in captured.out
+    assert "BAŞARISIZ" in captured.err
+    assert "fully" in captured.err
+    assert not (tmp_path / "axis" / "criterion_a.json").exists()
+
+
+# --- Bulgu 6: bayat role_expression.json ------------------------------------
+
+
+def test_fails_when_expression_map_size_does_not_match_role_rows(tmp_path, monkeypatch, capsys):
+    """Farklı bir --limit ile üretilmiş eski harita sessizce kısmi hizasızlık
+    yaratırdı: eşleşmeyen her satır "no" sayılır."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+        expression_override={str(i): "fully" for i in range(10)},  # 24 yerine 10
+    )
+
+    assert ea.main() == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "10" in captured.err and "24" in captured.err
+    assert "GEÇTİ" not in captured.out
+
+
+def test_fails_when_expression_keys_do_not_cover_role_rows(tmp_path, monkeypatch, capsys):
+    """Anahtar sayısı tutsa bile satır numaraları kaymış olabilir."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+        expression_override={str(i + 100): "fully" for i in range(24)},
+    )
+
+    assert ea.main() == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "kapsamıyor" in captured.err
+
+
+# --- Bulgu 5: n_components_for_70pct doyuma ulaşmamalı -----------------------
+
+
+def test_n_components_for_70pct_is_computed_against_the_full_spectrum(tmp_path, monkeypatch):
+    """60 rol vektörü, 30 boyut, izotropik varyans: %70'e ulaşmak 10'dan fazla
+    bileşen ister. Yalnızca ilk 10 orandan hesaplansaydı `searchsorted` doyuma
+    ulaşıp hep 11 derdi — "persona uzayı düşük boyutlu" iddiasını yapay olarak
+    destekleyen, desteklenemeyecek kadar küçük bir sayı.
+    """
+    _patch_paths(monkeypatch, tmp_path)
+    rng = np.random.default_rng(7)
+    n_roles, d_model, n_layers, per_role = 60, 30, 2, 10
+
+    rows, blocks = [], []
+    for role_index in range(n_roles):
+        center = rng.normal(scale=1.0, size=d_model)
+        block = np.zeros((per_role, n_layers, d_model), dtype=np.float32)
+        for layer in range(n_layers):
+            block[:, layer, :] = center
+        blocks.append(block)
+        rows += [
+            {"kind": "role", "role": f"r{role_index}", "system_prompt": "x"}
+        ] * per_role
+    default_block = np.full((5, n_layers, d_model), 0.25, dtype=np.float32)
+    blocks.append(default_block)
+    rows += [{"kind": "default", "role": None, "system_prompt": ""}] * 5
+
+    acts = np.concatenate(blocks, axis=0)
+    np.save(tmp_path / "activations.npy", acts)
+    (tmp_path / "activations_index.json").write_text(
+        json.dumps(
+            {
+                "n_rows": int(acts.shape[0]),
+                "n_layers": n_layers,
+                "d_model": d_model,
+                "model": "test/Model-1.7B",
+                "middle_layer": 1,
+                "rows": rows,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "role_expression.json").write_text(
+        json.dumps({"expression": {str(i): "fully" for i in range(n_roles * per_role)}}),
+        encoding="utf-8",
+    )
+
+    assert ea.main() in (0, 1)
+
+    report = json.loads((tmp_path / "axis" / "criterion_a.json").read_text(encoding="utf-8"))
+    ratios_first10 = np.asarray(report["explained_variance_ratio"])
+    assert len(ratios_first10) == 10  # rapor yine ilk 10 bileşeni gösterir
+    # eski (doyan) hesap tam olarak 11 derdi:
+    assert int(np.searchsorted(np.cumsum(ratios_first10), 0.70) + 1) == 11
+    assert np.cumsum(ratios_first10)[-1] < 0.70  # ilk 10 eşiğe hiç ulaşmıyor
+    assert report["n_components_for_70pct"] > 11
+
+
+# --- Minor: künye -------------------------------------------------------------
+
+
+def test_criterion_a_records_provenance_without_a_timestamp(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0), ("c", "fully", 12, 9.0)],
+        index_extra={"run_id": "abc123"},
+    )
+
+    assert ea.main() in (0, 1)
+
+    report = json.loads((tmp_path / "axis" / "criterion_a.json").read_text(encoding="utf-8"))
+    assert report["model"] == "test/Model-1.7B"
+    assert report["run_id"] == "abc123"
+    assert report["n_layers"] == 2
+    assert report["d_model"] == 3
+    assert report["middle_layer"] == 1
+    # saatten türetilen hiçbir alan yok
+    assert not [k for k in report if "time" in k or "date" in k or "stamp" in k]
 ```
 
 - [ ] **Step 2: Test'lerin başarısız olduğunu doğrula**
 
-Run: `cd ~/assistant-axis && uv run --extra dev pytest tests/test_axis.py -v`
+Run: `cd ~/assistant-axis && uv run --extra dev pytest tests/test_axis.py tests/test_extract_axis.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'aax.axis'`
 
 - [ ] **Step 3: `src/aax/axis.py` yaz**
@@ -3396,6 +3827,7 @@ PCA sonuçları. Bu sayede ekilmiş bir yönle sentetik veride tam test edilebil
 """
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 
 import numpy as np
@@ -3405,10 +3837,27 @@ TOP_DECILE = 0.9
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    """İki vektörün kosinüs benzerliği.
+
+    NaN/inf sessizce yayılmaz: sonlu olmayan girdi ya da sonlu olmayan sonuç
+    `ValueError` ile reddedilir. Aksi hâlde boş bir dilimin ortalamasından
+    doğan bir NaN, `evaluate_criterion_a`'ya kadar gidip sahte bir "GEÇTİ"
+    üretir (NaN karşılaştırmaları hep False'tur).
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if not np.isfinite(a).all() or not np.isfinite(b).all():
+        raise ValueError(
+            "kosinüs sonlu olmayan (NaN/inf) değer içeren vektörle tanımsız — "
+            "girdi büyük olasılıkla boş bir dilimin ortalamasından geliyor"
+        )
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
     if na == 0 or nb == 0:
         raise ValueError("sıfır vektörün kosinüsü tanımsız")
-    return float(np.dot(a, b) / (na * nb))
+    value = float(np.dot(a, b) / (na * nb))
+    if not math.isfinite(value):
+        raise ValueError("kosinüs sonlu olmayan bir değere çözüldü")
+    return value
 
 
 def contrast_axis(default_mean: np.ndarray, role_mean: np.ndarray) -> np.ndarray:
@@ -3416,12 +3865,26 @@ def contrast_axis(default_mean: np.ndarray, role_mean: np.ndarray) -> np.ndarray
 
     Makale bunu PC1'e tercih ediyor: PC1'in her modelde aynı anlamı taşıyacağı
     garanti değil (Ek G.5).
+
+    `cosine` ile aynı gerekçe: sonlu olmayan girdi/çıktı sessizce geçmez.
+    `norm == 0` kontrolü NaN için ateşlemez, bu yüzden ayrı bir sonluluk
+    kontrolü şart.
     """
-    axis = np.asarray(default_mean, dtype=np.float64) - np.asarray(role_mean, dtype=np.float64)
+    default_mean = np.asarray(default_mean, dtype=np.float64)
+    role_mean = np.asarray(role_mean, dtype=np.float64)
+    if not np.isfinite(default_mean).all() or not np.isfinite(role_mean).all():
+        raise ValueError(
+            "kontrast vektörü sonlu olmayan (NaN/inf) girdiyle tanımsız — "
+            "default veya rol ortalaması büyük olasılıkla boş bir dilimden geliyor"
+        )
+    axis = default_mean - role_mean
     norm = np.linalg.norm(axis)
     if norm == 0:
         raise ValueError("kontrast vektörü sıfır — default ve rol ortalamaları aynı")
-    return axis / norm
+    axis = axis / norm
+    if not np.isfinite(axis).all():
+        raise ValueError("kontrast vektörü sonlu olmayan bir değere çözüldü")
+    return axis
 
 
 def role_vectors(
@@ -3430,14 +3893,21 @@ def role_vectors(
     row_categories: list[str],
     *,
     min_responses: int = 10,
-) -> tuple[np.ndarray, list[str]]:
+) -> tuple[np.ndarray, list[str], list[str]]:
     """(rol, kategori) başına ortalama aktivasyon.
 
     Makalenin kuralı: bir kategori en az `min_responses` yanıt içermiyorsa
     o vektör hesaplanmaz. fully ve somewhat ayrı vektörler üretir.
 
-    Dönüş: ([n_vectors, n_layers, d_model], isimler) — isim "rol::kategori",
-    ya da kategori tekse sadece "rol".
+    Dönüş: ([n_vectors, n_layers, d_model], isimler, kategoriler).
+
+    `isimler` gösterim içindir: "rol::kategori", ya da o rolden tek kategori
+    kaldıysa sadece "rol". Bu kural isimleri tek başına ayırt edici KILMAZ —
+    yalnızca `somewhat`'ı kalan bir rol de sadece "rol" adını alır ve yalnızca
+    `fully`'si kalan bir rolden ayırt edilemez. `kategoriler` bu nedenle ayrı
+    döner: Assistant Axis yalnızca `fully` rol vektörlerinden hesaplandığı için
+    çağıranın kategoriyi isimden tahmin etmesi değil, doğrudan bilmesi gerekir.
+    `kategoriler[i]` her zaman `isimler[i]` ile aynı vektöre aittir.
     """
     buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
     for index, (role, category) in enumerate(zip(row_roles, row_categories)):
@@ -3446,26 +3916,34 @@ def role_vectors(
 
     kept = {k: rows for k, rows in buckets.items() if len(rows) >= min_responses}
     if not kept:
-        return np.empty((0,) + activations.shape[1:], dtype=np.float32), []
+        return np.empty((0,) + activations.shape[1:], dtype=np.float32), [], []
 
     roles_with_both = defaultdict(set)
     for role, category in kept:
         roles_with_both[role].add(category)
 
     names: list[str] = []
+    categories: list[str] = []
     vectors: list[np.ndarray] = []
     for (role, category), rows in sorted(kept.items()):
         name = f"{role}::{category}" if len(roles_with_both[role]) > 1 else role
         names.append(name)
+        categories.append(category)
         vectors.append(activations[rows].astype(np.float64).mean(axis=0))
 
-    return np.stack(vectors).astype(np.float32), names
+    return np.stack(vectors).astype(np.float32), names, categories
 
 
 def pca_components(
     vectors: np.ndarray, n_components: int
 ) -> tuple[np.ndarray, np.ndarray]:
     """Roller arası ortalamayı çıkarıp PCA koş.
+
+    Ortalamayı çıkarmak (centring) isteğe bağlı bir süsleme değil: gerçek
+    aktivasyonlarda tüm rollerin paylaştığı büyük bir ortalama vektör vardır ve
+    centring olmadan SVD'nin ilk sağ tekil vektörü varyans yönünü değil bu ortak
+    ortalamanın yönünü bulur. Regresyon koruması:
+    `test_pca_centring_survives_a_large_shared_offset`.
 
     Dönüş: (bileşenler [k, d], açıklanan varyans oranı [k]).
     """
@@ -3476,6 +3954,29 @@ def pca_components(
     ratios = variance / variance.sum()
     k = min(n_components, vt.shape[0])
     return vt[:k], ratios[:k]
+
+
+def n_components_for_variance(
+    explained_variance_ratio: np.ndarray, threshold: float = 0.70
+) -> int | None:
+    """Kümülatif varyansın `threshold`'u ilk kez aştığı bileşen sayısı.
+
+    Verilen spektrum eşiğe hiç ulaşmıyorsa `None` döner. Bu ayrım önemli:
+    yalnızca ilk 10 bileşen istenmişse `np.searchsorted(cumsum, 0.70)` doyuma
+    ulaşıp her zaman 11 der ve gerçek cevap 10'dan büyük olduğunda "persona
+    uzayı düşük boyutlu" iddiasını destekleyecek şekilde YANILTICI biçimde
+    küçük bir sayı raporlar. `None` dönen çağıran taraf ya tam spektrumla
+    yeniden hesaplamalı ya da ">k" gibi bir alt sınır yazmalıdır.
+    """
+    ratios = np.asarray(explained_variance_ratio, dtype=np.float64)
+    if ratios.size == 0:
+        return None
+    if not np.isfinite(ratios).all():
+        raise ValueError("açıklanan varyans oranı sonlu olmayan değer içeriyor")
+    reached = np.nonzero(np.cumsum(ratios) >= threshold)[0]
+    if reached.size == 0:
+        return None
+    return int(reached[0]) + 1
 
 
 def projection_percentile(value: float, distribution: np.ndarray) -> float:
@@ -3492,24 +3993,42 @@ def evaluate_criterion_a(cos_pc1_axis: float, default_percentile: float) -> dict
 
     PC1'in işareti SVD'nin keyfî bir seçimidir; hem kosinüs hem desil
     büyüklük üzerinden değerlendirilir.
+
+    Sonlu olmayan girdi (NaN/inf) SERT BAŞARISIZLIKTIR. NaN ile yapılan her
+    karşılaştırma False döndüğü için sessiz bir NaN, hiçbir gerekçe
+    eklenmeden `passed: True` üretirdi — yani tanımsız veriden "GEÇTİ".
     """
-    magnitude = abs(cos_pc1_axis)
-    in_extreme_decile = (
-        default_percentile >= TOP_DECILE or default_percentile <= 1 - TOP_DECILE
+    cos_value = float(cos_pc1_axis)
+    percentile_value = float(default_percentile)
+    cos_is_finite = math.isfinite(cos_value)
+    percentile_is_finite = math.isfinite(percentile_value)
+
+    magnitude = abs(cos_value)
+    in_extreme_decile = percentile_is_finite and (
+        percentile_value >= TOP_DECILE or percentile_value <= 1 - TOP_DECILE
     )
 
     reasons = []
-    if magnitude <= COS_THRESHOLD:
-        reasons.append(f"|cos| {magnitude:.3f} <= {COS_THRESHOLD}")
-    if not in_extreme_decile:
+    if not cos_is_finite:
         reasons.append(
-            f"default projeksiyonu uç desilde değil (persentil {default_percentile:.3f})"
+            f"cos(PC1, eksen) sonlu değil ({cos_value}) — tanımsız değerden karar çıkarılamaz"
+        )
+    elif magnitude <= COS_THRESHOLD:
+        reasons.append(f"|cos| {magnitude:.3f} <= {COS_THRESHOLD}")
+    if not percentile_is_finite:
+        reasons.append(
+            f"default persentili sonlu değil ({percentile_value}) — "
+            "tanımsız değerden karar çıkarılamaz"
+        )
+    elif not in_extreme_decile:
+        reasons.append(
+            f"default projeksiyonu uç desilde değil (persentil {percentile_value:.3f})"
         )
 
     return {
-        "cos_pc1_axis": cos_pc1_axis,
+        "cos_pc1_axis": cos_value,
         "cos_magnitude": magnitude,
-        "default_percentile": default_percentile,
+        "default_percentile": percentile_value,
         "passed": not reasons,
         "reason": "; ".join(reasons) if reasons else "her iki koşul da sağlandı",
     }
@@ -3517,8 +4036,8 @@ def evaluate_criterion_a(cos_pc1_axis: float, default_percentile: float) -> dict
 
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
-Run: `cd ~/assistant-axis && uv run --extra dev --extra ml pytest tests/test_axis.py -v`
-Expected: PASS, 15 passed
+Run: `cd ~/assistant-axis && uv run --extra dev --extra ml pytest tests/test_axis.py tests/test_extract_axis.py -v`
+Expected: PASS, 29 passed (22 + 7). (Bu satır önceden "15 passed" diyordu; blok o hâlinde 14 test içeriyordu — Fix Round 1'de hem sayı düzeltildi hem de 15 test eklendi.)
 
 - [ ] **Step 5: `scripts/07_extract_axis.py` yaz**
 
@@ -3532,6 +4051,7 @@ Kullanım:
 from __future__ import annotations
 
 import json
+import sys
 
 import numpy as np
 
@@ -3540,6 +4060,7 @@ from aax.axis import (
     contrast_axis,
     cosine,
     evaluate_criterion_a,
+    n_components_for_variance,
     pca_components,
     projection_percentile,
     role_vectors,
@@ -3547,13 +4068,36 @@ from aax.axis import (
 
 OUT_DIR = config.RESULTS_DIR / "axis"
 
+ROLE_EXPRESSION_PATH = config.DATA_DIR / "role_expression.json"
+
 
 def main() -> int:
     acts = np.load(config.DATA_DIR / "activations.npy")
     index = json.loads((config.DATA_DIR / "activations_index.json").read_text(encoding="utf-8"))
-    expression = json.loads(
-        (config.DATA_DIR / "role_expression.json").read_text(encoding="utf-8")
-    )["expression"]
+
+    # 06_label_and_train_probe.py ile aynı desen: brief'in Adım 5 kod bloğunda
+    # bu sarmalayıcı yoktu (çıplak `.read_text()["expression"]`), ama görev
+    # tanımı "eksikse temiz başarısız olsun, traceback değil" diyor — dosya
+    # `role_expression.json`'ı henüz üretmemiş bir operatör için çıplak
+    # FileNotFoundError traceback'i bu koşulu karşılamıyor.
+    try:
+        expression = json.loads(ROLE_EXPRESSION_PATH.read_text(encoding="utf-8"))["expression"]
+    except FileNotFoundError:
+        print(
+            f"BAŞARISIZ: {ROLE_EXPRESSION_PATH} yok.\n"
+            "  Bu dosya Aşama 2'nin çıktısıdır — önce "
+            "scripts/06_label_and_train_probe.py çalıştırılmalı.",
+            file=sys.stderr,
+        )
+        return 2
+    except (json.JSONDecodeError, KeyError) as exc:
+        print(
+            f"BAŞARISIZ: {ROLE_EXPRESSION_PATH} bozuk veya 'expression' anahtarı yok.\n"
+            f"  Ayrıntı: {exc}\n"
+            "  scripts/06_label_and_train_probe.py'yi tekrar çalıştırıp dosyayı yeniden üretin.",
+            file=sys.stderr,
+        )
+        return 2
 
     rows = index["rows"]
     middle = index["middle_layer"]
@@ -3562,18 +4106,84 @@ def main() -> int:
     role_idx = [i for i, r in enumerate(rows) if r["kind"] == "role"]
     default_idx = [i for i, r in enumerate(rows) if r["kind"] == "default"]
 
-    categories = [expression.get(str(i), "no") for i in role_idx]
-    vectors, names = role_vectors(
+    # Bayatlık kontrolü: `expression.get(str(i), "no")` eşleşmeyen her satırı
+    # sessizce "no" sayar. Tek bir taze koşuda sorun değil, ama farklı bir
+    # --limit veya rol kümesiyle üretilmiş eski bir role_expression.json Aşama 1
+    # yeniden koşturulduktan sonra yerinde kalırsa fully/somewhat ayrımı kısmen
+    # kayar ve hiçbir hata vermez. İki ucuz kontrol bunu yakalar: anahtar sayısı
+    # ve anahtarların indeksteki rol satırlarını kapsaması.
+    if len(expression) != len(role_idx):
+        print(
+            "BAŞARISIZ: role_expression.json ile activations_index.json uyuşmuyor —\n"
+            f"  ifade haritasında {len(expression)} anahtar var, "
+            f"indekste {len(role_idx)} rol satırı.\n"
+            "  Olası neden: farklı bir --limit veya rol kümesiyle üretilmiş eski bir "
+            "role_expression.json, Aşama 1 yeniden koşturulduktan sonra yerinde kalmış.\n"
+            "  scripts/06_label_and_train_probe.py'yi güncel rollouts/aktivasyonlarla "
+            "yeniden çalıştırın.",
+            file=sys.stderr,
+        )
+        return 2
+    missing = [i for i in role_idx if str(i) not in expression]
+    if missing:
+        print(
+            "BAŞARISIZ: role_expression.json indeksteki bazı rol satırlarını kapsamıyor —\n"
+            f"  {len(missing)} satırın karşılığı yok (ilk örnekler: {missing[:5]}).\n"
+            "  Anahtar sayısı tutsa bile satır numaraları kaymış: iki dosya farklı "
+            "koşulardan geliyor.\n"
+            "  scripts/06_label_and_train_probe.py'yi güncel rollouts/aktivasyonlarla "
+            "yeniden çalıştırın.",
+            file=sys.stderr,
+        )
+        return 2
+
+    categories = [expression[str(i)] for i in role_idx]
+    vectors, names, vector_categories = role_vectors(
         acts[role_idx], [rows[i]["role"] for i in role_idx], categories
     )
     print(f"{len(names)} rol vektörü hesaplandı (>=10 yanıt kuralı sonrası)")
+
+    # role_vectors, hiçbir (rol, kategori) çifti min_responses eşiğini
+    # geçemezse boş dizi döner. Bu durumda devam etmek NaN'lara (boş dilimin
+    # ortalaması) ve ardından PCA/kosinüs adımlarında şifreli bir
+    # IndexError'a yol açar — görev tanımının "traceback değil, temiz mesaj"
+    # koşulu burada da geçerli.
+    if len(names) == 0:
+        print(
+            "BAŞARISIZ: hiçbir rol min_responses (>=10) eşiğini geçemedi — "
+            "hesaplanacak rol vektörü yok.\n"
+            "  Olası neden: role_expression.json'daki dağılım beklenenden "
+            "farklı veya veri seti hâlâ pilot ölçekte (--limit).",
+            file=sys.stderr,
+        )
+        return 2
     if len(names) < 40:
         print(f"UYARI: yalnızca {len(names)} vektör — PCA kararsız olabilir.")
 
     default_mean_all = acts[default_idx].astype(np.float64).mean(axis=0)  # [L, D]
 
-    fully_rows = [i for i, c in zip(role_idx, categories) if c == "fully"]
-    role_mean_all = acts[fully_rows].astype(np.float64).mean(axis=0)  # [L, D]
+    # Assistant Axis = mean(default) − mean(fully ROL VEKTÖRLERİ). Ham "fully"
+    # satırlarını havuzlamak İKİ ayrı hata olurdu: (1) "fully" sayısı 10'un
+    # altında kalan bir rol role_vectors tarafından elenmişken ham satırlarıyla
+    # yine de ortalamaya karışırdı; (2) çok rollout'lu roller ortalamayı ele
+    # geçirirdi — oysa tanım her nitelikli rolün EŞİT ağırlıkta katkısını ister.
+    fully_positions = [i for i, c in enumerate(vector_categories) if c == "fully"]
+    if not fully_positions:
+        print(
+            "BAŞARISIZ: hiçbir rol vektörü 'fully' kategorisinde değil — "
+            "Assistant Axis tanımsız.\n"
+            "  Eksen mean(default) − mean(fully rol vektörleri) olarak tanımlı; "
+            "fully rol vektörü yoksa hesaplanacak bir şey yok.\n"
+            "  Kontrol edin: role_expression.json'daki dağılım (kaç satır 'fully'?), "
+            ">=10 yanıt kuralı (bir rolün 'fully' sayısı eşiğin altında kalmış "
+            "olabilir) ve veri setinin hâlâ pilot ölçekte (--limit) olup olmadığı.\n"
+            "  Bu bir BAŞARISIZLIKTIR, A kriteri kararı DEĞİLDİR: tanımsız veriden "
+            "GEÇTİ/DÜŞTÜ çıkarılamaz.",
+            file=sys.stderr,
+        )
+        return 2
+    role_mean_all = vectors[fully_positions].astype(np.float64).mean(axis=0)  # [L, D]
+    print(f"  bunların {len(fully_positions)} tanesi 'fully' — eksen bunlardan hesaplanıyor")
 
     axis_per_layer = np.stack(
         [contrast_axis(default_mean_all[l], role_mean_all[l]) for l in range(acts.shape[1])]
@@ -3584,7 +4194,14 @@ def main() -> int:
         components, _ = pca_components(vectors[:, layer, :], n_components=1)
         cos_by_layer.append(cosine(components[0], axis_per_layer[layer]))
 
-    components_mid, ratios_mid = pca_components(vectors[:, middle, :], n_components=10)
+    # Tam spektrum isteniyor: n_components_for_70pct yalnızca ilk 10 orandan
+    # hesaplanırsa gerçek cevap 10'u aştığında doyuma ulaşıp hep 11 der ve
+    # "persona uzayı düşük boyutlu" iddiasını yapay olarak destekler.
+    # Raporlanan `explained_variance_ratio` yine ilk 10 bileşendir.
+    components_mid, ratios_full = pca_components(
+        vectors[:, middle, :], n_components=vectors.shape[0]
+    )
+    ratios_mid = ratios_full[:10]
     pc1 = components_mid[0]
     role_projections = vectors[:, middle, :] @ pc1
     default_projection = float(default_mean_all[middle] @ pc1)
@@ -3596,15 +4213,28 @@ def main() -> int:
     np.save(OUT_DIR / "assistant_axis.npy", axis_per_layer)
     np.save(OUT_DIR / "role_vectors.npy", vectors)
     (OUT_DIR / "role_names.json").write_text(json.dumps(names, ensure_ascii=False), encoding="utf-8")
+    n_for_70 = n_components_for_variance(ratios_full, 0.70)
     (OUT_DIR / "criterion_a.json").write_text(
         json.dumps(
             {
                 **verdict,
+                # Kaynak künyesi: bu dosya aylar sonra tek başına okunacak.
+                # Saatten türetilen zaman damgası YOK — bu repo kimlikleri
+                # içerikten türetir.
+                "model": index.get("model"),
+                "run_id": index.get("run_id"),
+                "n_layers": int(acts.shape[1]),
+                "d_model": int(acts.shape[2]),
                 "middle_layer": middle,
                 "n_role_vectors": len(names),
+                "n_fully_role_vectors": len(fully_positions),
                 "cos_by_layer": cos_by_layer,
                 "explained_variance_ratio": ratios_mid.tolist(),
-                "n_components_for_70pct": int(np.searchsorted(np.cumsum(ratios_mid), 0.70) + 1),
+                # Tam spektrum eşiğe hiç ulaşmazsa kesin sayı yerine alt sınır
+                # yazılır — desteklenemeyen bir sayı yazmaktansa ">k" dürüsttür.
+                "n_components_for_70pct": (
+                    n_for_70 if n_for_70 is not None else f">{len(ratios_full)}"
+                ),
             },
             ensure_ascii=False,
             indent=2,
@@ -3633,12 +4263,12 @@ if __name__ == "__main__":
 - [ ] **Step 6: Tam test paketinin yeşil olduğunu doğrula**
 
 Run: `cd ~/assistant-axis && uv run --extra dev --extra ml pytest -q`
-Expected: PASS. Plan 1'in 207 testi + bu planın ~47 testi.
+Expected: PASS. Fix Round 1 sonrası: 332 passed, 7 deselected (Fix Round 1 öncesi 317).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/aax/axis.py scripts/07_extract_axis.py tests/test_axis.py
+git add src/aax/axis.py scripts/07_extract_axis.py tests/test_axis.py tests/test_extract_axis.py
 git commit -m "feat: Aşama 3 eksen çıkarımı ve A kriteri"
 ```
 
@@ -3650,8 +4280,14 @@ cd ~/assistant-axis && uv run --extra ml python scripts/07_extract_axis.py
 
 Çıktı `results/axis/criterion_a.json`'a yazılır ve commit edilir.
 
-**GEÇTİ** → Plan 3 (Aşama 4-5: steering sweep ve persona drift) yazılabilir.
-**DÜŞTÜ** → bu da bir sonuçtur: "Assistant Axis 1.7B ölçeğinde oluşmuyor". Eşik gevşetilmez. Bu durumda Llama-3.2-3B ile tekrarlamak veya çalışmayı burada sonlandırıp negatif bulguyu raporlamak arasında karar verilir.
+**GEÇTİ** (çıkış 0) → Plan 3 (Aşama 4-5: steering sweep ve persona drift) yazılabilir.
+**DÜŞTÜ** (çıkış 1) → bu da bir sonuçtur: "Assistant Axis 1.7B ölçeğinde oluşmuyor". Eşik gevşetilmez. Bu durumda Llama-3.2-3B ile tekrarlamak veya çalışmayı burada sonlandırıp negatif bulguyu raporlamak arasında karar verilir.
+**BAŞARISIZ** (çıkış 2) → bir karar DEĞİLDİR: girdi eksik/bayat ya da eksen tanımsız (hiç `fully` rol vektörü yok). Veri düzeltilip tekrar koşulur; bu çıktı `criterion_a.json`'a yazılmaz.
+
+Fix Round 1 (Kritik 1/2, Bulgu 3/5/6, Minor) ayrı bir takip commit'idir — değişen dosyalar:
+`src/aax/axis.py`, `scripts/07_extract_axis.py`, `tests/test_axis.py`,
+`tests/test_extract_axis.py` (yeni). Yukarıdaki kod blokları ve test sayıları
+bu tur sonrasının hâlini gösterir. Ayrıntı: p2-task-7-report.md, Fix Round 1.
 
 ---
 
