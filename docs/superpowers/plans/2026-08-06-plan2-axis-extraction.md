@@ -4582,6 +4582,36 @@ yazıyor. Boşluk proje sahibine ayrıca bildirildi.
 
 ---
 
+## Closure Fix Wave — dalın hazır ilanından önceki son düzeltme dalgası (2026-08-06)
+
+Final Fix Wave'in doğrulama geçişinde bulunan bir Kritik ve beş Önemli bulgu.
+**Yukarıdaki Task bölümlerindeki VE Final Fix Wave'deki kod blokları bu
+dalgadan ÖNCEKİ hâli gösterir**; çelişki hâlinde kaynak kod ve bu bölüm
+geçerlidir. Ayrıntılı gerekçe, ölçüm ve test eşlemesi:
+`.superpowers/sdd/p2-closure-fix-report.md`.
+
+| # | Bulgu | Değişen | Test |
+|---|---|---|---|
+| Kritik 1 | `rollouts_run_id` `answer`'ı BİLEREK dışarıda bırakıyordu; `04` `temperature=1.0` ile örneklediği için aynı spec'lerin iki üretimi AYNI kimlikle FARKLI cevaplar üretebiliyordu — `05`in aktivasyonu ile `06`nın etiketi farklı cevapları tarif edip `07`nin üç bütünlük kontrolünün (satır sayısı, anahtar kapsaması, `run_id`) hepsini geçebiliyordu | `src/aax/rollouts.py::rollouts_run_id` — blob artık `answer`'ı da katıyor; `04`/`05`/`06` aynı fonksiyonu çağırdığı için otomatik yayılıyor | `tests/test_rollouts.py` (aynı spec + farklı cevap → farklı kimlik), `tests/test_capture_activations.py`, `tests/test_extract_axis.py` — uçtan uca: aynı spec'ler farklı cevaplarla üretilmiş iki `run_id` `07` tarafından reddediliyor |
+| Önemli 2 | `--start-row` yalnızca matris ŞEKLİNE bakıyordu; kısmi işaret (`activations_partial.json`) VARSA doğrulanıyordu ama YOKSA sessizce geçiliyordu — tam da "aynı satır sayısı, farklı rollout kümesi" senaryosu | `scripts/05_capture_activations.py::_load_resume_prefix` — işaret artık `--start-row` için ZORUNLU | `tests/test_capture_activations.py::test_start_row_refuses_when_no_partial_marker_exists_even_if_shape_matches` |
+| Önemli 3 | `06`'da çıplak `read_rollouts(...)` çağrısı `try/except`'in dışındaydı; eksik/bozuk dosya çıplak istisnayla yorumlayıcıyı çıkış 1'e ("probe güvenilmez") düşürüyordu | `scripts/06_label_and_train_probe.py::main` — `05`'teki desenin aynısıyla sarıldı | `tests/test_label_and_train_probe.py` — eksik ve bozuk `rollouts.jsonl` artık çıkış 2 |
+| Önemli 4 | Checkpoint yazımı (`np.save(ACTS_PATH, acts)`) planlanan ölçekte ~80 kez tam matrisi (~3.67 GB) baştan yazıyordu, hem de non-atomik | `scripts/05_capture_activations.py` — `--checkpoint-every` varsayılanı 25→250; `_atomic_save_npy` (`aax.rollouts.write_rollouts`'un tempfile+fsync+rename deseni) | `tests/test_capture_activations.py::test_checkpoint_every_default_is_250_not_25`, `test_atomic_save_npy_*` |
+| Önemli 5 | `06` `05`'in çıktısına bağımlı değildi (`rollouts.jsonl`'ı doğrudan okur) — künye kontrolü yalnızca `05`'e bağlıydı, bir pilot künye hakem harcamasından (~200 çağrı) önce reddedilmiyordu | `scripts/06_label_and_train_probe.py::main` — `load_rollouts_meta` + `--allow-pilot` (05'in deseni) | `tests/test_label_and_train_probe.py` — pilot künye reddi ve `--allow-pilot` ile bilinçli geçiş |
+| Önemli 6 | `02`'nin varsayılanı (8 rol × 5 soru = 40) kapının tabanıyla (`03::MIN_LABELLED`=40) BİREBİR aynıydı, sıfır boşluk payı | `scripts/02_pilot_rollouts.py` — varsayılan `--roles` 8→9 (9×5=45); 40'ın altına düşerse UYARI | `tests/test_pilot_rollouts.py` |
+| Minor | `tests/test_activations.py`'nin `ml`-marked testi bare `import torch` — `ml` extra'sı kurulu değilse SKIP değil FAIL | `tests/test_activations.py` — `pytest.importorskip("torch")` | mevcut test artık extra'sız `pytest --collect-only` ile de patlamıyor |
+| Minor | `criterion_a.json` gevşetilmiş `--min-role-vectors` tabanını taşımıyordu — yalnızca `n_role_vectors`'a bakarak dolaylı çıkarılabilirdi | `scripts/07_extract_axis.py` — `min_role_vectors` alanı eklendi | `tests/test_extract_axis.py::test_criterion_a_records_the_min_role_vectors_floor_actually_used` |
+| Minor | `cumulative_variance_at_10` adı sabit "10" varsayıyordu; `--min-role-vectors` 10'un altına gevşetilirse alan adı kendi içeriğiyle çelişiyordu | `scripts/07_extract_axis.py` — `cumulative_variance_top_components` + ayrı `cumulative_variance_n_components` | `tests/test_extract_axis.py::test_cumulative_variance_n_components_reflects_fewer_than_10_role_vectors` |
+| Minor | `03_judge_gate.py`'nin yedi `raise SystemExit(...)` yolu (1 `run_machine`, 6 `run_score`) çıkış 1 veriyordu — kapının GERÇEK reddiyle ("KAPI KAPALI") aynı kod; `r["description"]` çıplak indekslemesi de aynı sınıftan bir `KeyError` | `scripts/03_judge_gate.py` — hepsi `print(...) + return 2`; `description` eksikliği `except KeyError` ile yakalanıyor | `tests/test_judge_gate.py` |
+
+**Etki alanı doğrulaması (Kritik 1):** `rollouts_run_id`'nin dört tüketicisi
+(`04`→`rollouts_meta.json`, `05`→`activations_index.json`,
+`06`→`role_expression.json`, `07`'nin künye eşitliği kontrolü) hepsi AYNI
+fonksiyonu çağırıyor; hiçbiri `answer`'ın kimliğin dışında olduğuna
+BAĞIMLI değildi. Değişiklik tek fonksiyonda kaldı, üç script de otomatik
+olarak yeni davranışı miras aldı — ayrıca bir kod değişikliği gerekmedi.
+
+---
+
 ## Plan 2 Tamamlanma Kriterleri
 
 - [ ] `uv run --extra dev --extra ml pytest -q` yeşil; `-m ml` ve `-m gpu` ayrıca geçiyor

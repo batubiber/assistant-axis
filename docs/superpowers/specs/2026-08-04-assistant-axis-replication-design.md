@@ -172,6 +172,12 @@ altındaysa kapıyı açmaz da kapamaz da — çıkış kodu 2 ile "ölçüm yap
 ile bilinçli olarak düşürülebilir). Boş satırlar sessizce atlandığı için 45 satırlık bir sayfada
 5 dolu satır 5 örnek demektir, 45 değil.
 
+`scripts/02_pilot_rollouts.py`'nin varsayılanı **9 rol × 5 soru = 45** yanıt üretir (eskiden
+8×5=40 — kapının tabanıyla BİREBİR aynıydı, sıfır boşluk payı; tek bir boş yanıt bile kapıyı
+`--min-labelled 39` olmadan açılamaz hale getiriyordu, üstelik operatör zaten HER ŞEYİ elle
+etiketledikten SONRA). `02` ayrıca üretilen kayıt sayısı 40'ın altında kalırsa (boş yanıtlar
+yüzünden) bir UYARI basar — operatör bunu insan etiketlemesine BAŞLAMADAN önce görür.
+
 Pahalı hiçbir aşama bu kapı geçilmeden başlamaz.
 
 ### Aşama 1 — Rollout ve aktivasyon · 0 çağrı · ~35 dk
@@ -191,13 +197,32 @@ ayrımının tamamı buna dayanır.
 **Pilot işareti.** `--limit` ile üretilen bir duman testi kanonik yola (`data/rollouts.jsonl`)
 yazar ve dosyanın kendisinde bunu belli eden hiçbir şey yoktur — Aşama 0'ın `roles.json` zarfının
 çözdüğü problemin aynısı. Bu yüzden `04` yanına `data/rollouts_meta.json` yazar (`limit`, `n`,
-içerikten türetilen `run_id`) ve `05` pilot bir künyeyi `--allow-pilot` verilmedikçe **reddeder**.
+içerikten türetilen `run_id`) ve hem `05` hem `06` pilot bir künyeyi `--allow-pilot` verilmedikçe
+**reddeder** — `06` `05`'in çıktısına bağımlı değildir (`rollouts.jsonl`'ı doğrudan okur), bu
+yüzden künye kontrolü ikisine de AYRI AYRI kurulmak zorundaydı; aksi hâlde hakem harcamasının
+(~200 çağrı, aşama bütçesinin çoğu) bir pilot künye üzerinde de yapılabilmesini hiçbir şey
+engellemezdi.
+
+**run_id İÇERİĞE cevabı da katar.** `04` `temperature=1.0` ile örnekler: aynı spec kümesiyle
+(aynı hayatta kalan kayıt listesiyle) iki ayrı üretim koşusu AYNI `kind`/`role`/`system_prompt`/
+`question` ama FARKLI `answer` üretebilir. `05` cevabı aktivasyona tokenize eder, `06`'nın hakem
+etiketleri cevap METNİ üzerinden verilir — ikisi de cevaba bağımlıdır. Bu yüzden `rollouts_run_id`
+cevabı da hash'e katar: aynı spec'lerin farklı cevaplarla iki üretimi FARKLI bir `run_id` üretir
+ve Aşama 3'ün künye eşitliği kontrolü (aşağıda) bunu yakalar — onsuz, satır *i*'nin etiketi cevap
+A'yı tarif ederken satır *i*'nin aktivasyonu cevap B'yi kodlayabilirdi, sessizce.
 
 **Kesinti kurtarma.** Yakalama geçişi ~2.000 batch sürer; `05` her batch'te ilerleme basar, kısmi
-sonucu diske kaydeder ve bir batch patlarsa hangi batch olduğunu + `--start-row N` ile nasıl devam
-edileceğini yazar. Üretim (vLLM) tekrarlanmak zorunda değildir. `activations_index.json` **yalnızca
-geçiş eksiksiz bittiğinde** yazılır: yarım bir matrisin yanında eksiksiz görünümlü bir indeks,
-Aşama 3'ün sıfır satırları gerçek aktivasyon sanması demektir.
+sonucu diske kaydeder (`--checkpoint-every`, varsayılan 250 batch — planlanan ölçekte ~2.000 satır
+başına, ~6-7 tam matris yeniden yazımı; atomik: tempfile + `os.replace`, `aax.rollouts.write_
+rollouts`'un deseniyle) ve bir batch patlarsa hangi batch olduğunu + `--start-row N` ile nasıl
+devam edileceğini yazar. Üretim (vLLM) tekrarlanmak zorunda değildir. `activations_index.json`
+**yalnızca geçiş eksiksiz bittiğinde** yazılır: yarım bir matrisin yanında eksiksiz görünümlü bir
+indeks, Aşama 3'ün sıfır satırları gerçek aktivasyon sanması demektir. `--start-row`, kısmi
+işaretin (`activations_partial.json`) VARLIĞINI zorunlu kılar — yalnızca matris şekline bakmak
+yetmez: önceki TAM bir koşu `activations.npy`'yi bırakabilir (işaret başarı sonunda silinir),
+rollout'lar aynı satır sayısıyla yeniden üretilebilir, yeni yakalama ilk checkpoint'ten önce OS
+düzeyinde öldürülebilir — işaret hiç yazılmadan. Marker olmadan `--start-row` bu senaryoda eski ve
+yeni koşuyu sessizce karıştırırdı.
 
 Çıktı: `data/rollouts.jsonl`, `data/rollouts_meta.json`, `data/activations.npy`,
 `data/activations_index.json`.
@@ -246,7 +271,10 @@ Aşama bütçesi 250 = 200 (etiketleme) + 50 (yedek: geri çekilme senaryosu ve 
 **Asgari rol vektörü sayısı: 40** (`--min-role-vectors` ile bilinçli olarak düşürülebilir). Altında
 A kriteri **değerlendirilmez**, çıkış kodu 2'dir. Gerekçe Bölüm 9'un ilk riskiyle aynı: *n* rol
 vektörüyle persentil yalnızca `k/n` değerlerini alabilir, yani küçük *n*'de "uç desil" koşulu
-neredeyse otomatik sağlanır — ölçülen şey veri değil, örneklem büyüklüğü olur.
+neredeyse otomatik sağlanır — ölçülen şey veri değil, örneklem büyüklüğü olur. Fiilen KULLANILAN
+taban `criterion_a.json`'a `min_role_vectors` alanı olarak yazılır: gevşetilmiş bir taban ön
+kaydedilmiş bir hüküm için maddi bir sapmadır ve yalnızca `n_role_vectors` sayısına bakarak
+(40'ın hemen üstünde mi, çok üstünde mi) dolaylı çıkarılamamalıdır.
 
 **Çıkış kodları** (bu aşamanın ürünü projenin ön kaydedilmiş hükmü olduğu için sözleşmedir):
 `0` = A kriteri GEÇTİ, `1` = A kriteri DÜŞTÜ (gerçek, değerlendirilmiş bir sonuç), `2` = BAŞARISIZ,
