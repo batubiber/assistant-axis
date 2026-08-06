@@ -120,11 +120,33 @@ class FakeJudgeClient:
     fırlatılır (BudgetExceeded/CircuitOpen/GatewayError senaryoları için).
     """
 
-    def __init__(self, role_scores: dict[str, int], *, exceptions: list | None = None) -> None:
+    def __init__(
+        self,
+        role_scores: dict[str, int],
+        *,
+        exceptions: list | None = None,
+        cached_prompts: set[str] | None = None,
+        stage_remaining: int = 10_000,
+        global_remaining: int = 10_000,
+    ) -> None:
         self._role_scores = dict(role_scores)
         self._exceptions = list(exceptions or [])
+        # `--dry-run` artık gerçek istemcinin API'sini kullanıyor:
+        # `would_call()` (cache'te olan çağrıyı saymaz) + `remaining_budget()`
+        # (tavan değil, diskteki sayaca göre KALAN).
+        self._cached = set(cached_prompts or ())
+        self._stage_remaining = stage_remaining
+        self._global_remaining = global_remaining
+        self.would_call_count = 0
         self.calls = 0
         self.sends_made = 0
+
+    def would_call(self, messages, *, temperature=0.0, max_tokens=1024):
+        self.would_call_count += 1
+        return messages[0]["content"] not in self._cached
+
+    def remaining_budget(self, stage):
+        return self._stage_remaining, self._global_remaining
 
     def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
         self.calls += 1
@@ -183,32 +205,118 @@ def test_dry_run_reports_plan_and_exits_zero_when_under_budget(tmp_path, monkeyp
     roles = ["pirate", "sage"]
     _write_roles_catalog(tmp_path / "roles.json", roles)
     _write_rollouts(tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=10))
-    monkeypatch.setattr(ltp, "build_default_client", lambda: FakeJudgeClient({}))
+    monkeypatch.setattr(
+        ltp, "build_default_client", lambda: FakeJudgeClient({}, stage_remaining=42)
+    )
 
     exit_code = ltp.main(["--dry-run", "--sample-size", "20"])
 
     assert exit_code == 0
     out = capsys.readouterr().out
     cap = ltp.config.STAGE_BUDGETS[ltp.STAGE]
-    assert "Planlanan çağrı" in out
-    assert f"Aşama bütçesi: {cap}" in out
+    assert "Planlanan çağrı:      2" in out
+    # C3: KALAN bütçe raporlanmalı, sadece tavan değil.
+    assert f"Aşama bütçesi:        {cap} (kalan: 42)" in out
+    assert f"Global tavan:         {ltp.config.GLOBAL_BUDGET} (kalan:" in out
+    # Birim uyarısı: sayaç HTTP gönderimi sayar, mantıksal çağrı değil.
+    assert "gönderim" in out
 
 
-def test_dry_run_exits_nonzero_when_plan_exceeds_stage_budget(tmp_path, monkeypatch, capsys):
+def test_dry_run_compares_the_plan_against_the_remaining_budget_not_the_cap(
+    tmp_path, monkeypatch, capsys
+):
+    """C3 regresyonu: aşama TAVANI 300 ve plan 2 çağrı — statik kıyaslama
+    temiz bir `0` derdi. Ama tavanın 299'u önceki bir koşuda harcanmışsa
+    kalan 1'dir ve koşu ortasında kesilirdi. `remaining_budget()` tam bu iş
+    için var."""
     _patch_paths(monkeypatch, tmp_path)
     roles = ["pirate", "sage"]
     _write_roles_catalog(tmp_path / "roles.json", roles)
     _write_rollouts(tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=10))
-    # 2 rol * 1 batch her biri = 2 planlanan çağrı; tavanı 1'e indir ki aşılsın.
-    monkeypatch.setitem(ltp.config.STAGE_BUDGETS, ltp.STAGE, 1)
-    monkeypatch.setattr(ltp, "build_default_client", lambda: FakeJudgeClient({}))
+    monkeypatch.setattr(
+        ltp, "build_default_client", lambda: FakeJudgeClient({}, stage_remaining=1)
+    )
 
     exit_code = ltp.main(["--dry-run", "--sample-size", "20"])
 
-    assert exit_code != 0
+    # D8: ön koşul hatası artık 2 — çıkış 1 bu script'te "probe güvenilmez".
+    assert exit_code == 2
     err = capsys.readouterr().err
     assert "HATA" in err
+    assert "yalnızca 1 kaldı" in err
     assert "--sample-size" in err
+
+
+def test_dry_run_fails_when_the_global_cap_is_exhausted(tmp_path, monkeypatch, capsys):
+    """Aşama bütçesi bol olsa bile 1500'lük global tavan dolmuş olabilir."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate", "sage"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=10))
+    monkeypatch.setattr(
+        ltp,
+        "build_default_client",
+        lambda: FakeJudgeClient({}, stage_remaining=300, global_remaining=0),
+    )
+
+    assert ltp.main(["--dry-run", "--sample-size", "20"]) == 2
+    assert "global tavan" in capsys.readouterr().err
+
+
+def test_dry_run_does_not_count_cached_calls(tmp_path, monkeypatch, capsys):
+    """Eski plan `(len(rows) + 9) // 10` idi ve cache'i yok sayıyordu.
+    `would_call()` yalnızca GERÇEKTEN harcanacak çağrıyı sayar."""
+    from aax.judge import build_role_score_prompts
+
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate", "sage"]
+    records = _make_role_records(roles, per_role=10)
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+
+    # "pirate" rolünün promptunu cache'te sayalım: plan 2 değil 1 olmalı.
+    pirate_items = [(r["question"], r["answer"]) for r in records if r["role"] == "pirate"]
+    cached = set(
+        build_role_score_prompts(
+            role="pirate", description="the role of a pirate", items=pirate_items
+        )
+    )
+    monkeypatch.setattr(
+        ltp, "build_default_client", lambda: FakeJudgeClient({}, cached_prompts=cached)
+    )
+
+    assert ltp.main(["--dry-run", "--sample-size", "20"]) == 0
+    out = capsys.readouterr().out
+    assert "Planlanan çağrı:      1 (cache'te: 1)" in out
+
+
+def test_dry_run_plans_the_prompts_that_would_actually_be_sent(tmp_path, monkeypatch):
+    """`would_call`'ın anlamlı olabilmesi için ön kontrol, `chat()`'in
+    kuracağı payload'ın AYNISINI kurmalı: aynı prompt, aynı sıcaklık, aynı
+    max_tokens — cache anahtarı bunlardan türetiliyor."""
+    from aax.judge import SCORE_MAX_TOKENS, SCORE_TEMPERATURE
+
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=5))
+
+    seen = []
+
+    class SpyClient(FakeJudgeClient):
+        def would_call(self, messages, *, temperature=0.0, max_tokens=1024):
+            seen.append((messages[0]["content"], temperature, max_tokens))
+            return True
+
+    monkeypatch.setattr(ltp, "build_default_client", lambda: SpyClient({}))
+
+    assert ltp.main(["--dry-run", "--sample-size", "5"]) == 0
+
+    assert seen, "hiç plan kurulmadı"
+    prompt, temperature, max_tokens = seen[0]
+    assert temperature == SCORE_TEMPERATURE
+    assert max_tokens == SCORE_MAX_TOKENS
+    assert "the role: pirate." in prompt  # gerçek hakem promptu
 
 
 def test_dry_run_sends_no_requests(tmp_path, monkeypatch):
@@ -222,6 +330,7 @@ def test_dry_run_sends_no_requests(tmp_path, monkeypatch):
     ltp.main(["--dry-run", "--sample-size", "5"])
 
     assert client.calls == 0, "--dry-run tek bir hakem çağrısı bile atmamalı"
+    assert client.would_call_count > 0, "plan `would_call` üzerinden kurulmalı"
 
 
 # --- Bulgu 1: kurulum aşaması hataları temiz tanıya çevrilir --------------------
@@ -442,6 +551,60 @@ def test_untrustworthy_probe_does_not_write_role_expression_and_exits_nonzero(
     assert ltp.LABELS_PATH.exists(), "hakem etiketleri yine de kalıcı olmalı"
     err = capsys.readouterr().err
     assert "GÜVENİLİR DEĞİL" in err
+
+
+def test_untrustworthy_probe_message_is_actionable(tmp_path, monkeypatch, capsys):
+    """Mesaj spec'in geri çekilme kuralını DUYURUYOR ama o kural bu dalda
+    UYGULANMADI (kapsam dışı, bilinçli). O hâlde mesaj, operatörün gerçekten
+    yapabileceği şeyleri söylemeli: uygulanmadığını, iki seçeneği ve harcanan
+    bütçeyi."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate", "sage"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=5))
+    monkeypatch.setattr(
+        ltp,
+        "build_default_client",
+        lambda: FakeJudgeClient({"pirate": 3, "sage": 0}, stage_remaining=280),
+    )
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
+    monkeypatch.setattr(ltp, "RoleExpressionProbe", _make_fixed_probe_class(trustworthy=False))
+
+    assert ltp.main(["--sample-size", "10"]) == 1
+
+    err = capsys.readouterr().err
+    assert "UYGULANMADI" in err  # otomatik geri çekilme yok
+    assert "--sample-size" in err  # seçenek 1
+    assert "somewhat" in err  # seçenek 2
+    assert "gönderim" in err and "kalan: 280" in err  # harcanan/kalan bütçe
+
+
+# --- B3: role_expression.json koşu kimliği taşımalı --------------------------
+
+
+def test_role_expression_carries_the_rollout_run_id(tmp_path, monkeypatch):
+    """`07_extract_axis.py` bunu `activations_index.json`'ınkiyle karşılaştırıp
+    eşit değilse çıkış 2 veriyor. Onsuz, Aşama 1'in aynı satır sayısı ve
+    sırasıyla FARKLI bir rol kümesiyle yeniden koşturulması 07'nin sayı ve
+    kapsama kontrollerinin İKİSİNİ de geçiyordu."""
+    from aax.rollouts import rollouts_run_id
+
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate", "sage"]
+    records = _make_role_records(roles, per_role=5)
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+    monkeypatch.setattr(
+        ltp, "build_default_client", lambda: FakeJudgeClient({"pirate": 3, "sage": 0})
+    )
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
+    monkeypatch.setattr(ltp, "RoleExpressionProbe", _make_fixed_probe_class(trustworthy=True))
+
+    assert ltp.main(["--sample-size", "10"]) == 0
+
+    payload = json.loads(ltp.OUT_PATH.read_text(encoding="utf-8"))
+    assert payload["run_id"] == rollouts_run_id(records)
+    assert len(payload["run_id"]) == 16
 
 
 # --- verbatim etiket önceliği: hakem etiketleri tahminle EZİLMEZ ---------------

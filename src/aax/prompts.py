@@ -52,7 +52,21 @@ def load_role_catalog(path: str | Path) -> list[dict]:
         raise ValueError(
             f"{path}: katalog eksik — requested={requested}, catalog_size={catalog_size}"
         )
-    return payload["roles"]
+    # Üstteki üç doğrulama `.get()` kullanırken bu satır `payload["roles"]`
+    # ile doğrudan indeksliyordu. Bozuk/eksik bir `roles.json` için sonuç
+    # ÇIPLAK bir `KeyError`'dı ve `KeyError` bir `ValueError` DEĞİLDİR:
+    # `06_label_and_train_probe.py`'nin `except ValueError` sarmalayıcısını
+    # atlayıp yorumlayıcıyı çıkış 1 ile döndürüyordu — o script'te 1
+    # "probe güvenilmez, geri çekilme kuralı" demek. Yani BOZUK BİR KATALOG,
+    # PROBE HAKKINDA BİR BULGU olarak raporlanıyordu.
+    roles = payload.get("roles")
+    if not isinstance(roles, list):
+        raise ValueError(
+            f"{path}: 'roles' anahtarı yok ya da liste değil "
+            f"({type(roles).__name__}). Dosya bozuk — Aşama 0'ı "
+            "(scripts/00_generate_role_data.py) tekrar çalıştırın."
+        )
+    return roles
 
 
 def build_role_specs(catalog: list[dict], questions: list[str]) -> list[RolloutSpec]:

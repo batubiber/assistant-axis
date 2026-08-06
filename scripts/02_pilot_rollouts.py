@@ -18,6 +18,7 @@ import json
 from aax import config
 from aax.model import load_hf_model
 from aax.prompts import build_role_specs, load_role_catalog, to_chat_messages
+from aax.rollouts import rollout_record
 
 OUT_PATH = config.DATA_DIR / "pilot_rollouts.jsonl"
 
@@ -45,6 +46,7 @@ def main() -> int:
     import torch
 
     records = []
+    empty = 0
     for index, spec in enumerate(specs, start=1):
         text = tok.apply_chat_template(
             to_chat_messages(spec),
@@ -65,17 +67,22 @@ def main() -> int:
         answer = tok.decode(
             out[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
         ).strip()
-        records.append(
-            {
-                "role": spec.role,
-                "system_prompt": spec.system_prompt,
-                "question": spec.question,
-                "answer": answer,
-            }
-        )
+        # `rollout_record` üzerinden: burada kayıt elle kuruluyordu ve
+        # o yolun BOŞ YANIT KORUMASI yoktu (`rollout_record` boş/whitespace
+        # yanıtta `ValueError` fırlatır). Boş bir pilot yanıtı hakeme kadar
+        # gider, bloklayıcı kapının ~40 slotundan birini yer ve insan
+        # etiketleyiciye boş bir satır olarak çıkardı — kapının ölçtüğü uyum
+        # oranı da o satıra göre kayardı.
+        if not answer.strip():
+            empty += 1
+            print(f"\r{index}/{len(specs)} — boş yanıt atlandı ({empty})", end="")
+            continue
+        records.append(rollout_record(spec, answer))
         print(f"\r{index}/{len(specs)}", end="")
 
     print()
+    if empty:
+        print(f"UYARI: {empty} boş yanıt atlandı — kapıya {len(records)} örnek gidiyor")
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     with OUT_PATH.open("w", encoding="utf-8") as handle:
         for record in records:

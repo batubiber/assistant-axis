@@ -37,10 +37,17 @@ import sys
 from aax import config
 from aax.gateway import BudgetExceeded, CircuitOpen, GatewayError, build_default_client
 from aax.judge import JudgeParseError, score_role_expression
+from aax.prompts import load_role_catalog
 
 STAGE = "stage05_judge_gate"
 THRESHOLD = 0.75
+# Spec Bölüm 5, Aşama 0.5: "pilot bir rol setinden 40 yanıt üret ... aynı 40'ı
+# elle etiketle, uyumu ölç". Bu sayı bir öneri değil, kapının ölçüm gücüdür:
+# 3 satırda tesadüfen tutan bir uyum "%100" diye raporlanır ve BLOKLAYICI kapı
+# açılır. Boş satırlar sessizce atlandığı için tek koruma "en az bir tane"ydi.
+MIN_LABELLED = 40
 PILOT_PATH = config.DATA_DIR / "pilot_rollouts.jsonl"
+ROLES_PATH = config.DATA_DIR / "roles.json"
 LABELS_PATH = config.DATA_DIR / "judge_gate_labels.csv"
 MACHINE_PATH = config.DATA_DIR / "judge_gate_machine.json"
 RESULT_PATH = config.DATA_DIR / "judge_gate.json"
@@ -112,14 +119,60 @@ def _parse_human_score(raw: str) -> int:
 def run_machine(client) -> int:
     records = _load_pilot()
 
+    # Kapı, ÜRETİMDE koşacak hakemi doğrulamalı — ona yakın bir şeyi değil.
+    # Burada açıklama `f"the role of a {role}"` diye ÜRETİLİYORDU, oysa
+    # `06_label_and_train_probe.py` kataloğun LLM tarafından yazılmış tam
+    # açıklamasını geçiyor ve `judge._build_prompt` bu dizeyi promptun en
+    # tanımlayıcı cümlesine ("You are evaluating whether ... the role: {role}.
+    # {description}") gömüyor. İki prompt en belirleyici alanında farklıysa
+    # kapının onayladığı uyum, 2.000 rollout'u etiketleyecek hakemin uyumu
+    # DEĞİLDİR.
+    try:
+        catalog = {
+            r["role"]: r["description"]
+            for r in load_role_catalog(ROLES_PATH)
+        }
+    except FileNotFoundError:
+        print(
+            f"BAŞARISIZ: {ROLES_PATH} yok.\n"
+            "  Hakem kapısı, Aşama 2'nin kullanacağı rol açıklamalarının AYNISIYLA "
+            "puanlamak zorunda; katalog olmadan bu mümkün değil.\n"
+            "  Önce Aşama 0'ı (scripts/00_generate_role_data.py) çalıştırın.",
+            file=sys.stderr,
+        )
+        return 2
+    except ValueError as exc:
+        print(
+            "BAŞARISIZ: rol kataloğu kanonik değil.\n"
+            f"  {exc}\n"
+            "  Aşama 0'ı (scripts/00_generate_role_data.py) --allow-partial OLMADAN "
+            "tamamlayıp tekrar deneyin.",
+            file=sys.stderr,
+        )
+        return 2
+
     by_role: dict[str, list[dict]] = {}
     for record in records:
         by_role.setdefault(record["role"], []).append(record)
 
+    # Fail-closed, `06_label_and_train_probe.py` ile aynı gerekçe: eksik bir
+    # rol için jenerik bir açıklama uydurmak, tam da düzeltilen hatayı geri
+    # getirirdi.
+    missing_roles = sorted(role for role in by_role if role not in catalog)
+    if missing_roles:
+        print(
+            f"BAŞARISIZ: pilot'taki {len(missing_roles)} rol kanonik katalogda yok: "
+            f"{missing_roles}.\n"
+            "  pilot_rollouts.jsonl ile roles.json aynı koşudan gelmiyor olabilir — "
+            "scripts/02_pilot_rollouts.py'yi güncel katalogla tekrar çalıştırın.",
+            file=sys.stderr,
+        )
+        return 2
+
     scored: list[dict] = []
     try:
         for role, group in by_role.items():
-            description = f"the role of a {role}"
+            description = catalog[role]
             items = [(r["question"], r["answer"]) for r in group]
             scores = score_role_expression(
                 client, role=role, description=description, items=items, stage=STAGE
@@ -176,7 +229,7 @@ def run_machine(client) -> int:
     return 0
 
 
-def run_score() -> int:
+def run_score(min_labelled: int = MIN_LABELLED) -> int:
     if not LABELS_PATH.exists():
         raise SystemExit(f"{LABELS_PATH} yok. Önce --machine çalıştır.")
     if not MACHINE_PATH.exists():
@@ -249,6 +302,23 @@ def run_score() -> int:
     if not machine:
         raise SystemExit("Hiç human_score doldurulmamış.")
 
+    # Boş satırlar sessizce atlanıyor ve tek taban "en az bir tane"ydi: elle
+    # doldurulmuş 3 satır tesadüfen tutarsa "Uyum: %100.0 — KAPI AÇIK" basılıp
+    # 16.000 rollout'luk aşama serbest bırakılıyordu. Spec Bölüm 5 (Aşama 0.5)
+    # 40 diyor; bu bir tavsiye değil, kapının istatistiksel gücü.
+    if len(machine) < min_labelled:
+        print(
+            f"BAŞARISIZ: yalnızca {len(machine)} satır etiketlenmiş, en az "
+            f"{min_labelled} gerekiyor (spec Bölüm 5, Aşama 0.5).\n"
+            f"  {LABELS_PATH} içinde {len(rows)} satır var; human_score sütunu "
+            f"{len(rows) - len(machine)} satırda boş.\n"
+            "  Bu bir KAPI KARARI DEĞİLDİR: bu kadar az örnekle ölçülen uyum, hakemin "
+            "kalitesini değil tesadüfü ölçer.\n"
+            "  Tabanı bilinçli olarak düşürmek için: --min-labelled N.",
+            file=sys.stderr,
+        )
+        return 2
+
     agreement = agreement_rate(machine, human)
     passed = gate_passed(agreement)
 
@@ -267,7 +337,7 @@ def run_score() -> int:
         encoding="utf-8",
     )
 
-    print(f"Etiketli örnek: {len(machine)}")
+    print(f"Etiketli örnek: {len(machine)} (asgari {min_labelled})")
     print(f"Uyum: {agreement:.1%} (eşik {THRESHOLD:.0%})")
     print()
     disagreements = [p for p in pairs if collapse_to_category(p["machine"]) != collapse_to_category(p["human"])]
@@ -291,10 +361,19 @@ def main(argv: list[str] | None = None) -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--machine", action="store_true", help="hakeme puanlat, şablon yaz")
     group.add_argument("--score", action="store_true", help="elle doldurulmuş şablonu değerlendir")
+    parser.add_argument(
+        "--min-labelled",
+        type=int,
+        default=MIN_LABELLED,
+        help=(
+            f"kapının değerlendirileceği asgari elle etiketlenmiş satır sayısı "
+            f"(varsayılan {MIN_LABELLED}, spec Bölüm 5); altında çıkış 2"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.score:
-        return run_score()
+        return run_score(args.min_labelled)
 
     # `build_default_client()` `config.api_key()` üzerinden bare bir
     # `RuntimeError` fırlatabilir (APP_KEY_JAILBREAK export edilmemiş —

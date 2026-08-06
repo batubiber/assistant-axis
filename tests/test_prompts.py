@@ -68,6 +68,28 @@ def test_load_role_catalog_rejects_partial_catalog(tmp_path):
         load_role_catalog(path)
 
 
+def test_load_role_catalog_rejects_a_missing_roles_key_as_valueerror(tmp_path):
+    """D1: bu satır `payload["roles"]` ile doğrudan indeksliyordu ve bozuk bir
+    dosyada ÇIPLAK bir `KeyError` fırlatıyordu. `KeyError` bir `ValueError`
+    DEĞİLDİR: `06_label_and_train_probe.py`'nin `except ValueError`
+    sarmalayıcısını atlayıp yorumlayıcıyı çıkış 1 ile döndürüyordu — o
+    script'te 1 "probe güvenilmez" demek. Yani BOZUK BİR KATALOG, PROBE
+    HAKKINDA BİR BULGU olarak raporlanıyordu."""
+    payload = make_catalog()
+    del payload["roles"]
+    path = write_catalog(tmp_path, payload)
+    with pytest.raises(ValueError, match="roles"):
+        load_role_catalog(path)
+
+
+def test_load_role_catalog_rejects_a_non_list_roles_value(tmp_path):
+    payload = make_catalog()
+    payload["roles"] = {"rol0": "bozuk"}
+    path = write_catalog(tmp_path, payload)
+    with pytest.raises(ValueError, match="roles"):
+        load_role_catalog(path)
+
+
 def test_role_specs_are_roles_times_prompts_times_questions():
     catalog = make_catalog(n_roles=5, n_instructions=3)["roles"]
     questions = [f"ortak {i}" for i in range(40)]

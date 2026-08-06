@@ -4,6 +4,17 @@
 Kullanım:
     uv run python scripts/06_label_and_train_probe.py --dry-run
     uv run --extra ml python scripts/06_label_and_train_probe.py
+
+ÇIKIŞ KODLARI:
+    0  probe güvenilir, role_expression.json yazıldı
+    1  BULGU: probe held-out uyumu eşiğin altında — güvenilmez, geri çekilme
+       kuralı devreye girer (bu bir ÖLÇÜM sonucudur, bir çalıştırma hatası değil)
+    2  koşulamadı: ön koşul/kurulum hatası, bütçe, gateway, --dry-run planı
+       kalan bütçeye sığmıyor
+
+`1` bilinçli olarak TEK bir anlama ayrılmıştır. Eskiden `--dry-run`'ın bütçe
+reddi de 1 döndürüyordu; bir kabuk pipeline'ı "probe güvenilmez" ile "koşu
+hiç başlamadı"yı ayırt edemiyordu.
 """
 from __future__ import annotations
 
@@ -12,14 +23,18 @@ import json
 import sys
 from collections import defaultdict
 
-import numpy as np
-
 from aax import config
 from aax.gateway import BudgetExceeded, CircuitOpen, GatewayError, build_default_client
-from aax.judge import JudgeParseError, score_role_expression
+from aax.judge import (
+    SCORE_MAX_TOKENS,
+    SCORE_TEMPERATURE,
+    JudgeParseError,
+    build_role_score_prompts,
+    score_role_expression,
+)
 from aax.probe import RoleExpressionProbe, embed_answers, stratified_sample
 from aax.prompts import load_role_catalog
-from aax.rollouts import read_rollouts
+from aax.rollouts import read_rollouts, rollouts_run_id
 
 STAGE = "stage2_probe_labels"
 SEED = 20260806
@@ -36,6 +51,79 @@ def collapse(score: int) -> str:
     if score in (0, 1):
         return "no"
     raise ValueError(f"Puan 0-3 aralığı dışında: {score!r}")
+
+
+def run_dry_run(client, by_role: dict[str, list[int]], records: list[dict], catalog: dict) -> int:
+    """İstek atmadan planı KALAN bütçeyle kıyasla.
+
+    `scripts/00_generate_role_data.py::run_dry_run` ile AYNI desen. Eski
+    sürüm iki ayrı hata yapıyordu:
+
+    1. Plan, aşama TAVANIYLA (`config.STAGE_BUDGETS[STAGE]`) kıyaslanıyordu.
+       Tavanın çoğunu önceki bir koşuda harcamış bir operatör temiz bir `0`
+       görüp koşuyu başlatır, bütçe biter bitmez ortasında kesilirdi.
+       `GatewayClient.remaining_budget()` tam bu iş için var ve docstring'i
+       bunu açıkça söylüyor.
+    2. Plan cache'i yok sayıyordu (`(len(rows) + 9) // 10`). `would_call()`
+       cache'te olanı sayMAZ — gerçekten HARCANACAK çağrı sayısı budur.
+
+    BİRİM UYARISI korunuyor: bütçe sayacı **HTTP gönderimi** sayar, mantıksal
+    çağrı değil (bkz. `config.STAGE_BUDGETS` yorumu). Bir mantıksal çağrı
+    retry'larla 2-3 gönderim harcayabilir; 300'lük tavanın 50'si zaten bu pay
+    içindir. Yani `planlanan <= kalan` GEREK koşuldur, YETER koşul değildir —
+    çıktı bunu açıkça yazar.
+    """
+    planned = 0
+    cached = 0
+    for role, rows in by_role.items():
+        items = [(records[i]["question"], records[i]["answer"]) for i in rows]
+        for prompt in build_role_score_prompts(
+            role=role, description=catalog[role], items=items
+        ):
+            if client.would_call(
+                [{"role": "user", "content": prompt}],
+                temperature=SCORE_TEMPERATURE,
+                max_tokens=SCORE_MAX_TOKENS,
+            ):
+                planned += 1
+            else:
+                cached += 1
+
+    stage_remaining, global_remaining = client.remaining_budget(STAGE)
+    stage_cap = config.STAGE_BUDGETS[STAGE]
+
+    print(f"Planlanan çağrı:      {planned} (cache'te: {cached})")
+    print(f"Aşama bütçesi:        {stage_cap} (kalan: {stage_remaining})")
+    print(f"Global tavan:         {config.GLOBAL_BUDGET} (kalan: {global_remaining})")
+    print(
+        "Not: bütçe sayacı HTTP gönderimi sayar, mantıksal çağrı değil — "
+        "planın kalana sığması gerek koşuldur, yeter koşul değil (retry payı)."
+    )
+
+    sorunlar = []
+    if planned > stage_remaining:
+        sorunlar.append(
+            f"aşama bütçesi: {planned} planlandı, yalnızca {stage_remaining} kaldı "
+            f"({stage_cap} tavanın {stage_cap - stage_remaining}'i harcanmış)"
+        )
+    if planned > global_remaining:
+        sorunlar.append(
+            f"global tavan: {planned} planlandı, yalnızca {global_remaining} kaldı "
+            f"({config.GLOBAL_BUDGET} tavanın {config.GLOBAL_BUDGET - global_remaining}'i "
+            "harcanmış)"
+        )
+    if sorunlar:
+        for sorun in sorunlar:
+            print(f"HATA: {sorun}", file=sys.stderr)
+        print(
+            "Koşu başlatılmadı — --sample-size küçült. Tavan yükseltilmez.",
+            file=sys.stderr,
+        )
+        # Çıkış 2: bu bir ÖN KOŞUL hatasıdır, bir bulgu değil. Çıkış 1 bu
+        # script'te tek bir şey demek: "probe güvenilmez" (bkz. modül
+        # docstring'i).
+        return 2
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -116,16 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.dry_run:
-        planned = sum(
-            (len(rows) + 9) // 10 for rows in by_role.values()
-        )
-        cap = config.STAGE_BUDGETS[STAGE]
-        print(f"Planlanan çağrı (üst sınır, cache yok sayılarak): {planned}")
-        print(f"Aşama bütçesi: {cap}")
-        if planned > cap:
-            print("HATA: plan aşama bütçesini aşıyor — --sample-size küçült.", file=sys.stderr)
-            return 1
-        return 0
+        return run_dry_run(client, by_role, records, catalog)
 
     labels: dict[int, str] = {}
     try:
@@ -189,8 +268,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if not probe.is_trustworthy:
         print(
-            "PROBE GÜVENİLİR DEĞİL — spec'in geri çekilme kuralı devreye giriyor.\n"
-            "  Rol düzeyinde tut/at filtresine dön ve bunu sonuçlarda raporla.",
+            f"PROBE GÜVENİLİR DEĞİL: held-out uyum %{probe.holdout_agreement * 100:.1f}, "
+            "eşik %85.\n"
+            "  Spec'in geri çekilme kuralı (Bölüm 5, Aşama 2) rol düzeyinde tut/at "
+            "filtresine dönmeyi söyler: rol başına 15 rollout hakeme sorulur (~180 çağrı).\n"
+            "  BU OTOMATİK GERİ ÇEKİLME UYGULANMADI — bu script onu koşmaz, elle bir "
+            "karar gerekir. İki seçenek var:\n"
+            "    1) Daha büyük bir --sample-size ile tekrar koş: probe'un uyumu çoğunlukla "
+            "etiket sayısıyla sınırlıdır. Bunun bütçe maliyeti aşağıdaki KALAN'a "
+            "sığmalıdır.\n"
+            "    2) 'somewhat' vektörleriyle devam et (spec Bölüm 9'un '<40 rol' çıkış "
+            "yolu) ve probe'un güvenilmez olduğunu sonuçlarda AÇIKÇA raporla.\n"
+            f"  Bu koşuda harcanan: {client.sends_made} gönderim "
+            f"(aşama tavanı {config.STAGE_BUDGETS[STAGE]}); "
+            f"aşamada kalan: {client.remaining_budget(STAGE)[0]}, "
+            f"global kalan: {client.remaining_budget(STAGE)[1]}.\n"
+            f"  Hakem etiketleri {LABELS_PATH} içinde duruyor — tekrar koşuda cache'ten "
+            "gelirler, aynı örnekler ikinci kez ücretlendirilmez.",
             file=sys.stderr,
         )
         return 1
@@ -201,6 +295,14 @@ def main(argv: list[str] | None = None) -> int:
     OUT_PATH.write_text(
         json.dumps(
             {
+                # `05_capture_activations.py`'nin `activations_index.json`'a
+                # yazdığı kimliğin AYNISI (ikisi de `rollouts.jsonl`
+                # kayıtlarından türetilir). `07_extract_axis.py` ikisinin
+                # eşit olmasını ŞART koşar: onsuz, Aşama 1'in FARKLI bir rol
+                # kümesiyle ama aynı satır sayısı ve sırasıyla yeniden
+                # koşturulması, 07'nin sayı+kapsama kontrollerinin ikisini de
+                # geçiyordu ve fully/somewhat ayrımı sessizce kayıyordu.
+                "run_id": rollouts_run_id(records),
                 "holdout_agreement": probe.holdout_agreement,
                 "n_judge_labels": len(labels),
                 "n_probe_labels": len(role_rows) - len(labels),
