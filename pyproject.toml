@@ -30,5 +30,5 @@ packages = ["src/aax"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-markers = ["gpu: GPU gerektirir, varsayılan koşuda atlanır"]
+markers = ["gpu: GPU veya ağır ML bağımlılığı gerektirir, varsayılan koşuda atlanır"]
 addopts = "-m 'not gpu'"
