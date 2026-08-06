@@ -31,14 +31,26 @@ def rollouts_run_id(records: list[dict]) -> str:
     üç ayrı yerde elle kopyalanmış bir ifadeyle hesaplamak, aralarından
     birinin sessizce ayrışması demekti.
 
-    Blob, satır sırasıyla `kind`/`role`/`system_prompt`/`question` alanlarını
-    birleştirir: aynı rollout kümesi (aynı sıra, aynı içerik) her zaman aynı
-    kimliği üretir; roller, sistem promptları ya da sorular değişirse kimlik
-    de değişir. `answer` bilerek DIŞARIDA: kimlik "hangi rollout kümesi"
-    sorusunu yanıtlar, "model o gün ne üretti" sorusunu değil.
+    Blob, satır sırasıyla `kind`/`role`/`system_prompt`/`question`/`answer`
+    alanlarını birleştirir. `answer` KASITLI olarak İÇERİDE (Kritik 1'in
+    düzeltmesi, önceki sürümde bilerek dışarıdaydı): `04_generate_rollouts.py`
+    `temperature=1.0` ile örnekler, yani aynı spec'lerle iki ayrı üretim
+    koşusu (ör. yakalama çökmesi sonrası `04`'ün yeniden koşulması) hayatta
+    kalan kayıt listesi değişmediği sürece AYNI `kind`/`role`/`system_prompt`/
+    `question` ile ama FARKLI `answer` üretir. `05` cevabı aktivasyona
+    tokenize eder, `06`'nın hakem etiketleri cevap METNİ üzerinden verilir —
+    yani her iki aşağı akış artefaktı da cevaba bağımlıdır. `answer` kimliğin
+    dışında kalsaydı, `05` eski cevaplardan yakalanmış aktivasyonları, `06` ise
+    yeni cevaplardan verilmiş etiketleri taşıyabilir ve `07`'nin üç bütünlük
+    kontrolü de (satır sayısı, anahtar kapsaması, `run_id`) bunu YAKALAYAMAZDI
+    — satır *i*'nin etiketi cevap A'yı tarif ederken satır *i*'nin
+    aktivasyonu cevap B'yi kodlardı. `answer` içeri alınınca aynı spec'lerin
+    farklı cevaplarla iki üretimi FARKLI bir kimlik üretir ve `07` bunu aynı
+    `run_id` uyuşmazlığı kontrolüyle (zaten var olan) reddeder.
     """
     blob = "\n".join(
-        f"{r['kind']}\t{r['role']}\t{r['system_prompt']}\t{r['question']}" for r in records
+        f"{r['kind']}\t{r['role']}\t{r['system_prompt']}\t{r['question']}\t{r['answer']}"
+        for r in records
     )
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 

@@ -108,12 +108,27 @@ def test_run_id_is_content_derived_and_stable():
     assert rollouts_run_id(_records(3)) != rollouts_run_id(_records(3, role="sage"))
 
 
-def test_run_id_ignores_the_answer_text():
-    """Kimlik "hangi rollout kümesi" sorusunu yanıtlar, "model o gün ne
-    üretti" sorusunu değil: aynı spec'ler farklı yanıtlarla aynı kimliği
-    vermeli, yoksa `05` ile `06` aynı dosyayı okusa bile ayrışabilirdi."""
+def test_run_id_is_sensitive_to_the_answer_text():
+    """Kritik 1: `04` `temperature=1.0` ile örnekler, yani aynı spec'lerle
+    (aynı hayatta-kalan kayıt listesiyle) iki ayrı üretim koşusu AYNI
+    `kind`/`role`/`system_prompt`/`question` ama FARKLI `answer` üretebilir.
+    `05` cevabı aktivasyona tokenize eder, `06`'nın hakem etiketleri cevap
+    METNİ üzerinden verilir — ikisi de cevaba bağımlıdır. Kimlik cevaba
+    duyarlı olmazsa aynı spec'lerin farklı cevaplarla iki koşusu AYNI
+    `run_id`'yi üretir ve `07`'nin künye eşitliği kontrolü satır *i*'nin
+    etiketinin cevap A'yı, aktivasyonunun cevap B'yi tarif ettiği bir
+    karışıklığı YAKALAYAMAZ. Bu yüzden aynı spec'ler + farklı cevaplar artık
+    FARKLI bir kimlik üretmeli."""
     a = [rollout_record(make_spec(question=f"s{i}"), f"cevap-{i}") for i in range(3)]
     b = [rollout_record(make_spec(question=f"s{i}"), f"BAMBAŞKA-{i}") for i in range(3)]
+    assert rollouts_run_id(a) != rollouts_run_id(b)
+
+
+def test_run_id_is_deterministic_for_identical_answers():
+    """Aynı spec'ler VE aynı cevaplar her zaman aynı kimliği vermeli —
+    kimlik hâlâ saatten değil içerikten türetilir."""
+    a = [rollout_record(make_spec(question=f"s{i}"), f"cevap-{i}") for i in range(3)]
+    b = [rollout_record(make_spec(question=f"s{i}"), f"cevap-{i}") for i in range(3)]
     assert rollouts_run_id(a) == rollouts_run_id(b)
 
 
