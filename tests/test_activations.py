@@ -40,7 +40,7 @@ def test_capture_layer_outputs_calls_base_model_with_use_cache_false():
     modülün (spec Bölüm 10: "yanlış tensörü yakalamak sessiz ve ölümcül")
     tek ucuz doğruluk sınaması hiç çalışmıyordu.
     """
-    import torch
+    torch = pytest.importorskip("torch")
 
     from aax.activations import capture_layer_outputs
 
