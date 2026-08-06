@@ -21,8 +21,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -81,8 +84,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checkpoint-every",
         type=int,
-        default=25,
-        help="kaç batch'te bir kısmi sonuç diske yazılsın (0 = yalnızca hata anında)",
+        default=250,
+        help=(
+            "kaç batch'te bir kısmi sonuç diske yazılsın (0 = yalnızca hata anında). "
+            "Önemli 4: planlanan ölçekte (16.000 satır, batch 8) 25'in varsayılan olduğu "
+            "sürümde bu 200 satırda bir, yani ~80 tam matris yeniden yazımı (~290 GB) "
+            "demekti; 250 bunu ~6-7 yazıma indirir"
+        ),
     )
     parser.add_argument(
         "--allow-pilot",
@@ -101,6 +109,31 @@ def _format_seconds(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}"
 
 
+def _atomic_save_npy(path: Path, array: np.ndarray) -> None:
+    """`np.save`'i `aax.rollouts.write_rollouts`'un tempfile+fsync+rename
+    deseniyle yaz — düz `np.save(path, array)` bir plain overwrite'tır.
+
+    Önemli 4: planlanan ölçekte (16.000 × 28 × 2048 float32, ~3.67 GB)
+    checkpoint bu dosyayı ~80 kez baştan yazıyordu; her yazım yarıda kesilirse
+    (OOM, Ctrl-C, disk dolması) `activations.npy` YARIM ve BOZUK kalırdı —
+    üstelik `--start-row` ile bir sonraki koşu tam olarak bu dosyayı okumaya
+    çalışır (`_load_resume_prefix`). Tempfile + `os.replace` ile hedef dosya
+    ya TAMAMEN eski hâlinde ya da TAMAMEN yeni hâlinde kalır, hiçbir zaman
+    yarım kalmaz.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".npy.tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            np.save(handle, array)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
 def _save_partial(acts: np.ndarray, rows_done: int, run_id: str) -> None:
     """Kısmi matrisi ve ilerleme işaretini yaz.
 
@@ -110,7 +143,7 @@ def _save_partial(acts: np.ndarray, rows_done: int, run_id: str) -> None:
     indeks, kuyruğu sıfır olan satırları gerçek aktivasyon sanan bir eksen
     hesabı demek olurdu.
     """
-    np.save(ACTS_PATH, acts)
+    _atomic_save_npy(ACTS_PATH, acts)
     PARTIAL_PATH.write_text(
         json.dumps(
             {"rows_done": int(rows_done), "n_rows": int(acts.shape[0]), "run_id": run_id},
@@ -125,11 +158,47 @@ def _load_resume_prefix(acts: np.ndarray, start_row: int, run_id: str) -> int:
     """`--start-row` için mevcut matrisin ilk `start_row` satırını yerine koy.
 
     Dönüş: kopyalanan satır sayısı. Uyuşmazlıkta `ValueError`.
+
+    Önemli 2: `PARTIAL_PATH` artık `--start-row` için ZORUNLU, önceden yalnızca
+    "varsa" doğrulanıyordu. Şekil eşleşmesi TEK BAŞINA yeterli değil: aynı
+    satır SAYISINA sahip ama FARKLI bir rollout kümesi bu kontrolü sessizce
+    geçer. Somut senaryo: önceki tam bir koşu `activations.npy`'yi bırakır
+    (başarıyla bittiği için `PARTIAL_PATH` başarı sonunda silinir);
+    rollout'lar aynı kayıt sayısıyla yeniden üretilir (`04` tekrar koşulur);
+    yeni yakalama geçişi ilk checkpoint'ten ÖNCE OS düzeyinde öldürülür (`kill
+    -9`, OOM-killer) — hiçbir `_save_partial` çağrılmaz, `PARTIAL_PATH` hiç
+    yazılmaz. Operatör "kaldığı yerden devam" niyetiyle `--start-row N`
+    verir: eski kod yalnızca şekle bakıp satır 0..N'i ESKİ (önceki tam)
+    koşudan alır, yeni bir `run_id` ile devam eder — `07`'nin künye
+    kontrolleri bunu YAKALAYAMAZ çünkü indeks tek bir tutarlı `run_id`
+    taşıyacak şekilde yazılır. Marker zorunlu kılınınca bu senaryo baştan
+    reddedilir: operatör bilir bilmez baştan koşar, sessizce karışık veri
+    üretilmez.
     """
     if not ACTS_PATH.exists():
         raise ValueError(
             f"--start-row {start_row} verildi ama {ACTS_PATH} yok — devam edilecek "
             "kısmi sonuç bulunamadı."
+        )
+    if not PARTIAL_PATH.exists():
+        raise ValueError(
+            f"--start-row {start_row} verildi ama {PARTIAL_PATH} yok. Şekil eşleşmesi "
+            f"TEK BAŞINA yeterli değil: {ACTS_PATH} önceki TAMAMLANMIŞ bir koşudan kalmış "
+            "olabilir (başarı sonunda kısmi işaret silinir) ve aynı satır sayısına sahip "
+            "ama FARKLI bir rollout kümesiyle karışabilir. Baştan koşun — üretim (Aşama 1) "
+            "tekrarlanmak zorunda değil, yalnızca bu yakalama geçişi."
+        )
+    marker = json.loads(PARTIAL_PATH.read_text(encoding="utf-8"))
+    if marker.get("run_id") != run_id:
+        raise ValueError(
+            f"--start-row {start_row}: {PARTIAL_PATH} farklı bir koşuyu işaretliyor "
+            f"(run_id={marker.get('run_id')!r}, beklenen {run_id!r}). Baştan koşun."
+        )
+    if marker.get("rows_done", 0) < start_row:
+        raise ValueError(
+            f"--start-row {start_row}: kısmi dosyada yalnızca "
+            f"{marker.get('rows_done')} satır hesaplanmış. En fazla oradan devam "
+            "edilebilir."
         )
     existing = np.load(ACTS_PATH, mmap_mode="r")
     if existing.shape != acts.shape:
@@ -138,19 +207,6 @@ def _load_resume_prefix(acts: np.ndarray, start_row: int, run_id: str) -> int:
             f"bu koşunun beklediği {tuple(acts.shape)}. Aradaki rollout kümesi ya da "
             "model değişmiş; baştan koşun."
         )
-    if PARTIAL_PATH.exists():
-        marker = json.loads(PARTIAL_PATH.read_text(encoding="utf-8"))
-        if marker.get("run_id") != run_id:
-            raise ValueError(
-                f"--start-row {start_row}: {PARTIAL_PATH} farklı bir koşuyu işaretliyor "
-                f"(run_id={marker.get('run_id')!r}, beklenen {run_id!r}). Baştan koşun."
-            )
-        if marker.get("rows_done", 0) < start_row:
-            raise ValueError(
-                f"--start-row {start_row}: kısmi dosyada yalnızca "
-                f"{marker.get('rows_done')} satır hesaplanmış. En fazla oradan devam "
-                "edilebilir."
-            )
     acts[:start_row] = existing[:start_row]
     return start_row
 
@@ -292,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
 
-    np.save(ACTS_PATH, acts)
+    _atomic_save_npy(ACTS_PATH, acts)
     INDEX_PATH.write_text(
         json.dumps(
             {

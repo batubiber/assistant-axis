@@ -50,12 +50,26 @@ def test_all_args_have_help_text():
         assert actions[dest].help, f"--{dest} için help metni eksik"
 
 
+def test_checkpoint_every_default_is_250_not_25():
+    """Önemli 4: planlanan ölçekte (16.000 satır, batch 8) eski varsayılan
+    25, 200 satırda bir checkpoint demekti — ~80 tam matris (~3.67 GB)
+    yeniden yazımı, ~290 GB toplam. 250 bunu ~6-7 yazıma indirir."""
+    parser = ca.build_arg_parser()
+    assert parser.get_default("checkpoint_every") == 250
+
+
 # --- run_id: activations_index.json'ı kaynağa geri bağla ---------------------
 
 
 def _make_records(roles: list[str]) -> list[dict]:
     return [
-        {"kind": "role", "role": role, "system_prompt": f"{role} ol", "question": "q?"}
+        {
+            "kind": "role",
+            "role": role,
+            "system_prompt": f"{role} ol",
+            "question": "q?",
+            "answer": f"{role} cevabı",
+        }
         for role in roles
     ]
 
@@ -277,6 +291,36 @@ def test_start_row_refuses_a_partial_file_from_another_run(tmp_path, monkeypatch
     assert "BAŞARISIZ" in capsys.readouterr().err
 
 
+def test_start_row_refuses_when_no_partial_marker_exists_even_if_shape_matches(
+    tmp_path, monkeypatch, capsys
+):
+    """Önemli 2: şekil eşleşmesi TEK BAŞINA yeterli değil.
+
+    Gerçek senaryo: önceki TAM bir koşu `activations.npy`'yi bırakır (kısmi
+    işaret başarı sonunda silinir, bkz. `test_main_writes_one_index_row_per_
+    rollout_in_the_same_order`); rollout'lar aynı satır sayısıyla yeniden
+    üretilir (`04` tekrar koşulur); yeni yakalama geçişi OS düzeyinde
+    (`kill -9`, OOM-killer) ilk checkpoint'ten ÖNCE öldürülür — hiçbir kısmi
+    işaret hiç YAZILMAZ. Operatör "kaldığı yerden devam" niyetiyle
+    `--start-row` verirse, düzeltme öncesi kod yalnızca `existing.shape ==
+    acts.shape` bakardı ve bu SESSİZCE geçerdi — tam olarak "aynı satır
+    sayısı, farklı rollout kümesi" durumu, `C5`'in künye kontrolünün ayrı
+    tuttuğu türden bir bayatlık. Burada basitleştirilmiş biçimde: TAMAMLANMIŞ
+    bir koşunun ardından (kısmi işaret hiç yok) `--start-row` denenir ve
+    ŞEKİL TAM UYSA BİLE reddedilmeli."""
+    records = _make_rollouts(n_role=6, n_default=2)
+    _setup(monkeypatch, tmp_path, records)
+    assert ca.main([]) == 0  # tam, başarılı koşu — kısmi işaret hiç yazılmadı
+    assert not (tmp_path / "activations_partial.json").exists()
+    capsys.readouterr()
+
+    assert ca.main(["--batch-size", "2", "--start-row", "4"]) == 2
+
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "activations_partial.json" in err
+
+
 def test_main_rejects_a_pilot_rollout_set(tmp_path, monkeypatch, capsys):
     """C5: `--limit 100` kanonik yola yazıyordu ve `05` farkı göremiyordu.
     Aşama 0'ın `load_role_catalog` sert reddiyle aynı desen."""
@@ -340,3 +384,42 @@ def test_main_rejects_an_out_of_range_start_row(tmp_path, monkeypatch, capsys, s
 
     assert ca.main(["--start-row", str(start_row)]) == 2
     assert "--start-row" in capsys.readouterr().err
+
+
+# --- Önemli 4: checkpoint yazımı atomik olmalı --------------------------------
+
+
+def test_atomic_save_npy_no_temp_left_on_success(tmp_path):
+    path = tmp_path / "acts.npy"
+    ca._atomic_save_npy(path, np.zeros((2, 3), dtype=np.float32))
+
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "acts.npy"]
+    assert leftovers == []
+    assert np.array_equal(np.load(path), np.zeros((2, 3), dtype=np.float32))
+
+
+def test_atomic_save_npy_preserves_existing_file_and_leaves_no_temp_on_failure(
+    tmp_path, monkeypatch
+):
+    """Gerçek atomiklik garantisi: `aax.rollouts.write_rollouts`'un
+    `test_write_failure_partway_leaves_no_temp_and_preserves_existing_target`
+    testiyle aynı desen, ama `.npy` için. Sahte, tempfile'sız bir düz
+    `np.save(path, array)` bu testi geçemezdi: yarıda kesilen bir yazım
+    hedefi kısmi/bozuk içerikle üzerine yazardı — planlanan ölçekte
+    (~80 checkpoint yazımı) bu, `--start-row`'un okuyacağı dosyanın tam da
+    devam ederken bozulması demekti."""
+    path = tmp_path / "acts.npy"
+    original = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    np.save(path, original)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("simüle edilmiş çökme (disk dolu / Ctrl-C / OOM)")
+
+    monkeypatch.setattr(ca.np, "save", boom)
+
+    with pytest.raises(RuntimeError, match="simüle edilmiş çökme"):
+        ca._atomic_save_npy(path, np.zeros(3, dtype=np.float32))
+
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "acts.npy"]
+    assert leftovers == [], "yarıda kesilen yazım tempfile bırakmamalı"
+    assert np.array_equal(np.load(path), original), "hedef dosya bozulmamalı"
