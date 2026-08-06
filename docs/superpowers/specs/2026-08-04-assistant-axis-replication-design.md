@@ -180,8 +180,11 @@ response token'larının ortalaması alınır (~10 dk). Rollout başına saklana
 16k rollout'un tamamını hakeme sormak batch'li bile olsa ~1600 çağrı eder. Bunun yerine:
 
 1. 2,000 rollout'u tabakalı örnekle, gateway'e sor (batch 10 → **~200 çağrı**), 0-3 etiketi al.
-2. Bu etiketlerle, cache'te hazır bulunan **`BAAI/bge-m3`** embedding'leri üzerine lojistik regresyon
-   oturt (`probe.py`). Sınıflar: *fully* (3), *somewhat* (2), *no* (0-1).
+2. Bu etiketlerle **`BAAI/bge-m3`** embedding'leri üzerine lojistik regresyon oturt (`probe.py`).
+   Sınıflar: *fully* (3), *somewhat* (2), *no* (0-1). (Tasarım sırasında bu modelin HF cache'inde
+   hazır olduğu sanılmıştı; 2026-08-06'da cache girdisinin boş bir kabuk olduğu görüldü — model
+   indirilecek, ~2.3 GB. Diskte ağırlığıyla duran `intfloat/multilingual-e5-large` alternatif
+   olarak değerlendirildi, kullanıcı bge-m3'te kaldı.)
 3. Held-out %20'de probe–hakem uyumunu raporla.
 4. Kalan ~14k rollout'u probe ile **yerelde bedava** etiketle.
 
