@@ -157,3 +157,44 @@ def test_empty_pilot_answers_never_reach_the_worksheet(tmp_path, monkeypatch, ca
     assert all(r["answer"].strip() for r in records)
     out = capsys.readouterr().out
     assert "boş yanıt atlandı" in out
+
+
+# --- Önemli 6: pilot varsayılanı kapının tabanına sıfır pay bırakıyordu ------
+
+
+def test_default_pilot_size_is_9_roles_by_5_questions_end_to_end(tmp_path, monkeypatch):
+    """Uçtan uca: bayraksız (`--roles`/`--questions` verilmeden) bir koşu
+    9 rol × 5 soru = 45 kayıt üretmeli — kapının 40'lık tabanının 5 üstünde."""
+    _setup(monkeypatch, tmp_path, ["cevap"], n_roles=9, n_questions=5)
+    monkeypatch.setattr(sys, "argv", ["02_pilot_rollouts.py"])  # bayraksız, saf varsayılan
+
+    assert pr.main() == 0
+
+    records = _read_records(pr.OUT_PATH)
+    assert len(records) == 45
+
+
+def test_warns_when_pilot_output_falls_below_the_gate_floor(tmp_path, monkeypatch, capsys):
+    """Önemli 6: pilot boş yanıtlar yüzünden kapının tabanının (40) altına
+    düşerse operatör bunu insan etiketlemesine BAŞLAMADAN önce görmeli."""
+    # 9x5=45 spec, yanıtların yarısı boş -> ~22-23 kayıt, 40'ın altında.
+    _setup(monkeypatch, tmp_path, ["dolu", "   "], n_roles=9, n_questions=5)
+    monkeypatch.setattr(sys, "argv", ["02_pilot_rollouts.py"])
+
+    assert pr.main() == 0
+
+    records = _read_records(pr.OUT_PATH)
+    assert len(records) < 40
+    out = capsys.readouterr().out
+    assert "UYARI" in out
+    assert "40" in out
+
+
+def test_no_warning_when_pilot_output_meets_the_gate_floor(tmp_path, monkeypatch, capsys):
+    _setup(monkeypatch, tmp_path, ["cevap"], n_roles=9, n_questions=5)
+    monkeypatch.setattr(sys, "argv", ["02_pilot_rollouts.py"])
+
+    assert pr.main() == 0
+
+    out = capsys.readouterr().out
+    assert "UYARI" not in out
