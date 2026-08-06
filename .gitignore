@@ -4,6 +4,11 @@ data/
 *.npz
 *.safetensors
 
+# ...ama `results/` commit EDİLİR. `results/axis/assistant_axis.npy` Plan
+# 3-4'ün girdisidir ve onu üreten kararla (`criterion_a.json`) aynı commit'te
+# durmalı; global `*.npy` kuralı bunu sessizce dışarıda bırakıyordu.
+!results/**/*.npy
+
 # Sırlar
 .env
 *.key
