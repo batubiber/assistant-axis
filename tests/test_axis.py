@@ -205,10 +205,65 @@ def test_criterion_a_fails_when_default_not_in_top_decile():
     assert "desil" in result["reason"]
 
 
-def test_criterion_a_accepts_negative_cosine_by_magnitude():
-    """PC1'in işareti keyfîdir; önemli olan büyüklük."""
+def test_criterion_a_accepts_negative_cosine_when_default_is_in_the_bottom_decile():
+    """PC1'in işareti keyfîdir (SVD seçer) — ama işaret hangi desilin
+    BEKLENDİĞİNİ belirler. Negatif kosinüs + alt desil, pozitif kosinüs +
+    üst desilin ayna görüntüsüdür ve aynı fiziksel duruma karşılık gelir."""
     result = evaluate_criterion_a(cos_pc1_axis=-0.75, default_percentile=0.02)
     assert result["passed"] is True
+
+
+# --- A1: işaret × desil eşleşmesi (coupled) ---------------------------------
+#
+# Eskiden iki koşul BAĞIMSIZDI: `|cos| > 0.6` VE `(persentil >= 0.9 VEYA
+# persentil <= 0.1)`. Bu, geçme bölgesini ikiye katlıyordu ve bölgenin YARISI
+# hipotezin ALEYHİNE delildi. Aşağıdaki dört test, işaret × desil
+# kombinasyonlarının tamamını sabitler.
+
+
+def test_criterion_a_positive_cosine_requires_the_top_decile():
+    result = evaluate_criterion_a(cos_pc1_axis=0.95, default_percentile=0.97)
+    assert result["passed"] is True
+    assert result["required_decile"] == "top"
+
+
+def test_criterion_a_positive_cosine_with_bottom_decile_fails():
+    """A1'in başlık regresyonu.
+
+    Düzeltme öncesi bu tam olarak `passed: True` dönüyordu (doğrulandı).
+    Eksen rollerden default'a doğru bakar; PC1 onunla AYNI yöndeyken default
+    projeksiyonunun HER rol vektörünün ALTINDA kalması, ölçülen kriterin tam
+    tersidir — geçme değil, hipoteze karşı delildir.
+    """
+    result = evaluate_criterion_a(cos_pc1_axis=0.95, default_percentile=0.0)
+    assert result["passed"] is False
+    assert result["required_decile"] == "top"
+    assert "POZİTİF" in result["reason"]
+    assert "ÜST desilde" in result["reason"]
+
+
+def test_criterion_a_negative_cosine_requires_the_bottom_decile():
+    result = evaluate_criterion_a(cos_pc1_axis=-0.95, default_percentile=0.03)
+    assert result["passed"] is True
+    assert result["required_decile"] == "bottom"
+
+
+def test_criterion_a_negative_cosine_with_top_decile_fails():
+    """Aynalı regresyon: bağımsız testlerde bu da `passed: True` derdi."""
+    result = evaluate_criterion_a(cos_pc1_axis=-0.95, default_percentile=1.0)
+    assert result["passed"] is False
+    assert result["required_decile"] == "bottom"
+    assert "NEGATİF" in result["reason"]
+    assert "ALT desilde" in result["reason"]
+
+
+def test_criterion_a_zero_cosine_has_no_required_decile_and_fails():
+    """`cos == 0`: işaret yok, dolayısıyla istenen desil de tanımsız.
+    `|cos| <= 0.6` zaten düşürüyor, ama gerekçe her iki koşulu da adlandırmalı."""
+    result = evaluate_criterion_a(cos_pc1_axis=0.0, default_percentile=1.0)
+    assert result["passed"] is False
+    assert result["required_decile"] is None
+    assert "işaret" in result["reason"]
 
 
 def test_criterion_a_never_passes_on_a_nan_cosine():
@@ -240,8 +295,11 @@ def test_criterion_a_boundary_bottom_decile_exactly_0_1_passes():
     """`1 - TOP_DECILE` ikili kayan noktada `0.09999999999999998`'tir —
     tam `0.1` persentili (n 10'un katıysa `k/n` ile ATTAINABLE, beklenen
     ölçekte rutin) bu ifadeyle KAÇARDI. `BOTTOM_DECILE = 0.1` sabiti bunu
-    düzeltir; sınır ULP'siz, ayna simetrik olmalı."""
-    result = evaluate_criterion_a(cos_pc1_axis=0.9, default_percentile=0.1)
+    düzeltir; sınır ULP'siz, ayna simetrik olmalı.
+
+    A1 sonrası kosinüs NEGATİF: alt desil yalnızca negatif işaretle
+    istenir. Sınamanın konusu değişmedi — sınırın tam `0.1` olması."""
+    result = evaluate_criterion_a(cos_pc1_axis=-0.9, default_percentile=0.1)
     assert result["passed"] is True
 
 
