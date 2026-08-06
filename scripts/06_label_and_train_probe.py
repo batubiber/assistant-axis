@@ -4,13 +4,20 @@
 Kullanım:
     uv run python scripts/06_label_and_train_probe.py --dry-run
     uv run --extra ml python scripts/06_label_and_train_probe.py
+    uv run --extra ml python scripts/06_label_and_train_probe.py --allow-pilot  # bilinçli pilot
 
 ÇIKIŞ KODLARI:
     0  probe güvenilir, role_expression.json yazıldı
     1  BULGU: probe held-out uyumu eşiğin altında — güvenilmez, geri çekilme
        kuralı devreye girer (bu bir ÖLÇÜM sonucudur, bir çalıştırma hatası değil)
     2  koşulamadı: ön koşul/kurulum hatası, bütçe, gateway, --dry-run planı
-       kalan bütçeye sığmıyor
+       kalan bütçeye sığmıyor, rollouts.jsonl eksik/bozuk/PİLOT (--allow-pilot yoksa)
+
+`05_capture_activations.py` ile aynı `--allow-pilot` deseni: `rollouts.jsonl`
+`04`'ün bir `--limit` koşusundan geliyorsa (`rollouts_meta.json` künyesi
+bunu taşır), bu script varsayılan olarak REDDEDER — aksi hâlde hakem
+harcamasının (~200 çağrı, aşama bütçesinin çoğu) bir duman testi üzerinde
+yapılması hiçbir şeyle engellenmezdi.
 
 `1` bilinçli olarak TEK bir anlama ayrılmıştır. Eskiden `--dry-run`'ın bütçe
 reddi de 1 döndürüyordu; bir kabuk pipeline'ı "probe güvenilmez" ile "koşu
@@ -34,7 +41,7 @@ from aax.judge import (
 )
 from aax.probe import RoleExpressionProbe, embed_answers, stratified_sample
 from aax.prompts import load_role_catalog
-from aax.rollouts import read_rollouts, rollouts_run_id
+from aax.rollouts import load_rollouts_meta, read_rollouts, rollouts_run_id
 
 STAGE = "stage2_probe_labels"
 SEED = 20260806
@@ -130,9 +137,54 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--sample-size", type=int, default=LABEL_SAMPLE_SIZE)
+    parser.add_argument(
+        "--allow-pilot",
+        action="store_true",
+        help=(
+            "rollouts.jsonl bir --limit koşusundan gelse bile devam et "
+            "(05_capture_activations.py'nin --allow-pilot'ıyla aynı bilinçli geçersiz kılma)"
+        ),
+    )
     args = parser.parse_args(argv)
 
-    records = read_rollouts(config.DATA_DIR / "rollouts.jsonl")
+    rollouts_path = config.DATA_DIR / "rollouts.jsonl"
+    # `05_capture_activations.py::main` ile aynı desen: çıplak `read_rollouts`
+    # çağrısı `FileNotFoundError`/`ValueError`'ı sarmasız bırakıyordu — biri
+    # yorumlayıcıyı çıplak bir traceback'le, ikisi de görev tanımının
+    # istediği "traceback değil temiz tanı" koşulunu ihlal ederek çıkış 1
+    # (bu script'te "probe güvenilmez" anlamına gelen kod) ile döndürüyordu.
+    try:
+        records = read_rollouts(rollouts_path)
+    except FileNotFoundError:
+        print(
+            f"BAŞARISIZ: {rollouts_path} yok.\n"
+            "  Bu dosya Aşama 1 üretiminin çıktısıdır — önce "
+            "scripts/04_generate_rollouts.py çalıştırılmalı.",
+            file=sys.stderr,
+        )
+        return 2
+    except ValueError as exc:
+        print(f"BAŞARISIZ: {rollouts_path} okunamadı.\n  {exc}", file=sys.stderr)
+        return 2
+
+    # Önemli 5: `05`'e bağlı olmadan `rollouts.jsonl`'ı DOĞRUDAN okuyordu —
+    # künye kontrolü yalnızca `05`'e bağlıydı. Bu, hakem harcamasının
+    # (~200 çağrı, 300'lük aşama bütçesinin çoğu) bir PİLOT künye üzerinde de
+    # yapılabileceği anlamına geliyordu; hiçbir şey bunu harcamadan önce
+    # reddetmiyordu. `05`'in `--allow-pilot` deseninin AYNISI.
+    try:
+        meta = load_rollouts_meta(
+            config.DATA_DIR / "rollouts_meta.json", records, allow_pilot=args.allow_pilot
+        )
+    except ValueError as exc:
+        print(f"BAŞARISIZ: rollout kümesi kanonik değil.\n  {exc}", file=sys.stderr)
+        return 2
+    if meta.get("limit") is not None:
+        print(
+            f"UYARI: PİLOT rollout kümesi (--limit={meta['limit']}, {meta['n']} kayıt) "
+            "--allow-pilot ile kabul edildi. Bu etiketler A kriteri için kullanılamaz."
+        )
+
     role_rows = [i for i, r in enumerate(records) if r["kind"] == "role"]
     role_records = [records[i] for i in role_rows]
 

@@ -23,6 +23,7 @@ import pytest
 
 from aax.gateway import BudgetExceeded, CircuitOpen, GatewayError
 from aax.judge import JudgeParseError
+from aax.rollouts import write_rollouts_meta
 
 _SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "06_label_and_train_probe.py"
@@ -74,11 +75,20 @@ def _make_role_records(roles: list[str], per_role: int = 5) -> list[dict]:
     return records
 
 
-def _write_rollouts(path: Path, records: list[dict]) -> None:
+def _write_rollouts(path: Path, records: list[dict], *, limit: int | None = None) -> None:
+    """`rollouts.jsonl`'ı yaz VE yanına eşleşen `rollouts_meta.json`'ı da yaz.
+
+    Önemli 5: `06` artık `05` ile aynı deseni izleyip künyeyi doğruluyor
+    (`load_rollouts_meta`, `--allow-pilot` olmadan pilot bir künyeyi
+    reddeder). Bu yardımcı varsayılan olarak KANONİK (`limit=None`) bir
+    künye yazar ki mevcut testlerin çoğu bu kontrolden habersizce geçsin;
+    pilot davranışını sınayan testler `limit=` ile açıkça override eder.
+    """
     path.write_text(
         "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
         encoding="utf-8",
     )
+    write_rollouts_meta(path.parent / "rollouts_meta.json", records, limit)
 
 
 def _write_roles_catalog(path: Path, roles: list[str]) -> None:
@@ -195,6 +205,126 @@ def test_collapse_maps_scores_to_three_categories():
 def test_collapse_rejects_out_of_range():
     with pytest.raises(ValueError):
         ltp.collapse(4)
+
+
+# --- Önemli 3: eksik/bozuk rollouts.jsonl artık çıplak istisna değil ----------
+#
+# `read_rollouts(...)` çağrısı hiçbir `try/except`'in dışındaydı; `except
+# ValueError` sarmalayıcısı bir satır AŞAĞIDA (örnekleme kurulumunda)
+# başlıyordu. Eksik dosya `FileNotFoundError`, kırpık bir satır `ValueError`
+# fırlatır — ikisi de `main()`'den KAÇAR ve yorumlayıcı çıkış kodu 1 ile
+# sonlanır; bu script'te 1 TEK bir anlama ayrılmıştır (modül docstring'i):
+# "probe held-out uyumu eşiğin altında". Bozuk bir GİRDİ dosyası, PROBE
+# HAKKINDA bir BULGU olarak raporlanıyordu.
+
+
+def test_main_reports_missing_rollouts_file_cleanly_not_exit_1(tmp_path, monkeypatch, capsys):
+    _patch_paths(monkeypatch, tmp_path)
+    # rollouts.jsonl kasıtlı olarak hiç yazılmadı.
+
+    exit_code = ltp.main(["--sample-size", "5"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "rollouts.jsonl" in err
+    assert "Traceback" not in err
+
+
+def test_main_reports_corrupt_rollouts_file_cleanly_not_exit_1(tmp_path, monkeypatch, capsys):
+    _patch_paths(monkeypatch, tmp_path)
+    (tmp_path / "rollouts.jsonl").write_text('{"kind": "role"}\n{"kind": "ro', encoding="utf-8")
+
+    exit_code = ltp.main(["--sample-size", "5"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "Traceback" not in err
+
+
+# --- Önemli 5: pilot rollout kümesi hakem harcamasından ÖNCE reddedilir -------
+#
+# `05_capture_activations.py` yalnızca `05`'in kendi girdisini korurdu; `06`
+# `rollouts.jsonl`'ı DOĞRUDAN okur ve `05`'in çıktısına bağımlı değildir, bu
+# yüzden hiçbir şey pilot bir künyeyi hakem harcamasından (~200 çağrı, 300'lük
+# aşama bütçesinin çoğu) ÖNCE reddetmiyordu.
+
+
+def test_main_rejects_a_pilot_rollout_set_before_spending_budget(tmp_path, monkeypatch, capsys):
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(
+        tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=5), limit=100
+    )
+    build_calls = {"n": 0}
+
+    def fake_build():
+        build_calls["n"] += 1
+        return FakeJudgeClient({"pirate": 3})
+
+    monkeypatch.setattr(ltp, "build_default_client", fake_build)
+
+    exit_code = ltp.main(["--sample-size", "5"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "PİLOT" in err
+    assert "--allow-pilot" in err
+    assert build_calls["n"] == 0, "pilot tespit edildiyse istemci hiç kurulmamalı"
+
+
+def test_allow_pilot_flag_lets_a_pilot_rollout_set_through_with_a_warning(
+    tmp_path, monkeypatch, capsys
+):
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate", "sage"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(
+        tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=5), limit=100
+    )
+    monkeypatch.setattr(
+        ltp, "build_default_client", lambda: FakeJudgeClient({"pirate": 3, "sage": 0})
+    )
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
+    monkeypatch.setattr(ltp, "RoleExpressionProbe", _make_fixed_probe_class(trustworthy=True))
+
+    exit_code = ltp.main(["--sample-size", "10", "--allow-pilot"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "UYARI" in out and "PİLOT" in out
+
+
+def test_main_rejects_a_missing_or_stale_meta_file(tmp_path, monkeypatch, capsys):
+    """`05_capture_activations.py::test_main_rejects_a_missing_or_stale_meta_file`
+    ile aynı desen: künye ya hiç yok ya da BAŞKA bir rollout kümesini tarif
+    ediyor — ikisi de reddedilmeli, `--limit`'e hiç bakmadan."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    records = _make_role_records(roles, per_role=5)
+    # Künye YAZMADAN doğrudan jsonl yaz — eski (künyesiz) bir sürümden kalmış
+    # rollouts.jsonl'ı simüle eder.
+    (tmp_path / "rollouts.jsonl").write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = ltp.main(["--sample-size", "5"])
+
+    assert exit_code == 2
+    assert "BAŞARISIZ" in capsys.readouterr().err
+
+    # Künye var ama BAŞKA bir rollout kümesini tarif ediyor.
+    write_rollouts_meta(
+        tmp_path / "rollouts_meta.json", _make_role_records(["baska_rol"], per_role=5), None
+    )
+    exit_code = ltp.main(["--sample-size", "5"])
+    assert exit_code == 2
+    assert "BAŞARISIZ" in capsys.readouterr().err
 
 
 # --- --dry-run: bütçe aritmetiği ------------------------------------------------
