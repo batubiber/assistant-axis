@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -874,3 +875,278 @@ def test_labelled_rows_are_indexed_to_the_correct_embeddings_after_single_pass(
     )
     # predict() TÜM 30 rol satırı için, role_rows sırasıyla çağrılmalı.
     assert captured["predict_embeddings"] == list(range(30))
+
+
+# --- Bulgu: "Bu koşuda harcanan" mesajı SÜREÇ İÇİ sends_made yerine disk ------
+# bütçesinden gerçek harcamayı okumalı ----------------------------------------
+
+
+def test_untrustworthy_probe_message_reports_true_stage_spend_not_process_local_sends_made(
+    tmp_path, monkeypatch, capsys
+):
+    """Üretim bulgusu: mesaj `client.sends_made` (istemci başına, SÜREÇ İÇİ
+    sayaç) okuyordu. Etiketleme geçişi kesintiye uğrayıp CACHE'TEN devam
+    ettirilirse (ör. önceki bir süreç 240 gerçek gönderim yaptı, cache'e
+    yazdı; BU süreç aynı promptları TAMAMEN cache'ten okuyup sıfır YENİ
+    gönderim yapar) `sends_made` bu YENİ süreçte 0'da kalır — mesaj
+    "0 gönderim" derdi, oysa bu etiket kümesini üretmek GERÇEKTE 240
+    gönderime mal olmuştu (disk bütçesi kalıcıdır, ölçüldü: 1369 -> 1129
+    global kalan). Mesaj artık `client.remaining_budget` üzerinden disk
+    bütçesinden (`stage_cap - stage_remaining`) türetilen GERÇEK sayıyı
+    basmalı."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate", "sage"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=5))
+
+    class AllCacheHitClient(FakeJudgeClient):
+        """`chat()` her satırı başarıyla yanıtlar ama `sends_made`'i HİÇ
+        artırmaz — bir önceki sürecin gerçek gönderimlerinin bu süreçte
+        TAMAMEN cache'ten geldiği senaryonun sahtesi. `stage_remaining`
+        (yapıcıya sabit verilir) önceki sürecin GERÇEKTEN harcadığı 240'ı
+        yansıtır: 300 tavan - 240 harcanan = 60 kalan."""
+
+        def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+            self.calls += 1  # tanı amaçlı sayaç; bütçe/sends_made DEĞİL
+            content = messages[0]["content"]
+            role = next(r for r in self._role_scores if f"the role: {r}." in content)
+            n_items = content.count("[ITEM ")
+            return json.dumps([self._role_scores[role]] * n_items)
+
+    monkeypatch.setattr(
+        ltp,
+        "build_default_client",
+        lambda: AllCacheHitClient({"pirate": 3, "sage": 0}, stage_remaining=60),
+    )
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
+    monkeypatch.setattr(ltp, "RoleExpressionProbe", _make_fixed_probe_class(trustworthy=False))
+
+    assert ltp.main(["--sample-size", "10"]) == 1
+
+    err = capsys.readouterr().err
+    assert "Bu koşuda harcanan: 240 gönderim" in err, (
+        f"gerçek harcama (300 tavan - 60 kalan = 240) yerine yanlış bir sayı basıldı:\n{err}"
+    )
+    assert "Bu koşuda harcanan: 0 gönderim" not in err
+
+
+# --- --role-level-fallback: rol düzeyi geri çekilme, VAR OLAN etiketlerden ----
+#
+# Spec'in geri çekilme kuralı (Bölüm 5/Aşama 2) rol başına 15 rollout hakeme
+# sorup (~180 YENİ çağrı) rol düzeyinde tut/at kararı vermeyi varsayıyordu.
+# `--role-level-fallback` aynı kararı VAR OLAN hakem etiketlerinden
+# (`data/probe_labels.json`) türetir — hiçbir yeni gateway çağrısı yapmadan.
+
+
+def _write_probe_labels(path, labels: dict[int, str], *, seed: int = 20260806) -> None:
+    path.write_text(
+        json.dumps({"seed": seed, "labels": {str(k): v for k, v in labels.items()}}),
+        encoding="utf-8",
+    )
+
+
+def test_role_level_fallback_assigns_category_reaching_at_least_ten_labels(
+    tmp_path, monkeypatch
+):
+    """>=10 kuralı: 12 etiketten 10'u 'fully' ise rol 'fully' alır ve bu
+    kategori rolün TÜM rollout satırlarına (yalnızca etiketli 12'sine değil)
+    yayılır."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    records = _make_role_records(roles, per_role=20)  # satır 0..19, hepsi pirate
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+    # 10 "fully" + 2 "no" = 12 etiket; yalnızca "fully" eşiği (>=10) geçer.
+    _write_probe_labels(
+        tmp_path / "probe_labels.json",
+        {i: "fully" for i in range(10)} | {i: "no" for i in range(10, 12)},
+    )
+
+    exit_code = ltp.main(["--role-level-fallback"])
+
+    assert exit_code == 0
+    payload = json.loads(ltp.OUT_PATH.read_text(encoding="utf-8"))
+    expression = payload["expression"]
+    assert len(expression) == 20, "kategori TÜM rollout satırlarına yayılmalı, yalnızca etiketlilere değil"
+    assert set(expression.values()) == {"fully"}
+    assert payload["dropped_roles"] == []
+
+
+def test_role_level_fallback_drops_role_when_no_category_reaches_ten(tmp_path, monkeypatch):
+    """Hiçbir kategori eşiği geçemezse rol ATILIR: hiçbir rollout satırı bir
+    kategori almaz (fail-closed — 'belirsiz' 'tut' değil 'atla' demektir)."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["sage"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    records = _make_role_records(roles, per_role=20)
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+    # 6 fully + 4 somewhat + 3 no = 13 etiket; HİÇBİRİ >=10 değil.
+    _write_probe_labels(
+        tmp_path / "probe_labels.json",
+        {i: "fully" for i in range(6)}
+        | {i: "somewhat" for i in range(6, 10)}
+        | {i: "no" for i in range(10, 13)},
+    )
+
+    exit_code = ltp.main(["--role-level-fallback"])
+
+    assert exit_code == 0
+    payload = json.loads(ltp.OUT_PATH.read_text(encoding="utf-8"))
+    assert payload["dropped_roles"] == ["sage"]
+    assert payload["expression"] == {}
+    assert payload["n_roles_dropped"] == 1
+    assert payload["n_rollouts_covered"] == 0
+
+
+def test_role_level_fallback_dropped_roles_contribute_no_rows_kept_roles_unaffected(
+    tmp_path, monkeypatch
+):
+    """Bir rol atıldığında yalnızca O rolün satırları dışarıda kalır — tutulan
+    bir rolün satırları hiç etkilenmez."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate", "sage"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    records = _make_role_records(roles, per_role=20)  # pirate: 0..19, sage: 20..39
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+    _write_probe_labels(
+        tmp_path / "probe_labels.json",
+        # pirate: 10 fully + 2 no -> "fully" alır.
+        {i: "fully" for i in range(10)}
+        | {i: "no" for i in range(10, 12)}
+        # sage: 6 fully + 4 somewhat + 3 no -> hiçbiri eşiği geçmez, ATILIR.
+        | {i: "fully" for i in range(20, 26)}
+        | {i: "somewhat" for i in range(26, 30)}
+        | {i: "no" for i in range(30, 33)},
+    )
+
+    exit_code = ltp.main(["--role-level-fallback"])
+
+    assert exit_code == 0
+    payload = json.loads(ltp.OUT_PATH.read_text(encoding="utf-8"))
+    expression = payload["expression"]
+    assert len(expression) == 20
+    assert all(int(row) < 20 for row in expression), "sage (atıldı) satırları sızmamalı"
+    assert set(expression.values()) == {"fully"}
+    assert payload["dropped_roles"] == ["sage"]
+    assert payload["n_roles_fully"] == 1
+    assert payload["n_roles_dropped"] == 1
+    assert payload["n_rollouts_covered"] == 20
+
+
+def test_role_level_fallback_artifact_records_method_threshold_and_probe_agreement(
+    tmp_path, monkeypatch
+):
+    """Künye: yöntem, eşik, probe'un ÖLÇÜLEN uyumu ve reddettiği eşik, ve
+    atılan rol listesi — hepsi role_expression.json'da açıkça durmalı."""
+    from aax.rollouts import rollouts_run_id
+
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate", "sage"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    records = _make_role_records(roles, per_role=20)
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+    _write_probe_labels(
+        tmp_path / "probe_labels.json",
+        {i: "fully" for i in range(10)}
+        | {i: "no" for i in range(10, 12)}
+        | {i: "fully" for i in range(20, 26)}
+        | {i: "somewhat" for i in range(26, 30)}
+        | {i: "no" for i in range(30, 33)},
+    )
+
+    assert ltp.main(["--role-level-fallback"]) == 0
+
+    payload = json.loads(ltp.OUT_PATH.read_text(encoding="utf-8"))
+    assert payload["method"] == "role_level_fallback"
+    assert payload["fallback_threshold"] == 10
+    assert payload["probe_holdout_agreement"] == pytest.approx(0.635)
+    assert payload["probe_threshold"] == pytest.approx(0.85)
+    assert payload["dropped_roles"] == ["sage"]
+    assert payload["n_roles_dropped"] == 1
+    assert payload["n_roles_fully"] == 1
+    assert payload["n_roles_somewhat"] == 0
+    assert payload["n_roles_no"] == 0
+    assert payload["run_id"] == rollouts_run_id(records)
+
+
+def test_role_level_fallback_bypasses_probe_entirely_no_embedding_no_gateway_client(
+    tmp_path, monkeypatch
+):
+    """Bayrak verildiğinde probe'a hiç girilmemeli: ne embedding hesaplanır
+    ne de bir gateway istemcisi kurulur."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    records = _make_role_records(roles, per_role=20)
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+    _write_probe_labels(
+        tmp_path / "probe_labels.json",
+        {i: "fully" for i in range(10)} | {i: "no" for i in range(10, 12)},
+    )
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("--role-level-fallback probe'a girmemeli — bu hiç çağrılmamalı")
+
+    monkeypatch.setattr(ltp, "embed_answers", _must_not_be_called)
+    monkeypatch.setattr(ltp, "build_default_client", _must_not_be_called)
+
+    exit_code = ltp.main(["--role-level-fallback"])
+
+    assert exit_code == 0
+
+
+def test_role_level_fallback_still_rejects_pilot_rollout_set_before_reading_labels(
+    tmp_path, monkeypatch, capsys
+):
+    """Fallback yolu da AYNI pilot/künye korumasına tabi — probe yolunun
+    zaten uyduğu kural burada da geçerli, çünkü üretilen artefakt A kriteri
+    için aynı canonik-koşu şartına bağlı."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(
+        tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=20), limit=100
+    )
+    _write_probe_labels(tmp_path / "probe_labels.json", {i: "fully" for i in range(10)})
+
+    exit_code = ltp.main(["--role-level-fallback"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "PİLOT" in err
+    assert not ltp.OUT_PATH.exists()
+
+
+def test_role_level_fallback_missing_probe_labels_file_diagnoses_cleanly(
+    tmp_path, monkeypatch, capsys
+):
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=5))
+    # probe_labels.json kasıtlı olarak hiç yazılmadı.
+
+    exit_code = ltp.main(["--role-level-fallback"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "probe_labels.json" in err
+    assert "Traceback" not in err
+    assert not ltp.OUT_PATH.exists()
+
+
+def test_decide_role_category_pure_threshold_and_tie_rules():
+    """`decide_role_category` saf, ağsız — eşik ve eşitlik kuralları
+    doğrudan sınanır."""
+    assert ltp.decide_role_category(Counter({"fully": 10})) == "fully"
+    assert ltp.decide_role_category(Counter({"fully": 9})) is None
+    assert ltp.decide_role_category(Counter({"fully": 9, "somewhat": 3})) is None
+    assert (
+        ltp.decide_role_category(Counter({"fully": 11, "somewhat": 10})) == "fully"
+    ), "iki kategori de eşiği geçerse büyük olan kazanır"
+    assert (
+        ltp.decide_role_category(Counter({"fully": 10, "somewhat": 10})) is None
+    ), "eşitlik durumunda rol ATILIR, rastgele bir yöne yuvarlanmaz"
+    assert ltp.decide_role_category(Counter()) is None

@@ -244,11 +244,38 @@ yeni koşuyu sessizce karıştırırdı.
 hakeme sorulup rol düzeyinde tut/at kararı verilir (~180 çağrı). Bu daha kaba bir filtredir ve
 sonuçlarda böyle raporlanır.
 
-> **UYGULAMA DURUMU (2026-08-06):** Bu otomatik geri çekilme **kodda yok**. `06` uyum eşiğin
-> altındaysa çıkış kodu 1 ile durur ve operatöre iki gerçek seçeneği yazar: daha büyük bir
+> **UYGULAMA DURUMU (2026-08-06):** Bu otomatik geri çekilme **kodda yoktu**. `06` uyum eşiğin
+> altındaysa çıkış kodu 1 ile durur ve operatöre iki gerçek seçeneği yazardı: daha büyük bir
 > `--sample-size` ile tekrar koşmak (harcanan/kalan bütçeyi de basar) ya da `somewhat`
 > vektörleriyle devam edip probe'un güvenilmez olduğunu sonuçlarda açıkça raporlamak. Boşluk
 > bilinçli olarak açık bırakıldı ve proje sahibine ayrıca bildirildi.
+>
+> **GÜNCELLEME (2026-08-07) — geri çekilme fiilen tetiklendi:** Probe pass'i gerçek gateway'e
+> karşı koştu: 240 gönderim harcandı, 120 rolün tamamını kapsayan 2.000 hakem etiketi
+> (`data/probe_labels.json`, rol başına ~17) toplandı. Probe **%63,5 held-out uyumla** (eşik %85,
+> çoğunluk-sınıf tabanı %53,8) reddedildi — eğitim uyumu da yalnızca %69,4 idi (6 puanlık fark),
+> yani darboğaz etiket SAYISI değil etiket GÜRÜLTÜSÜydü (rol, etiketlerin varyansının %75,6'sını
+> açıklıyor; soru yalnızca %55,4'ünü — `bard`/`bohemian` 17/17 neredeyse oybirliği, `survivor`
+> 6/4/6 üç kategoriye neredeyse eşit dağılmış).
+>
+> Spec'in yukarıdaki ~180 çağrılık geri çekilme planı **gereksiz** çıktı: rol başına ~17 hakem
+> etiketi zaten diskte ve zaten ödendi, YENİ bir örneklem sormaya gerek yok. `06 --role-level-fallback`
+> bu var olan etiketlerden, hiçbir yeni gateway çağrısı yapmadan, rol düzeyinde **>=10 kuralıyla**
+> (aşağıdaki "en az 10 yanıt" kuralının YANIT düzeyinden ROL düzeyine taşınmış hâli — bkz.
+> `scripts/06_label_and_train_probe.py::decide_role_category`) `role_expression.json` türetir.
+> Gerçek sonuç: **55 rol fully, 38 somewhat, 3 no, 24 rol atıldı** (120'den 96'sı kaldı — atılan 24
+> rol hiçbir kategoride 10 etiketi bulamayan, genuinely tartışmalı rollerdir; fail-closed: "belirsiz"
+> "tut" değil "atla" demektir).
+>
+> **Bilinen uyumsuzluk (çözülmedi, bilinçli):** `07_extract_axis.py`'nin sayı+kapsama kontrolü
+> (bkz. Aşama 3 altındaki paragraf) bu fallback artefaktını **REDDEDİYOR**: atılan 24 rolün
+> satırları `expression`'da hiç yok (11.520 anahtar, `activations_index.json`'da 14.400 rol
+> satırı) ve bu kontrol TAM OLARAK bunu yakalamak için var — stale bir `role_expression.json`'u
+> farklı bir rol kümesinden ayırt etmek. `07` **bilerek değiştirilmedi**: gerçek bir stale artefaktla
+> bilinçli bir rol atma kararını ayırt etmek ayrı, kasıtlı bir tasarım kararı gerektirir, bu görev
+> kapsamında yapılmadı. Sonuç: `role_expression.json` rol düzeyinde geri çekilmeyle üretilebiliyor
+> ama Aşama 3'e şu an GEÇEMİYOR — proje sahibine bildirildi, ayrıntı
+> `.superpowers/sdd/p2-fallback-report.md`.
 
 `role_expression.json`, üretildiği rollout kümesinin içerikten türetilen `run_id`'sini taşır;
 Aşama 3 bunun `activations_index.json`'daki kimlikle **eşit olmasını şart koşar**. Aksi hâlde
@@ -465,6 +492,7 @@ Hepsi bilinçli ve gerekçelidir; sonuç raporunda bu tabloyla birlikte sunulur.
 | 7 | Steering normu LMSYS-CHAT-1M'den | Kendi default Assistant rollout'larımızdan | LMSYS elde yok |
 | 8 | Base model deneyleri (Bölüm 3.2.2), trait uzayı (Ek C) | Yok | Kapsam dışı — bkz. Bölüm 11 |
 | 9 | Hakem kapısı **insan** etiketiyle doğrulanır (makale: 200 örnek, %91.6 insan uyumu) | 45 örnek, **model** (ikinci bir model) etiketiyle, %77.8 | Operatörün kararı (2026-08-07). Ölçülen şey iki LLM arası uyum; insan-model uyumu değil. İki dil modeli aynı hataya birlikte düşebilir. Ayrıntılı künye `data/judge_gate.json` → `human_labels_provenance` |
+| 10 | (spec'in kendi ilk varsayımı) Probe reddedilirse rol başına 15 rollout hakeme sor, rol düzeyinde tut/at (**~180 YENİ çağrı**) | `--role-level-fallback`: aynı >=10 kuralı, ama VAR OLAN 2k hakem etiketinden (rol başına ~17), **0 yeni çağrı** | Etiketler probe eğitimi için zaten toplanmış ve ödenmişti (240 gönderim) — response-level bir örneklem daha sormak parayı ikinci kez harcamak olurdu. Fiilen tetiklendi (2026-08-07): probe %63,5 uyumla reddedildi (eşik %85), fallback 55 fully / 38 somewhat / 3 no / 24 atık verdi. Ayrıntı: Aşama 2 altındaki güncelleme kutusu, `.superpowers/sdd/p2-fallback-report.md` |
 
 **Aşama 0.5'in sonucu ve bir uyarı.** Kapı %77.8 ile geçti (eşik %75, 45'te 35). Uyuşmazlık rastgele değil:
 10 uyuşmazlığın 9'u aynı yönde (`hakem=2, etiketleyici=3`) ve **engineer / examiner / prophet** rollerinde

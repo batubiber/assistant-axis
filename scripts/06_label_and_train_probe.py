@@ -5,13 +5,22 @@ Kullanım:
     uv run python scripts/06_label_and_train_probe.py --dry-run
     uv run --extra ml python scripts/06_label_and_train_probe.py
     uv run --extra ml python scripts/06_label_and_train_probe.py --allow-pilot  # bilinçli pilot
+    uv run python scripts/06_label_and_train_probe.py --role-level-fallback  # probe reddedildiyse
 
 ÇIKIŞ KODLARI:
-    0  probe güvenilir, role_expression.json yazıldı
+    0  probe güvenilir, role_expression.json yazıldı (--role-level-fallback ile:
+       rol düzeyi geri çekilme başarıyla yazıldı — bu da geçerli bir "0")
     1  BULGU: probe held-out uyumu eşiğin altında — güvenilmez, geri çekilme
        kuralı devreye girer (bu bir ÖLÇÜM sonucudur, bir çalıştırma hatası değil)
     2  koşulamadı: ön koşul/kurulum hatası, bütçe, gateway, --dry-run planı
-       kalan bütçeye sığmıyor, rollouts.jsonl eksik/bozuk/PİLOT (--allow-pilot yoksa)
+       kalan bütçeye sığmıyor, rollouts.jsonl eksik/bozuk/PİLOT (--allow-pilot yoksa),
+       ya da --role-level-fallback için data/probe_labels.json eksik/bozuk
+
+`--role-level-fallback`: spec'in Bölüm 5/Aşama 2 geri çekilme kuralı ("probe
+reddedilirse rol düzeyinde tut/at filtresine dön") artık probe'u KOŞMADAN,
+`data/probe_labels.json`'daki VAR OLAN hakem etiketlerinden türetilebilir —
+bu etiketler zaten toplandı ve zaten ödendi, yeni hiçbir gateway çağrısı
+gerekmez. Bkz. `run_role_level_fallback()`.
 
 `05_capture_activations.py` ile aynı `--allow-pilot` deseni: `rollouts.jsonl`
 `04`'ün bir `--limit` koşusundan geliyorsa (`rollouts_meta.json` künyesi
@@ -28,7 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from aax import config
 from aax.gateway import BudgetExceeded, CircuitOpen, GatewayError, build_default_client
@@ -39,7 +48,7 @@ from aax.judge import (
     build_role_score_prompts,
     score_role_expression,
 )
-from aax.probe import RoleExpressionProbe, embed_answers, stratified_sample
+from aax.probe import FALLBACK_THRESHOLD, RoleExpressionProbe, embed_answers, stratified_sample
 from aax.prompts import load_role_catalog
 from aax.rollouts import load_rollouts_meta, read_rollouts, rollouts_run_id
 
@@ -58,6 +67,161 @@ def collapse(score: int) -> str:
     if score in (0, 1):
         return "no"
     raise ValueError(f"Puan 0-3 aralığı dışında: {score!r}")
+
+
+# --- rol düzeyi geri çekilme (spec Bölüm 5/Aşama 2, Bölüm 9) -------------------
+#
+# Spec'in geri çekilme kuralı YANIT başına 15 rollout'u hakeme sorup rol
+# düzeyinde tut/at kararı vermeyi varsayıyordu (~180 YENİ çağrı). Gerçekte
+# probe zaten 2.000 hakem etiketiyle (rol başına ~17) eğitildi ve %63,5
+# held-out uyumla (eşik %85) reddedildi — bu etiketler ZATEN diskte
+# (`data/probe_labels.json`) ve ZATEN ödendi (240 gönderim). Aşağıdaki yol
+# hiçbir YENİ gateway çağrısı yapmadan aynı geri çekilme kararını bu var olan
+# etiketlerden türetir.
+#
+# Eşik BİLEREK 10: `aax.axis.role_vectors`'ın `min_responses` parametresiyle
+# VE makalenin Bölüm 2.1.2'sindeki "bir kategori en az on yanıt içermiyorsa o
+# vektör hesaplanmaz" kuralıyla AYNI sayı. Makale bu kuralı YANIT düzeyinde
+# (bir rolün "fully" YANITLARI >=10 mu) uyguluyor; burada aynı sayı ROL
+# düzeyine taşınıyor (bir rolün "fully" ETİKETLERİ >=10 mu). İki farklı
+# yerde iki farklı taban icat etmemek için sayı kasıtlı olarak paylaşılıyor.
+ROLE_LEVEL_FALLBACK_MIN_LABELS = 10
+
+# Probe'un GERÇEK üretim koşusunda ÖLÇÜLEN held-out uyumu (bkz. bu koşunun
+# ürettiği `data/probe_labels.json`, 2026-08-07). `--role-level-fallback`
+# probe'u TEKRAR EĞİTMEZ — bu sayı bu yüzden burada SABİT bir KAYIT olarak
+# durur, canlı hesaplanmaz. Yalnızca raporlama içindir: "neden fallback'e
+# gidildi" sorusunun cevabı `role_expression.json`'un içinde açıkça dursun.
+# Probe gerçekten yeniden eğitilip güvenilir bulunursa (bkz.
+# `RoleExpressionProbe.is_trustworthy`) bu script normal yoldan devam eder
+# ve bu sabite hiç bakılmaz.
+MEASURED_PROBE_HOLDOUT_AGREEMENT = 0.635
+
+
+def decide_role_category(
+    counts: "Counter[str]", *, threshold: int = ROLE_LEVEL_FALLBACK_MIN_LABELS
+) -> str | None:
+    """Bir rolün üç kategoriden hangisine (ya da HİÇBİRİNE) atanacağına karar ver.
+
+    Kural: bir rol, kategorilerinden biri en az `threshold` etiket topladıysa
+    o kategoriye atanır. Hiçbir kategori eşiği geçmezse rol ATILIR (`None`
+    döner) — bu BİLEREK fail-closed'dır: "belirsiz" demek "tut" değil "atla"
+    demektir; bu satırlar genuinely tartışmalı rollerdir (bkz. modül üstü
+    tanı: `survivor` 6/4/6 gibi üç kategoriye neredeyse eşit dağılmış).
+
+    Birden fazla kategori eşiği AYNI ANDA geçerse (yalnızca bir rolün
+    `2 * threshold`'dan fazla etiketi varsa mümkün — bu veri setinde rol
+    başına ~17 etiketle pratikte olmaz) büyük olan kazanır; sayılar da
+    eşitse rol yine ATILIR — ortada kalan bir rolü rastgele bir yöne
+    yuvarlamak yerine.
+    """
+    qualifying = [category for category, n in counts.items() if n >= threshold]
+    if not qualifying:
+        return None
+    best = max(counts[category] for category in qualifying)
+    winners = [category for category in qualifying if counts[category] == best]
+    if len(winners) != 1:
+        return None
+    return winners[0]
+
+
+def run_role_level_fallback(records: list[dict], role_rows: list[int]) -> int:
+    """Probe'u tamamen atla; `role_expression.json`'ı VAR OLAN hakem
+    etiketlerinden (`data/probe_labels.json`) rol düzeyinde türet.
+
+    Hiçbir embedding çağrısı yapılmaz (`embed_answers` hiç çağrılmaz),
+    hiçbir gateway istemcisi kurulmaz (`build_default_client` hiç
+    çağrılmaz) — bu fonksiyon YALNIZCA yerel dosya okur/yazar, ağa hiç
+    çıkmaz.
+    """
+    try:
+        raw_labels = LABELS_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print(
+            f"BAŞARISIZ: {LABELS_PATH} yok.\n"
+            "  --role-level-fallback VAR OLAN hakem etiketlerini kullanır, yeni "
+            "üretmez. Önce (bayraksız) bir koşu ile en az bir kez hakem etiketi "
+            "toplanmış olmalı — bu script probe reddedilse bile etiketleri "
+            "probe eğitiminden ÖNCE diske yazar.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        labels_payload = json.loads(raw_labels)
+        judge_labels: dict[str, str] = labels_payload["labels"]
+    except (ValueError, KeyError) as exc:
+        print(
+            f"BAŞARISIZ: {LABELS_PATH} bozuk veya 'labels' anahtarı yok.\n"
+            f"  Ayrıntı: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
+    role_of_row = {row: records[row]["role"] for row in role_rows}
+
+    counts_by_role: dict[str, Counter] = defaultdict(Counter)
+    for row_str, category in judge_labels.items():
+        role = role_of_row.get(int(row_str))
+        if role is None:
+            # Etiket "role" türünde olmayan (ya da artık mevcut rollouts.jsonl'da
+            # bulunmayan) bir satırı işaret ediyor — role_expression.json yalnızca
+            # rol satırlarını kapsar, bu etiket sessizce dışarıda bırakılır.
+            continue
+        counts_by_role[role][category] += 1
+
+    distinct_roles = sorted({role_of_row[row] for row in role_rows})
+    role_category: dict[str, str | None] = {
+        role: decide_role_category(counts_by_role.get(role, Counter()))
+        for role in distinct_roles
+    }
+    dropped_roles = sorted(role for role, category in role_category.items() if category is None)
+
+    # Atılan rollerin satırları sözlükte HİÇ yer almaz (fail-closed'ın yazılı
+    # hâli) — `labels.get(row, pred)` gibi bir varsayılana (ör. "no") DÜŞMEK
+    # yerine anahtarın kendisi yok. `07_extract_axis.py`'nin kapsama kontrolü
+    # bunu nasıl ele aldığı script docstring'inde ve proje raporunda ayrıca
+    # belgelenir.
+    expression = {
+        str(row): role_category[role_of_row[row]]
+        for row in role_rows
+        if role_category[role_of_row[row]] is not None
+    }
+    assigned_counts = Counter(
+        category for category in role_category.values() if category is not None
+    )
+
+    OUT_PATH.write_text(
+        json.dumps(
+            {
+                # `07_extract_axis.py`'nin `activations_index.json`'la eşit
+                # olmasını şart koştuğu AYNI kimlik alanı — bkz. normal (probe)
+                # yoldaki `run_id` yorumunun tamamı, burada da geçerli.
+                "run_id": rollouts_run_id(records),
+                "method": "role_level_fallback",
+                "fallback_threshold": ROLE_LEVEL_FALLBACK_MIN_LABELS,
+                "fallback_label_source": "existing_probe_labels_zero_new_gateway_calls",
+                "probe_holdout_agreement": MEASURED_PROBE_HOLDOUT_AGREEMENT,
+                "probe_threshold": FALLBACK_THRESHOLD,
+                "n_roles_fully": assigned_counts.get("fully", 0),
+                "n_roles_somewhat": assigned_counts.get("somewhat", 0),
+                "n_roles_no": assigned_counts.get("no", 0),
+                "n_roles_dropped": len(dropped_roles),
+                "dropped_roles": dropped_roles,
+                "n_rollouts_covered": len(expression),
+                "expression": expression,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    print(f"Yazıldı: {OUT_PATH} (yöntem: rol düzeyi geri çekilme, yeni gateway çağrısı: 0)")
+    print(
+        f"Roller: fully={assigned_counts.get('fully', 0)} "
+        f"somewhat={assigned_counts.get('somewhat', 0)} "
+        f"no={assigned_counts.get('no', 0)} atıldı={len(dropped_roles)}"
+    )
+    print(f"Kapsanan rollout satırı: {len(expression)}/{len(role_rows)}")
+    return 0
 
 
 def run_dry_run(client, by_role: dict[str, list[int]], records: list[dict], catalog: dict) -> int:
@@ -145,6 +309,17 @@ def main(argv: list[str] | None = None) -> int:
             "(05_capture_activations.py'nin --allow-pilot'ıyla aynı bilinçli geçersiz kılma)"
         ),
     )
+    parser.add_argument(
+        "--role-level-fallback",
+        action="store_true",
+        help=(
+            "probe'u tamamen atla; role_expression.json'ı VAR OLAN hakem "
+            "etiketlerinden (data/probe_labels.json) rol düzeyinde >=10 kuralıyla "
+            "türet — hiçbir yeni gateway çağrısı yapılmaz, hiçbir embedding "
+            "hesaplanmaz (spec Bölüm 5/Aşama 2'nin geri çekilme kuralı, yanıt "
+            "düzeyinden rol düzeyine taşınmış; bkz. run_role_level_fallback())"
+        ),
+    )
     args = parser.parse_args(argv)
 
     rollouts_path = config.DATA_DIR / "rollouts.jsonl"
@@ -187,6 +362,16 @@ def main(argv: list[str] | None = None) -> int:
 
     role_rows = [i for i, r in enumerate(records) if r["kind"] == "role"]
     role_records = [records[i] for i in role_rows]
+
+    # `--role-level-fallback`: probe'a hiç girmeden, örnekleme/katalog/gateway
+    # istemcisi kurulmadan doğrudan dön. Bu kontrol BİLEREK burada — meta/pilot
+    # doğrulaması (yukarıda) her iki yolda da geçerli kalsın diye ONDAN SONRA,
+    # ama `stratified_sample`/`load_role_catalog`/`build_default_client`'tan
+    # (aşağıda) ÖNCE: bu üçü probe yoluna özgüdür, fallback hiçbirine ihtiyaç
+    # duymaz ve testin "no embedding call, no gateway client use" koşulu bunu
+    # gerektirir.
+    if args.role_level_fallback:
+        return run_role_level_fallback(records, role_rows)
 
     # Kurulum aşamasındaki her hata `build_default_client()` çevresindeki
     # sarmalayıcıyla aynı desende ele alınır: çıplak bir traceback yerine
@@ -319,22 +504,41 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Probe held-out uyumu: {probe.holdout_agreement:.1%} (eşik %85)")
 
     if not probe.is_trustworthy:
+        # Bulgu: bu mesaj `client.sends_made` (istemci başına, SÜREÇ İÇİ bir
+        # sayaç — bkz. `aax/gateway.py`'nin `sends_made` yorumu) okuyordu.
+        # Etiketleme geçişi kesintiye uğrayıp CACHE'TEN devam ettirildiğinde
+        # (ör. bir önceki süreç 240 gerçek gönderim yaptı, bu süreç TAMAMI
+        # cache'ten okuyup sıfır YENİ gönderim yaptı) bu sayaç 0'da kalır —
+        # operatöre "bu koşuda 0 gönderim harcandı" der, oysa GERÇEKTE bu
+        # etiket kümesini üretmek 240 gönderime mal olmuştu (ölçüldü: disk
+        # bütçesi 1369 -> 1129). `client.sends_made` SÜREÇ YENİDEN
+        # BAŞLADIĞINDA sıfırlanır; disk bütçesi (`remaining_budget`) ise
+        # süreçler arası kalıcıdır ve bu aşamaya (STAGE) harcanan GERÇEK
+        # toplamı verir. Aşağıdaki "harcanan" artık AYNI disk okumasından
+        # (`stage_cap - stage_remaining`) türetiliyor — "kalan" satırının
+        # zaten kullandığı kaynakla tutarlı.
+        stage_remaining, global_remaining = client.remaining_budget(STAGE)
+        stage_cap = config.STAGE_BUDGETS[STAGE]
+        spent_this_stage = stage_cap - stage_remaining
         print(
             f"PROBE GÜVENİLİR DEĞİL: held-out uyum %{probe.holdout_agreement * 100:.1f}, "
             "eşik %85.\n"
             "  Spec'in geri çekilme kuralı (Bölüm 5, Aşama 2) rol düzeyinde tut/at "
             "filtresine dönmeyi söyler: rol başına 15 rollout hakeme sorulur (~180 çağrı).\n"
             "  BU OTOMATİK GERİ ÇEKİLME UYGULANMADI — bu script onu koşmaz, elle bir "
-            "karar gerekir. İki seçenek var:\n"
+            "karar gerekir. Üç seçenek var:\n"
             "    1) Daha büyük bir --sample-size ile tekrar koş: probe'un uyumu çoğunlukla "
             "etiket sayısıyla sınırlıdır. Bunun bütçe maliyeti aşağıdaki KALAN'a "
             "sığmalıdır.\n"
             "    2) 'somewhat' vektörleriyle devam et (spec Bölüm 9'un '<40 rol' çıkış "
             "yolu) ve probe'un güvenilmez olduğunu sonuçlarda AÇIKÇA raporla.\n"
-            f"  Bu koşuda harcanan: {client.sends_made} gönderim "
-            f"(aşama tavanı {config.STAGE_BUDGETS[STAGE]}); "
-            f"aşamada kalan: {client.remaining_budget(STAGE)[0]}, "
-            f"global kalan: {client.remaining_budget(STAGE)[1]}.\n"
+            "    3) --role-level-fallback ile VAR OLAN hakem etiketlerinden (yeni "
+            "gateway çağrısı OLMADAN) rol düzeyinde tut/at kararına geç — bu etiketler "
+            f"({LABELS_PATH}) zaten toplandı, zaten ödendi.\n"
+            f"  Bu koşuda harcanan: {spent_this_stage} gönderim "
+            f"(aşama tavanı {stage_cap}); "
+            f"aşamada kalan: {stage_remaining}, "
+            f"global kalan: {global_remaining}.\n"
             f"  Hakem etiketleri {LABELS_PATH} içinde duruyor — tekrar koşuda cache'ten "
             "gelirler, aynı örnekler ikinci kez ücretlendirilmez.",
             file=sys.stderr,

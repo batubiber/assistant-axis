@@ -3275,6 +3275,32 @@ Fix Round 1 (Bulgu 1/2/Minor) ayrı bir takip commit'idir — değişen dosyalar
 `tests/test_label_and_train_probe.py` (yeni). Ayrıntı: p2-task-6-report.md,
 Fix Round 1.
 
+**Fix Round 2 (2026-08-07) — probe reddedildi, rol düzeyi geri çekilme
+eklendi.** Probe gerçek gateway'e karşı koştu: 240 gönderim, 2.000 hakem
+etiketi, **%63,5 held-out uyum** (eşik %85) — reddedildi. Yukarıdaki
+Step 1-7'nin planladığı ~180 çağrılık geri çekilme (spec Bölüm 5/Aşama 2)
+GEREKSİZ çıktı: rol başına ~17 hakem etiketi zaten diskte ve zaten ödendi.
+`scripts/06_label_and_train_probe.py`'ye `--role-level-fallback` bayrağı
+eklendi: probe'u (embedding + gateway istemcisi dahil) TAMAMEN atlayıp
+`data/probe_labels.json`'daki var olan etiketlerden, rol düzeyinde >=10
+kuralıyla (`aax.axis.role_vectors`'ın `min_responses`'ıyla VE makalenin
+Bölüm 2.1.2'sindeki "en az on yanıt" kuralıyla aynı eşik, yanıt düzeyinden
+rol düzeyine taşınmış), **sıfır yeni gateway çağrısıyla**
+`role_expression.json` türetiyor. Ayrıca ayrı bir bulgu: probe reddedilme
+mesajı `client.sends_made` (istemci başına, süreç içi bir sayaç) okuyordu —
+etiketleme geçişi cache'ten devam ettirildiğinde bu sayaç yanlışlıkla 0
+gösterebiliyordu (ölçüldü: gerçek koşuda "0 gönderim" basıldı, disk bütçesi
+aslında 240 gönderim harcamıştı); mesaj artık disk bütçesinden
+(`stage_cap - stage_remaining`) türetilen gerçek sayıyı basıyor.
+
+Gerçek local veride doğrulanan sonuç: **55 rol fully, 38 somewhat, 3 no, 24
+rol atıldı** (120'den 96'sı kaldı). `07_extract_axis.py`'nin sayı+kapsama
+kontrolü bu artefaktı REDDEDİYOR (11.520 anahtar vs. 14.400 rol satırı) —
+`07` bilerek DEĞİŞTİRİLMEDİ, bkz. spec Bölüm 5/Aşama 2'deki "Bilinen
+uyumsuzluk" kutusu. Değişen dosyalar: `scripts/06_label_and_train_probe.py`,
+`tests/test_label_and_train_probe.py` (+9 test). Ayrıntı:
+`.superpowers/sdd/p2-fallback-report.md`.
+
 ---
 
 ### Task 7: Aşama 3 — eksen çıkarımı ve A kriteri
