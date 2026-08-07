@@ -1,0 +1,23 @@
+{
+  "what": "Pilot rollout cevaplarinin, ayni soruya sistem promptu OLMADAN verilen cevaba bge-m3 kosinus benzerligi.",
+  "why": "Asama 0.5 hakem kapisindaki sistematik uyusmazligi tanilamak icin yapildi. Eksen hesaplanmadan ONCE toplandi, dolayisiyla A kriteri sonucundan bagimsiz bir on sinyal.",
+  "model": "Qwen/Qwen3-1.7B",
+  "embedder": "BAAI/bge-m3",
+  "n_roles": 9,
+  "n_questions": 5,
+  "similarity_to_unprompted_default": {
+    "engineer": 0.8833,
+    "researcher": 0.857,
+    "analyst": 0.8326,
+    "examiner": 0.8187,
+    "trickster": 0.7575,
+    "prophet": 0.7535,
+    "bohemian": 0.7243,
+    "romantic": 0.7016,
+    "bard": 0.6781
+  },
+  "analytical_mean": 0.8479,
+  "theatrical_mean": 0.7154,
+  "finding": "Analitik roller (engineer/researcher/analyst/examiner) varsayilan asistana belirgin sekilde daha yakin; teatral roller (bard/romantic/bohemian/trickster) daha uzak. Bu siralama makalenin PC1 bulgusuyla ayni yonde (Tablo 1: Assistant ucunda evaluator/examiner/reviewer/analyst, diger ucta bard/ghost/bohemian/trickster) ve hicbir aktivasyona dokunmadan elde edildi.",
+  "caveat": "Embedding benzerligi, aktivasyon uzayindaki mesafenin vekili degildir. Bu bir on sinyaldir, A kriteri yerine gecmez."
+}
