@@ -464,6 +464,26 @@ Hepsi bilinçli ve gerekçelidir; sonuç raporunda bu tabloyla birlikte sunulur.
 | 6 | Gemma 2 27B, Qwen 3 32B, Llama 3.3 70B | Qwen3-1.7B | 8 GB VRAM |
 | 7 | Steering normu LMSYS-CHAT-1M'den | Kendi default Assistant rollout'larımızdan | LMSYS elde yok |
 | 8 | Base model deneyleri (Bölüm 3.2.2), trait uzayı (Ek C) | Yok | Kapsam dışı — bkz. Bölüm 11 |
+| 9 | Hakem kapısı **insan** etiketiyle doğrulanır (makale: 200 örnek, %91.6 insan uyumu) | 45 örnek, **model** (ikinci bir model) etiketiyle, %77.8 | Operatörün kararı (2026-08-07). Ölçülen şey iki LLM arası uyum; insan-model uyumu değil. İki dil modeli aynı hataya birlikte düşebilir. Ayrıntılı künye `data/judge_gate.json` → `human_labels_provenance` |
+
+**Aşama 0.5'in sonucu ve bir uyarı.** Kapı %77.8 ile geçti (eşik %75, 45'te 35). Uyuşmazlık rastgele değil:
+10 uyuşmazlığın 9'u aynı yönde (`hakem=2, etiketleyici=3`) ve **engineer / examiner / prophet** rollerinde
+toplanmış — yani modelin kişiliksiz, yapılandırılmış bir kayıtla cevap verdiği roller.
+
+Sonradan yapılan ölçüm hakemin okumasını destekliyor: bu tartışmalı cevapların, **sistem promptu olmadan**
+verilen cevaba embedding benzerliği 0.80-0.96 (bir kayıtta 0.956). Yani bu cevaplar varsayılan asistandan
+ayırt edilemiyor ve "rolü tam oynuyor" saymak, neredeyse-varsayılan aktivasyonları rol vektörüne sokardı —
+Assistant Axis `mean(default) − mean(fully rol vektörleri)` olduğu için kontrastı küçültürdü.
+
+Etiketler bu analizden **sonra düzeltilmedi**; düzeltilseydi uyum %97.8 çıkardı ama insan etiketini makineye
+göre ayarlamak ölçümü yok ederdi. Pratik sonuç: gerçek uyum muhtemelen %77.8'den **yüksek**, yani kapı
+olduğundan daha sıkı bir testi geçti.
+
+Aynı ölçüm beklenmedik bir yan bulgu verdi ve `results/pilot/baseline_distance.json`'a kaydedildi: rollerin
+varsayılan asistana yakınlık sıralaması (engineer 0.883 → bard 0.678), makalenin PC1 bulgusuyla aynı yönde
+(Tablo 1: Assistant ucunda evaluator/examiner/reviewer/analyst, diğer uçta bard/ghost/bohemian/trickster).
+Hiçbir aktivasyona dokunmadan, eksen hesaplanmadan önce elde edildi — A kriteri için bağımsız bir ön sinyal,
+ama yerine geçmez.
 
 ## 9. Riskler
 
