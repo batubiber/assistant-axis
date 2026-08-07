@@ -65,7 +65,7 @@ def _patch_paths(monkeypatch, tmp_path):
 def _write_dataset(
     tmp_path,
     *,
-    role_spec: list[tuple[str, str, int, float]],
+    role_spec: list[tuple[str, str | None, int, float]],
     n_default: int = 6,
     default_value: float = 7.0,
     n_layers: int = 2,
@@ -74,15 +74,25 @@ def _write_dataset(
     index_extra: dict | None = None,
     run_id: str | None = _RUN_ID,
     expression_run_id: str | None = _RUN_ID,
+    dropped_roles_override: list[str] | None = None,
+    method: str | None = None,
+    n_roles_dropped: int | None = None,
+    probe_holdout_agreement: float | None = None,
 ):
     """Sentetik aktivasyon + indeks + ifade haritası yaz.
 
     `role_spec`: (rol, kategori, satır sayısı, taban değer) listesi. Her rolün
     satırları d_model boyutunda `taban değer`e dayalı, katmanlar arası hafifçe
     farklı bir vektör alır — böylece katman başına eksen ayrı ayrı anlamlı olur.
+
+    `kategori` `None` olabilir: bu, `--role-level-fallback`'in ATTIĞI bir rolü
+    modeller — indeks satırları YAZILIR (kind="role") ama `expression`'da o
+    rolün HİÇBİR satırı görünmez, rol adı otomatik olarak yazılan
+    `dropped_roles` listesine eklenir (bkz. `run_role_level_fallback()`).
     """
     rows = []
     blocks = []
+    dropped_roles_auto: list[str] = []
     for role, category, count, value in role_spec:
         for _ in range(count):
             rows.append({"kind": "role", "role": role, "system_prompt": f"{role} ol"})
@@ -90,6 +100,8 @@ def _write_dataset(
         for layer in range(n_layers):
             block[:, layer, :] = [value, value / 2 + layer, -value]
         blocks.append(block)
+        if category is None:
+            dropped_roles_auto.append(role)
 
     default_block = np.zeros((n_default, n_layers, d_model), dtype=np.float32)
     for layer in range(n_layers):
@@ -119,16 +131,27 @@ def _write_dataset(
     expression: dict[str, str] = {}
     cursor = 0
     for _role, category, count, _value in role_spec:
-        for offset in range(count):
-            expression[str(cursor + offset)] = category
+        if category is not None:
+            for offset in range(count):
+                expression[str(cursor + offset)] = category
         cursor += count
     if expression_override is not None:
         expression = expression_override
+
+    payload: dict = {"run_id": expression_run_id, "expression": expression}
+    if method is not None:
+        payload["method"] = method
+    if dropped_roles_override is not None:
+        payload["dropped_roles"] = dropped_roles_override
+    elif dropped_roles_auto:
+        payload["dropped_roles"] = sorted(dropped_roles_auto)
+    if n_roles_dropped is not None:
+        payload["n_roles_dropped"] = n_roles_dropped
+    if probe_holdout_agreement is not None:
+        payload["probe_holdout_agreement"] = probe_holdout_agreement
+
     (tmp_path / "role_expression.json").write_text(
-        json.dumps(
-            {"run_id": expression_run_id, "expression": expression}, ensure_ascii=False
-        ),
-        encoding="utf-8",
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
     return acts, index, expression
 
@@ -294,12 +317,23 @@ def test_no_partial_artifact_when_a_late_numeric_step_raises(tmp_path, monkeypat
         assert not (tmp_path / "axis" / name).exists()
 
 
-# --- Bulgu 6: bayat role_expression.json ------------------------------------
+# --- Bulgu 6: bayat role_expression.json (+ rol düzeyi geri çekilmenin ------
+# BİLİNÇLİ olarak dışarıda bıraktığı roller) -----------------------------------
+#
+# `--role-level-fallback` (scripts/06_label_and_train_probe.py) hiçbir
+# kategoride >=10 etiket toplayamayan bir rolü ATAR: o rolün satırları
+# `expression`'da hiç görünmez, rol adı `dropped_roles`'a yazılır. Aşağıdaki
+# testler bunu "bayat artefakt" ile karıştırmadığını, ama aynı zamanda
+# `dropped_roles` beyanının kendisinin de doğrulandığını kanıtlıyor.
 
 
-def test_fails_when_expression_map_size_does_not_match_role_rows(tmp_path, monkeypatch, capsys):
-    """Farklı bir --limit ile üretilmiş eski harita sessizce kısmi hizasızlık
-    yaratırdı: eşleşmeyen her satır "no" sayılır."""
+def test_probe_path_without_dropped_roles_still_requires_full_coverage(
+    tmp_path, monkeypatch, capsys
+):
+    """`dropped_roles` alanı YOKSA (probe yolu) davranış eskisiyle birebir
+    aynı kalmalı: eksik HER anahtar bayatlık işaretidir, hiçbir rol muaf
+    değildir. Farklı bir --limit ile üretilmiş eski bir harita sessizce
+    kısmi hizasızlık yaratırdı."""
     _patch_paths(monkeypatch, tmp_path)
     _write_dataset(
         tmp_path,
@@ -311,12 +345,16 @@ def test_fails_when_expression_map_size_does_not_match_role_rows(tmp_path, monke
 
     captured = capsys.readouterr()
     assert "BAŞARISIZ" in captured.err
-    assert "10" in captured.err and "24" in captured.err
+    assert "14" in captured.err  # 24 rol satırından 10'u kapsandı, 14'ü eksik
+    assert "atılmamış" in captured.err
     assert "GEÇTİ" not in captured.out
 
 
-def test_fails_when_expression_keys_do_not_cover_role_rows(tmp_path, monkeypatch, capsys):
-    """Anahtar sayısı tutsa bile satır numaraları kaymış olabilir."""
+def test_fails_when_an_expression_entry_points_at_a_nonexistent_row(
+    tmp_path, monkeypatch, capsys
+):
+    """Anahtar sayısı tutsa bile satır numaraları kaymış olabilir — hiçbiri
+    indeksteki gerçek bir satıra karşılık gelmiyor."""
     _patch_paths(monkeypatch, tmp_path)
     _write_dataset(
         tmp_path,
@@ -328,7 +366,155 @@ def test_fails_when_expression_keys_do_not_cover_role_rows(tmp_path, monkeypatch
 
     captured = capsys.readouterr()
     assert "BAŞARISIZ" in captured.err
-    assert "kapsamıyor" in captured.err
+    assert "geçersiz" in captured.err
+    assert "24" in captured.err  # 24 anahtarın HEPSİ geçersiz
+    assert "GEÇTİ" not in captured.out
+
+
+def test_fails_when_an_expression_entry_points_at_a_non_role_row(tmp_path, monkeypatch, capsys):
+    """Anahtar gerçekten var olan bir satırı işaret ediyor ama o satır
+    'default' türünde — rol satırı DEĞİL. Var olmayan satırdan farklı ama
+    aynı hard-failure sınıfı."""
+    _patch_paths(monkeypatch, tmp_path)
+    _, index, _ = _write_dataset(
+        tmp_path, role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)]
+    )
+    default_row_index = next(i for i, r in enumerate(index["rows"]) if r["kind"] == "default")
+    payload = json.loads((tmp_path / "role_expression.json").read_text(encoding="utf-8"))
+    payload["expression"][str(default_row_index)] = "fully"
+    (tmp_path / "role_expression.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+    assert ea.main(_ARGS) == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "geçersiz" in captured.err
+    assert "GEÇTİ" not in captured.out
+
+
+def test_fails_when_a_non_dropped_role_row_is_missing_an_entry(tmp_path, monkeypatch, capsys):
+    """Fallback artefaktında bile ATILMAMIŞ bir rolün her satırı zorunludur —
+    yalnızca `dropped_roles`'ta adı geçen roller muaf. Burada 'b'nin son
+    satırı (23) eksik ama 'b' dropped_roles'ta değil: hâlâ hard failure."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[
+            ("a", "fully", 12, 1.0),
+            ("b", "fully", 12, 4.0),
+            ("dusuruldu", None, 5, 50.0),  # gerçekten atılmış rol, dokunulmuyor
+        ],
+    )
+    payload = json.loads((tmp_path / "role_expression.json").read_text(encoding="utf-8"))
+    assert payload["dropped_roles"] == ["dusuruldu"]  # ön koşul: otomatik yazıldı
+    del payload["expression"]["23"]
+    (tmp_path / "role_expression.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+    assert ea.main(_ARGS) == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "atılmamış 1 rol satırının" in captured.err
+    assert "23" in captured.err
+    assert "GEÇTİ" not in captured.out
+
+
+def test_fails_when_a_dropped_role_still_has_entries(tmp_path, monkeypatch, capsys):
+    """`dropped_roles` bir rolü ATILDI diye listeliyorsa o rolün HİÇBİR
+    satırı `expression`'da olmamalı — varsa artefakt kendi içinde
+    tutarsızdır (probe reddi öncesi bir role ait etiketler yanlışlıkla
+    sızmış olabilir)."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[
+            ("a", "fully", 12, 1.0),
+            ("b", "fully", 12, 4.0),
+            ("dusuruldu", None, 5, 50.0),
+        ],
+    )
+    payload = json.loads((tmp_path / "role_expression.json").read_text(encoding="utf-8"))
+    payload["expression"]["24"] = "fully"  # "dusuruldu"nun ilk satırına kaçak kayıt
+    (tmp_path / "role_expression.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+    assert ea.main(_ARGS) == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "dusuruldu" in captured.err
+    assert "atıldı" in captured.err
+    assert "GEÇTİ" not in captured.out
+
+
+def test_fails_when_a_dropped_role_name_is_not_in_the_catalog(tmp_path, monkeypatch, capsys):
+    """`dropped_roles`'ta adı geçen bir rol indeksin rol kataloğunda hiç
+    yoksa iki dosya farklı rol kümelerinden geliyor demektir."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+        dropped_roles_override=["hayalet"],
+    )
+
+    assert ea.main(_ARGS) == 2
+
+    captured = capsys.readouterr()
+    assert "BAŞARISIZ" in captured.err
+    assert "hayalet" in captured.err
+    assert "GEÇTİ" not in captured.out
+
+
+def test_role_level_fallback_artifact_with_dropped_roles_is_accepted(tmp_path, monkeypatch):
+    """Görevin tam senaryosu: gerçek fallback artefaktı gibi bazı roller
+    (bilerek) hiç kapsanmıyor ama geri kalan kapsama tam — kabul edilmeli,
+    atılan rol eksene hiç katkı vermemeli."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[
+            ("a", "fully", 12, 1.0),
+            ("b", "fully", 12, 4.0),
+            ("dusuruldu", None, 5, 50.0),
+        ],
+        method="role_level_fallback",
+        n_roles_dropped=1,
+        probe_holdout_agreement=0.635,
+    )
+
+    assert ea.main(_ARGS) in (0, 1)  # karar ne olursa olsun kabul edilmeli
+
+    names = json.loads((tmp_path / "axis" / "role_names.json").read_text(encoding="utf-8"))
+    assert "dusuruldu" not in names  # atılan rol hiç değerlendirilmedi
+
+    report = json.loads((tmp_path / "axis" / "criterion_a.json").read_text(encoding="utf-8"))
+    assert report["n_role_vectors"] == 2  # yalnızca a, b
+    assert report["role_expression_method"] == "role_level_fallback"
+    assert report["role_expression_n_roles_dropped"] == 1
+    assert report["role_expression_probe_holdout_agreement"] == pytest.approx(0.635)
+
+
+def test_criterion_a_records_probe_method_by_default(tmp_path, monkeypatch):
+    """`method` alanı YOKSA (probe yolu, bkz. 06'nın probe dalının
+    write_text'i) `criterion_a.json` bunu açıkça "probe" olarak kaydetmeli,
+    fallback'e özgü iki alan `None` kalmalı."""
+    _patch_paths(monkeypatch, tmp_path)
+    _write_dataset(
+        tmp_path,
+        role_spec=[("a", "fully", 12, 1.0), ("b", "fully", 12, 4.0)],
+    )
+
+    assert ea.main(_ARGS) in (0, 1)
+
+    report = json.loads((tmp_path / "axis" / "criterion_a.json").read_text(encoding="utf-8"))
+    assert report["role_expression_method"] == "probe"
+    assert report["role_expression_n_roles_dropped"] is None
+    assert report["role_expression_probe_holdout_agreement"] is None
 
 
 # --- Bulgu 5: n_components_for_70pct doyuma ulaşmamalı -----------------------

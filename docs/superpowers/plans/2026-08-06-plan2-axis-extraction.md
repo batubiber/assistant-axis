@@ -4558,7 +4558,7 @@ cd ~/assistant-axis && uv run --extra ml python scripts/07_extract_axis.py
 |------:|-------|----------|
 | **0** | **GEÇTİ** | A kriterinin İKİ koşulu da sağlandı → Plan 3 (Aşama 4-5: steering sweep ve persona drift) yazılabilir. |
 | **1** | **DÜŞTÜ** | A kriteri TAM olarak değerlendirildi ve sağlanmadı — bu da bir bilimsel sonuçtur: "Assistant Axis 1.7B ölçeğinde oluşmuyor". Eşik gevşetilmez. Llama-3.2-3B ile tekrarlamak veya çalışmayı burada sonlandırıp negatif bulguyu raporlamak arasında karar verilir. |
-| **2** | **BAŞARISIZ** | Bir karar DEĞİLDİR — girdi eksik/bayat/tanımsız (`role_expression.json` yok/bozuk, ifade haritası bayat, hiç `fully` yok, hiç `default` yok) YA DA sayısal bölümde bir `ValueError` (Fix Round 2: `contrast_axis`/`cosine`/`n_components_for_variance`'ın attığı HER `ValueError` — sıfır normlu kontrast, aktivasyonda NaN/inf — artık burada yakalanır; eskiden yakalanmayan bir `ValueError` yorumlayıcıyı çıkış 1 ile döndürüyordu, yani "DÜŞTÜ" ile AYIRT EDİLEMEZ bir çökme oluyordu). Veri düzeltilip tekrar koşulur; bu çıktı `criterion_a.json`'a yazılmaz (Fix Round 2: hiçbir artefakt de yazılmaz — hesaplama tamamlanmadan hiçbir `np.save`/`write_text` çağrılmaz). |
+| **2** | **BAŞARISIZ** | Bir karar DEĞİLDİR — girdi eksik/bayat/tanımsız (`role_expression.json` yok/bozuk, ifade haritası bayat, hiç `fully` yok, hiç `default` yok) YA DA sayısal bölümde bir `ValueError` (Fix Round 2: `contrast_axis`/`cosine`/`n_components_for_variance`'ın attığı HER `ValueError` — sıfır normlu kontrast, aktivasyonda NaN/inf — artık burada yakalanır; eskiden yakalanmayan bir `ValueError` yorumlayıcıyı çıkış 1 ile döndürüyordu, yani "DÜŞTÜ" ile AYIRT EDİLEMEZ bir çökme oluyordu). Veri düzeltilip tekrar koşulur; bu çıktı `criterion_a.json`'a yazılmaz (Fix Round 2: hiçbir artefakt de yazılmaz — hesaplama tamamlanmadan hiçbir `np.save`/`write_text` çağrılmaz). "İfade haritası bayat" artık İKİ ayrı şeyi kapsıyor: gerçek bir bayatlık (Fix Round 3'ten önceki tanım) VE `dropped_roles` beyanının kendisinin tutarsızlığı (bkz. Fix Round 3). |
 
 Fix Round 1 (Kritik 1/2, Bulgu 3/5/6, Minor) ayrı bir takip commit'idir — değişen dosyalar:
 `src/aax/axis.py`, `scripts/07_extract_axis.py`, `tests/test_axis.py`,
@@ -4570,6 +4570,42 @@ bellek, kullanılmayan `capsys`) ayrı bir takip commit'idir — değişen dosya
 `tests/test_axis.py`, `tests/test_extract_axis.py`, `tests/test_capture_activations.py`.
 Yukarıdaki kod blokları ve test sayıları bu tur sonrasının hâlini gösterir.
 Ayrıntı: p2-task-7-report.md, Fix Round 2.
+
+**Fix Round 3 (2026-08-07) — Bulgu 6'nın kapsama kontrolü `--role-level-fallback`'i
+tanır, gevşemez.** Task 6'nın Fix Round 2'sinde (bkz. yukarıda) ölçülen "Bilinen
+uyumsuzluk": `06 --role-level-fallback`'in ürettiği artefakt (55 fully, 38 somewhat,
+3 no, **24 rol atıldı** — 14.400 rol satırından 11.520'si kapsanıyor) `07`'nin eski
+sayı+kapsama kontrolünü (`len(expression) == len(role_idx)` VE her rol satırının
+karşılığı) geçemiyordu; kontrol bunu bayat bir `role_expression.json`'dan ayırt
+edemiyordu. Kontrol GEVŞETİLMEDİ — bunun yerine artefaktın kendi beyanını
+(`dropped_roles`) okuyacak şekilde DÖRT ayrı kontrole bölündü:
+
+1. `dropped_roles`'ta adı geçen HER rol indeksin rol kataloğunda gerçekten var
+   olmalı (yoksa reddedilir — iki dosya farklı rol kümelerinden geliyordur).
+2. `expression`'daki HER anahtar indekste GERÇEK bir rol satırına karşılık
+   gelmeli (var olmayan ya da 'default' türünde bir satırı işaret eden anahtar
+   reddedilir).
+3. `dropped_roles`'ta adı geçen bir rolün satırlarından HİÇBİRİ `expression`'da
+   olmamalı (varsa artefakt kendi içinde tutarsızdır — reddedilir).
+4. `dropped_roles`'ta adı GEÇMEYEN her rol satırının bir karşılığı olmalı — eski
+   kontrolün ta kendisi, yalnızca bilerek atılmış satırlar için muaf.
+
+`dropped_roles` alanı YOKSA (probe yolu — `06`'nın probe dalı bu alanı hiç
+yazmaz) davranış eskisiyle birebir aynı kalır: hiçbir rol muaf değildir, TAM
+kapsama şarttır. Atılan rollerin satırları eksen hesabına hiç girmez (`role_vectors`
+çağrısına yalnızca `expression`'da GERÇEKTEN karşılığı olan satırlar gider — ne "no"
+gibi bir varsayılana düşerler ne de ham satır olarak havuzlanırlar). Ayrıca
+`criterion_a.json` artık `role_expression_method` (`"probe"` / `"role_level_fallback"`,
+alan yoksa `"probe"` varsayılır), ve fallback ise `role_expression_n_roles_dropped`
+ile `role_expression_probe_holdout_agreement` alanlarını da taşıyor — hükmü okuyan
+biri kategorilerin daha kaba bir filtreden geldiğini `role_expression.json`'ı ayrıca
+açmadan görür. Değişen dosyalar: `scripts/07_extract_axis.py`,
+`tests/test_extract_axis.py` (+8 test, -2 eski test yeni davranışa göre yeniden
+yazıldı; 431→437 geçen test). **Gerçek koşuda doğrulandı (2026-08-07):** `07` artık
+fallback artefaktını kabul ediyor, 93 rol vektörü (55 fully + 38 somewhat) üretiyor,
+`cos(PC1, eksen)`=+0.943, default persentili=0.839 (top desil için gereken ≥0.9) —
+**A KRİTERİ DÜŞTÜ** (çıkış 1, gerçek bir bilimsel sonuç, çökme değil). Ayrıntı:
+`.superpowers/sdd/p2-coverage-fix-report.md`.
 
 ---
 

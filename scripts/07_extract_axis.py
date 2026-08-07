@@ -255,40 +255,128 @@ def _run(argv: list[str] | None) -> int:
         )
         return 2
 
-    # Bayatlık kontrolü: `expression.get(str(i), "no")` eşleşmeyen her satırı
-    # sessizce "no" sayar. Tek bir taze koşuda sorun değil, ama farklı bir
-    # --limit veya rol kümesiyle üretilmiş eski bir role_expression.json Aşama 1
-    # yeniden koşturulduktan sonra yerinde kalırsa fully/somewhat ayrımı kısmen
-    # kayar ve hiçbir hata vermez. İki ucuz kontrol bunu yakalar: anahtar sayısı
-    # ve anahtarların indeksteki rol satırlarını kapsaması.
-    if len(expression) != len(role_idx):
+    # Bayatlık kontrolünün kapsama kısmı: `role_expression.json` iki farklı
+    # yöntemden gelebilir (bkz. `06_label_and_train_probe.py`'nin yazdığı
+    # "method" alanı). Probe yolu HER rol satırını kapsar — eksik bir anahtar
+    # orada her zaman bayatlık işaretidir. `--role-level-fallback` yolu ise
+    # BİLİNÇLİ olarak bazı rolleri hiç kapsamaz: hiçbir kategori >=10 etiket
+    # toplayamayan bir rol ATILIR (fail-closed) ve o rolün satırları
+    # `expression`'da hiç görünmez — bkz. `run_role_level_fallback()`'in
+    # üstündeki yorum. Artefaktın kendisi bu atılan rolleri `dropped_roles`
+    # alanında adıyla listeler; aşağıdaki kontroller bu beyanı okuyup
+    # "bilerek atıldı" ile "bayat/kaymış" durumunu ayırt eder.
+    #
+    # Alan YOKSA (ya da boşsa) "hiçbir rol atılmadı" demektir: probe yolunun
+    # TAM kapsama garantisi aynen sürer. Bu BİLEREK böyle — `dropped_roles`
+    # boş bir kümeyken aşağıdaki her kontrol eskisiyle birebir aynı sonucu
+    # üretir, yani "alan yok" durumu "kapsama kontrolsüz" DEĞİL "hiç rol
+    # atılmadı" anlamına gelir.
+    dropped_roles = set(expression_payload.get("dropped_roles") or [])
+
+    role_names_by_idx = {i: rows[i]["role"] for i in role_idx}
+    catalog_roles = set(role_names_by_idx.values())
+
+    # 1) `dropped_roles`'ta adı geçen HER rol gerçekten mevcut kataloğun
+    # (indeksteki rol satırlarının) içinde olmalı. Olmayan bir isim, iki
+    # dosyanın farklı rol kümelerinden geldiğinin işaretidir.
+    unknown_dropped = sorted(dropped_roles - catalog_roles)
+    if unknown_dropped:
         print(
-            "BAŞARISIZ: role_expression.json ile activations_index.json uyuşmuyor —\n"
-            f"  ifade haritasında {len(expression)} anahtar var, "
-            f"indekste {len(role_idx)} rol satırı.\n"
-            "  Olası neden: farklı bir --limit veya rol kümesiyle üretilmiş eski bir "
-            "role_expression.json, Aşama 1 yeniden koşturulduktan sonra yerinde kalmış.\n"
-            "  scripts/06_label_and_train_probe.py'yi güncel rollouts/aktivasyonlarla "
-            "yeniden çalıştırın.",
+            "BAŞARISIZ: role_expression.json'daki dropped_roles indeksin rol "
+            "kataloğunda olmayan isimler içeriyor —\n"
+            f"  {unknown_dropped}\n"
+            "  Bu iki dosya farklı rol kümelerinden geliyor demektir; "
+            "scripts/06_label_and_train_probe.py --role-level-fallback'i güncel "
+            "rollouts/aktivasyonlarla tekrar çalıştırıp dosyayı yeniden üretin.",
             file=sys.stderr,
         )
         return 2
-    missing = [i for i in role_idx if str(i) not in expression]
-    if missing:
+
+    # 2) `expression`'daki HER anahtar indekste GERÇEK bir rol satırına
+    # karşılık gelmeli. Var olmayan bir satırı (ör. eski bir --limit
+    # koşusundan kalma yüksek bir indeks) ya da rol OLMAYAN bir satırı (ör.
+    # bir 'default' satırı) işaret eden bir anahtar, iki dosyanın farklı
+    # koşulardan geldiğinin bir başka işaretidir.
+    role_idx_set = set(role_idx)
+    invalid_entries: list[str] = []
+    for key in expression:
+        try:
+            idx = int(key)
+        except (TypeError, ValueError):
+            invalid_entries.append(key)
+            continue
+        if idx not in role_idx_set:
+            invalid_entries.append(key)
+    if invalid_entries:
         print(
-            "BAŞARISIZ: role_expression.json indeksteki bazı rol satırlarını kapsamıyor —\n"
-            f"  {len(missing)} satırın karşılığı yok (ilk örnekler: {missing[:5]}).\n"
-            "  Anahtar sayısı tutsa bile satır numaraları kaymış: iki dosya farklı "
-            "koşulardan geliyor.\n"
+            "BAŞARISIZ: role_expression.json'da indeksteki gerçek bir rol satırına "
+            "karşılık gelmeyen anahtarlar var —\n"
+            f"  {len(invalid_entries)} anahtar geçersiz (ilk örnekler: "
+            f"{sorted(invalid_entries, key=str)[:5]}).\n"
+            "  Bu anahtarlar mevcut olmayan bir satırı ya da 'role' türünde olmayan "
+            "bir satırı (ör. 'default') işaret ediyor: iki dosya farklı koşulardan "
+            "geliyor.\n"
             "  scripts/06_label_and_train_probe.py'yi güncel rollouts/aktivasyonlarla "
             "yeniden çalıştırın.",
             file=sys.stderr,
         )
         return 2
 
-    categories = [expression[str(i)] for i in role_idx]
+    # 3) ATILDI denen (dropped_roles'ta adı geçen) bir rolün satırlarından
+    # HİÇBİRİ `expression`'da olmamalı. Varsa artefakt kendi içinde
+    # tutarsız: bir rol hem "hiçbir kategori eşiği geçemedi, atıldı" hem de
+    # "şu satırın kategorisi şu" diyemez.
+    dropped_with_entries = sorted(
+        {
+            role_names_by_idx[i]
+            for i in role_idx
+            if role_names_by_idx[i] in dropped_roles and str(i) in expression
+        }
+    )
+    if dropped_with_entries:
+        print(
+            "BAŞARISIZ: role_expression.json 'atıldı' dediği rollerden bazılarına "
+            "yine de kayıt taşıyor —\n"
+            f"  {dropped_with_entries}\n"
+            "  dropped_roles bir rolü ATILDI diye listeliyorsa o rolün HİÇBİR "
+            "satırı expression içinde olmamalı — artefakt kendi içinde tutarsız.\n"
+            "  scripts/06_label_and_train_probe.py --role-level-fallback'i tekrar "
+            "çalıştırıp dosyayı yeniden üretin.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # 4) ATILMAMIŞ (dropped_roles'ta adı GEÇMEYEN) her rol satırının bir
+    # karşılığı olmalı — eski kontrolün ta kendisi, yalnızca "bilerek
+    # atılmış" satırlar için muaf tutuluyor. `dropped_roles` boşsa (probe
+    # yolu) bu TÜM rol satırları için eskisiyle birebir aynı kontrol.
+    missing = [
+        i
+        for i in role_idx
+        if role_names_by_idx[i] not in dropped_roles and str(i) not in expression
+    ]
+    if missing:
+        print(
+            "BAŞARISIZ: role_expression.json ile activations_index.json uyuşmuyor —\n"
+            f"  atılmamış {len(missing)} rol satırının karşılığı yok "
+            f"(ilk örnekler: {missing[:5]}).\n"
+            "  Olası neden: farklı bir --limit veya rol kümesiyle üretilmiş eski bir "
+            "role_expression.json, Aşama 1 yeniden koşturulduktan sonra yerinde "
+            "kalmış — ya da dropped_roles listesi bu satırların rolünü kapsamıyor.\n"
+            "  scripts/06_label_and_train_probe.py'yi güncel rollouts/aktivasyonlarla "
+            "yeniden çalıştırın.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Atılan rollerin satırları BİLİNÇLİ olarak dışarıda bırakılır: bunlara
+    # "no" gibi bir varsayılan atamak (eskiden mümkün olan bir hata sınıfı),
+    # rol düzeyi geri çekilmenin fail-closed tasarımını burada sessizce
+    # bozardı — atılan bir rol "no" değil "hiç değerlendirilmedi" demektir.
+    covered_role_idx = [i for i in role_idx if str(i) in expression]
+    categories = [expression[str(i)] for i in covered_role_idx]
     vectors, names, vector_categories = role_vectors(
-        acts[role_idx], [rows[i]["role"] for i in role_idx], categories
+        acts[covered_role_idx], [rows[i]["role"] for i in covered_role_idx], categories
     )
     print(f"{len(names)} rol vektörü hesaplandı (>=10 yanıt kuralı sonrası)")
 
@@ -427,6 +515,29 @@ def _run(argv: list[str] | None) -> int:
         )
         return 2
 
+    # role_expression.json'ın YÖNTEM künyesi: kategoriler probe'tan mı yoksa
+    # rol düzeyi geri çekilmeden mi geldi? `06_label_and_train_probe.py`'nin
+    # probe yolu "method" alanı hiç yazmaz (bkz. `main()`'in dosya sonundaki
+    # write_text'i) — alan yoksa "probe" varsayılır, bu bilerek böyle: eski
+    # (probe döneminden kalma) bir role_expression.json de bu alanı taşımaz
+    # ve o da probe yoludur. `--role-level-fallback` ise "method":
+    # "role_level_fallback" yazar ve kaç rolün atıldığını (`n_roles_dropped`)
+    # ile atılmaya yol açan probe uyumunu (`probe_holdout_agreement`) aynı
+    # dosyaya gömer. Bu üçü aşağıda `criterion_a.json`'a da taşınır — hükmü
+    # okuyan biri kategorilerin daha kaba bir filtreden geldiğini role_
+    # expression.json'ı ayrıca açmadan görebilsin diye.
+    role_expression_method = expression_payload.get("method", "probe")
+    role_expression_n_roles_dropped = (
+        expression_payload.get("n_roles_dropped")
+        if role_expression_method == "role_level_fallback"
+        else None
+    )
+    role_expression_probe_holdout_agreement = (
+        expression_payload.get("probe_holdout_agreement")
+        if role_expression_method == "role_level_fallback"
+        else None
+    )
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     np.save(OUT_DIR / "assistant_axis.npy", axis_per_layer)
     np.save(OUT_DIR / "role_vectors.npy", vectors)
@@ -440,6 +551,9 @@ def _run(argv: list[str] | None) -> int:
                 # içerikten türetir.
                 "model": index.get("model"),
                 "run_id": index.get("run_id"),
+                "role_expression_method": role_expression_method,
+                "role_expression_n_roles_dropped": role_expression_n_roles_dropped,
+                "role_expression_probe_holdout_agreement": role_expression_probe_holdout_agreement,
                 "n_layers": int(acts.shape[1]),
                 "d_model": int(acts.shape[2]),
                 "middle_layer": middle,

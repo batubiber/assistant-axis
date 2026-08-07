@@ -267,15 +267,35 @@ sonuçlarda böyle raporlanır.
 > rol hiçbir kategoride 10 etiketi bulamayan, genuinely tartışmalı rollerdir; fail-closed: "belirsiz"
 > "tut" değil "atla" demektir).
 >
-> **Bilinen uyumsuzluk (çözülmedi, bilinçli):** `07_extract_axis.py`'nin sayı+kapsama kontrolü
-> (bkz. Aşama 3 altındaki paragraf) bu fallback artefaktını **REDDEDİYOR**: atılan 24 rolün
-> satırları `expression`'da hiç yok (11.520 anahtar, `activations_index.json`'da 14.400 rol
-> satırı) ve bu kontrol TAM OLARAK bunu yakalamak için var — stale bir `role_expression.json`'u
-> farklı bir rol kümesinden ayırt etmek. `07` **bilerek değiştirilmedi**: gerçek bir stale artefaktla
-> bilinçli bir rol atma kararını ayırt etmek ayrı, kasıtlı bir tasarım kararı gerektirir, bu görev
-> kapsamında yapılmadı. Sonuç: `role_expression.json` rol düzeyinde geri çekilmeyle üretilebiliyor
-> ama Aşama 3'e şu an GEÇEMİYOR — proje sahibine bildirildi, ayrıntı
-> `.superpowers/sdd/p2-fallback-report.md`.
+> **Uyumsuzluk çözüldü (2026-08-07) — `07`'nin kapsama kontrolü keskinleştirildi.**
+> `07_extract_axis.py`'nin sayı+kapsama kontrolü bu fallback artefaktını önce **REDDEDİYORDU**:
+> atılan 24 rolün satırları `expression`'da hiç yok (11.520 anahtar, `activations_index.json`'da
+> 14.400 rol satırı) ve eski kontrol bunu "bayat artefakt"tan ayırt edemiyordu. Kontrol GEVŞETİLMEDİ
+> — bunun yerine artefaktın kendi beyanını (`dropped_roles`) okuyacak şekilde keskinleştirildi:
+>
+> 1. `dropped_roles`'ta adı geçen HER rol, indeksin rol kataloğunda gerçekten var olmalı (yoksa
+>    iki dosya farklı rol kümelerinden geliyor demektir — reddedilir).
+> 2. `expression`'daki HER anahtar indekste GERÇEK bir rol satırına karşılık gelmeli (var olmayan
+>    bir satırı ya da bir 'default' satırını işaret eden anahtar reddedilir).
+> 3. `dropped_roles`'ta adı geçen bir rolün satırlarından HİÇBİRİ `expression`'da olmamalı (varsa
+>    artefakt kendi içinde tutarsızdır — reddedilir).
+> 4. `dropped_roles`'ta adı GEÇMEYEN her rol satırının bir karşılığı olmalı — bu, eski kontrolün
+>    ta kendisi, yalnızca bilerek atılmış satırlar için muaf.
+>
+> `dropped_roles` alanı YOKSA (probe yolu) davranış eskisiyle birebir aynı kalır: hiçbir rol muaf
+> değildir, kapsama TAM olmak zorundadır — alan yokluğu "kontrolsüz" değil "hiç rol atılmadı"
+> anlamına gelir. Atılan rollerin satırları eksen hesabına hiç girmez (ne "no" gibi bir varsayılana
+> düşer ne de ham satır olarak havuzlanır). `criterion_a.json` artık `role_expression_method`
+> (`"probe"` / `"role_level_fallback"`), ve fallback ise `role_expression_n_roles_dropped` ile
+> `role_expression_probe_holdout_agreement` alanlarını da taşıyor — hükmü okuyan biri kategorilerin
+> daha kaba bir filtreden geldiğini `role_expression.json`'ı ayrıca açmadan görür.
+>
+> **Gerçek koşu sonucu (2026-08-07):** `07` artık fallback artefaktını kabul ediyor — 93 rol
+> vektörü (55 fully + 38 somewhat), `cos(PC1, eksen)` orta katmanda **+0.943**, default persentili
+> **0.839** (top desil için gereken eşik ≥0.9). **A KRİTERİ DÜŞTÜ** (çıkış kodu 1): işaret doğru
+> yönde ama persentil eşiği ıskalıyor. Bu bir çökme/BAŞARISIZ değil, gerçek ve değerlendirilmiş bir
+> bilimsel sonuçtur. Ayrıntı: `.superpowers/sdd/p2-coverage-fix-report.md` (bkz. ayrıca önceki
+> `.superpowers/sdd/p2-fallback-report.md`).
 
 `role_expression.json`, üretildiği rollout kümesinin içerikten türetilen `run_id`'sini taşır;
 Aşama 3 bunun `activations_index.json`'daki kimlikle **eşit olmasını şart koşar**. Aksi hâlde
