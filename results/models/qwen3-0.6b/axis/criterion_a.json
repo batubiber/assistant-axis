@@ -9,7 +9,7 @@
   "run_id": "1d19a033540d649b",
   "role_expression_method": "role_level_fallback",
   "role_expression_n_roles_dropped": 33,
-  "role_expression_probe_holdout_agreement": 0.635,
+  "role_expression_probe_holdout_agreement": 0.6575,
   "n_layers": 28,
   "d_model": 1024,
   "middle_layer": 14,
