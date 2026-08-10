@@ -2730,6 +2730,7 @@ Hakeme 16.000 rollout sormak batch'li bile olsa ~1600 çağrı eder ve aşama b�
 - Create: `scripts/06_label_and_train_probe.py`
 - Test: `tests/test_probe.py`
 - Test (Fix Round 1): `tests/test_label_and_train_probe.py` — `06_label_and_train_probe.py`'nin karar mantığı (`collapse()`, `--dry-run` bütçe aritmetiği, kurulum-aşaması hata tanıları, `is_trustworthy` kapısı, verbatim etiket önceliği, tek geçişli embedding indekslemesi). 18 test.
+- Test (Fix Round 3, etiketleme dayanıklılığı, 2026-08-10): aynı dosyaya +14 test (37 → 51) — böl-ve-kurtar (`_label_batch`), etiketlenemeyen öğe muhasebesi, artımlı kalıcılık/yeniden yükleme, kurtarma sırasında bütçe aşımı, rapor eşiği. 450 → 464 test (ağaç geneli).
 
 **Interfaces:**
 - Consumes: `aax.judge.score_role_expression` (Plan 1), `aax.gateway` (Plan 1), `aax.rollouts.read_rollouts` (Task 5)
@@ -3300,6 +3301,53 @@ kontrolü bu artefaktı REDDEDİYOR (11.520 anahtar vs. 14.400 rol satırı) —
 uyumsuzluk" kutusu. Değişen dosyalar: `scripts/06_label_and_train_probe.py`,
 `tests/test_label_and_train_probe.py` (+9 test). Ayrıntı:
 `.superpowers/sdd/p2-fallback-report.md`.
+
+**Fix Round 3 (2026-08-10) — etiketleme geçişi dayanıklı hâle getirildi
+(sert blokaj).** İkinci hedef model (Qwen3-0.6B) için 2.000 rollout
+etiketlenirken koşu **1182/2000'de ölümcül şekilde durdu**:
+`BAŞARISIZ: Hakem yanıtı uzunluk uyuşmazlığı: 11 != 10` — hakem 10 öğelik bir
+batch için 11 skor döndürdü, `judge.score_role_expression`'ın sıkı
+doğrulaması bunu (doğru şekilde) reddetti. Üç ayrı kusur bu tek kötü yanıtı
+kurtarılamaz bir duruşa çeviriyordu: (1) etiketler yalnızca döngü TAMAMEN
+bitince diske yazılıyordu — 1.182 etiketin TAMAMI kayboldu; (2) tek bir kötü
+batch tüm geçişi düşürüyordu; (3) hakem `temperature=0` ile çalışıyor ve
+gateway cache'i payload'a göre anahtarlanıyor — bozuk yanıt CACHE'E
+YAZILMIŞTI, bu yüzden tekrar koşmak AYNI istisnayla AYNI noktada sonsuza dek
+tekrar ölüyordu, sıfır bütçe maliyetiyle ve sıfır ilerlemeyle.
+
+Üç düzeltme: **(a) artımlı kalıcılık** — `probe_labels.json` artık HER
+batch'ten (≤10 öğe) sonra `aax.rollouts.write_rollouts`'un temp-dosya +
+`os.replace` deseniyle ATOMİK yazılıyor (`save_labels`); bir sonraki koşu
+diskteki etiketleri yükleyip (`load_existing_labels`) o satırları TEKRAR
+sormuyor. **(b) batch-düzeyi kapsama** — `score_role_expression`'ın
+doğrulaması (uzunluk, tip, aralık — HİÇBİRİ değişmedi) bir `JudgeParseError`
+fırlattığında yeni `_label_batch()` koşuyu düşürmek yerine batch'i ÖNCE 2
+yarıya, bir yarı da başarısız olursa (tekrar yarılamadan) TEKİL öğelere
+bölerek KURTARIR. **(c) bölme, farklı bir payload ürettiği için farklı bir
+cache anahtarı üretir** (`GatewayClient._cache_key`, mesajlar+sıcaklık+
+max_tokens'ın sha256'sı) — bu yüzden basit bir retry'nin aksine hakemi
+GERÇEKTEN yeniden sorar, zehirlenmiş cache'teki yanıtı tekrarlamaz (bkz.
+`_label_batch`'in docstring'i). Kurtarma maliyeti SINIRLI: N=10 öğelik bir
+batch en kötü durumda 1 (tüm batch) + 2 (yarılar) + 10 (tekil öğeler) = 13
+gönderime mal olur. Tek başına bile ayrıştırılamayan bir öğe "etiketlenemedi"
+sayılır, `labels` sözlüğüne HİÇ girmez ve koşu devam eder —
+`--role-level-fallback`'ın `decide_role_category` >=10 kuralı bu yüzden
+ETKİLENMEZ (dedicated test: `test_unlabelled_items_do_not_count_toward_
+role_level_fallback_tally`). `BudgetExceeded`/`CircuitOpen`/`GatewayError`
+kurtarma sırasında bile FATAL kalır (`_label_batch` yalnızca
+`JudgeParseError`'ı yakalar) — o ana kadar toplanan HER ŞEY diske yazılıp
+koşu temiz durur.
+
+Koşu sonu artık dürüst bir rapor basıyor: etiketlenen/etiketlenemeyen
+sayısı, oranı, ve bölünüp kurtarılmaya çalışılan batch sayısı.
+Etiketlenemeyen oran **%2**'yi (`UNLABELLED_FRACTION_WARNING_THRESHOLD`)
+aşarsa BELİRGİN bir UYARI basılır — eşik gerçek olaydaki oranın (2.000
+öğede 1 batch'in 1 bozuk yanıtı, ~%0,05) çok üstünde ama "hakem belirli bir
+içerik sınıfını sistematik ayrıştıramıyor" sinyalini gürültüden ayıracak
+kadar sıkı seçildi; bu oranın kendisi ölçümün güvenilirliği hakkında bir
+BULGUdur. Değişen dosyalar: `scripts/06_label_and_train_probe.py`,
+`tests/test_label_and_train_probe.py` (+14 test, 37 → 51). Ayrıntı:
+`.superpowers/sdd/label-resilience-report.md`.
 
 ---
 

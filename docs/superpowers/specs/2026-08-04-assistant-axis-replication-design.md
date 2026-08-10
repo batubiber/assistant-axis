@@ -325,6 +325,32 @@ sonuçlarda böyle raporlanır.
 > yönde ama persentil eşiği ıskalıyor. Bu bir çökme/BAŞARISIZ değil, gerçek ve değerlendirilmiş bir
 > bilimsel sonuçtur. Ayrıntı: `.superpowers/sdd/p2-coverage-fix-report.md` (bkz. ayrıca önceki
 > `.superpowers/sdd/p2-fallback-report.md`).
+>
+> **Sert blokaj çözüldü (2026-08-10) — etiketleme geçişi dayanıklı hâle getirildi.** İkinci hedef
+> model (Qwen3-0.6B) için 2.000 rollout etiketlenirken koşu **1182/2000'de ölümcül şekilde durdu**:
+> hakem 10 öğelik bir batch için 11 skor döndürdü, `judge.score_role_expression`'ın sıkı
+> doğrulaması (DEĞİŞMEDİ — yanlış uzunluk/tip/aralık hâlâ reddedilir) bunu doğru şekilde reddetti.
+> Üç ayrı kusur bunu kurtarılamaz bir duruşa çeviriyordu: etiketler yalnızca döngü TAMAMEN bitince
+> diske yazılıyordu (1.182 etiketin tamamı kayboldu), tek bir kötü batch tüm geçişi düşürüyordu, ve
+> hakem `temperature=0` + payload-anahtarlı gateway cache'iyle çalıştığı için bozuk yanıt CACHE'E
+> YAZILMIŞTI — basit bir tekrar koşu AYNI istisnayla AYNI noktada sonsuza dek yeniden ölüyordu.
+>
+> Üç düzeltme: **artımlı kalıcılık** (`probe_labels.json` her batch'ten sonra atomik yazılır —
+> `aax.rollouts.write_rollouts`'un temp-dosya + `os.replace` deseni — bir sonraki koşu diskteki
+> etiketleri yükleyip o satırları tekrar sormaz); **batch-düzeyi kapsama** (bir `JudgeParseError`
+> artık koşuyu düşürmez — `_label_batch()` batch'i önce 2 yarıya, bir yarı da başarısız olursa
+> tekil öğelere bölerek kurtarmaya çalışır; bölme daha AZ öğe içerdiği için FARKLI bir payload,
+> dolayısıyla FARKLI bir cache anahtarı üretir — bu yüzden basit bir retry'nin aksine hakemi
+> GERÇEKTEN yeniden sorar); ve **sınırlı maliyet** (N=10 öğelik bir batch en kötü durumda
+> 1+2+10=13 gönderime mal olur). Tek başına bile ayrıştırılamayan bir öğe "etiketlenemedi" sayılır,
+> `labels` sözlüğüne HİÇ girmez ve koşu devam eder — aşağıdaki **en az 10 yanıt** kuralı bu yüzden
+> ETKİLENMEZ (etiketlenemeyen bir satır bir kategorinin sayacına hiç katkı yapmaz).
+> `BudgetExceeded`/`CircuitOpen`/`GatewayError` kurtarma sırasında bile FATAL kalır — o ana kadar
+> toplanan her şey diske yazılıp koşu temiz durur. Koşu sonu artık etiketlenen/etiketlenemeyen
+> sayısını ve oranını raporlar; oran **%2**'yi aşarsa (gerçek olaydaki ~%0,05'in çok üstünde, ama
+> sistematik bir hakem ayrıştırma bozukluğunu gürültüden ayıracak kadar sıkı) belirgin bir UYARI
+> basılır — bu oranın kendisi ölçümün güvenilirliği hakkında bir BULGUdur. Ayrıntı:
+> `.superpowers/sdd/label-resilience-report.md`.
 
 `role_expression.json`, üretildiği rollout kümesinin içerikten türetilen `run_id`'sini taşır;
 Aşama 3 bunun `activations_index.json`'daki kimlikle **eşit olmasını şart koşar**. Aksi hâlde
