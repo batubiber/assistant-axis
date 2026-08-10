@@ -17,10 +17,22 @@ Kullanım:
        ya da --role-level-fallback için data/probe_labels.json eksik/bozuk
 
 `--role-level-fallback`: spec'in Bölüm 5/Aşama 2 geri çekilme kuralı ("probe
-reddedilirse rol düzeyinde tut/at filtresine dön") artık probe'u KOŞMADAN,
-`data/probe_labels.json`'daki VAR OLAN hakem etiketlerinden türetilebilir —
-bu etiketler zaten toplandı ve zaten ödendi, yeni hiçbir gateway çağrısı
-gerekmez. Bkz. `run_role_level_fallback()`.
+reddedilirse rol düzeyinde tut/at filtresine dön") artık probe'u KATEGORİ
+KARARI için hiç KOŞMADAN, `data/probe_labels.json`'daki VAR OLAN hakem
+etiketlerinden türetilebilir — bu etiketler zaten toplandı ve zaten ödendi,
+yeni hiçbir gateway çağrısı gerekmez. Bkz. `run_role_level_fallback()`.
+
+Provenance düzeltmesi (2026-08-10; bkz.
+`.superpowers/sdd/probe-provenance-report.md`): `role_expression.json`'un
+`probe_holdout_agreement` alanı eskiden bir modelden diğerine SABİT bir
+değer taşıyordu (ilk hedef modelde ölçülüp koda gömülmüştü). Artık
+`--role-level-fallback` bu modelin KENDİ probe held-out uyumunu, YALNIZCA
+zaten etiketli (~2.000) yanıt üzerinde ayrı bir probe fit ederek ölçer
+(bkz. `_measure_fallback_probe_holdout_agreement()`) — bu fit >=10 kuralının
+kategori kararını ETKİLEMEZ, SADECE kaydı doğru model için doğru sayıyla
+doldurur. Ölçüm hâlâ SIFIR yeni gateway çağrısı yapar (embedding yerel,
+ağa çıkmaz); ölçülemezse alan SABİT bir başka değere düşmez, `null` olur ve
+`probe_holdout_agreement_provenance` kısa nedeni taşır.
 
 `05_capture_activations.py` ile aynı `--allow-pilot` deseni: `rollouts.jsonl`
 `04`'ün bir `--limit` koşusundan geliyorsa (`rollouts_meta.json` künyesi
@@ -261,15 +273,52 @@ def _label_batch(
 # yerde iki farklı taban icat etmemek için sayı kasıtlı olarak paylaşılıyor.
 ROLE_LEVEL_FALLBACK_MIN_LABELS = 10
 
-# Probe'un GERÇEK üretim koşusunda ÖLÇÜLEN held-out uyumu (bkz. bu koşunun
-# ürettiği `data/probe_labels.json`, 2026-08-07). `--role-level-fallback`
-# probe'u TEKRAR EĞİTMEZ — bu sayı bu yüzden burada SABİT bir KAYIT olarak
-# durur, canlı hesaplanmaz. Yalnızca raporlama içindir: "neden fallback'e
-# gidildi" sorusunun cevabı `role_expression.json`'un içinde açıkça dursun.
-# Probe gerçekten yeniden eğitilip güvenilir bulunursa (bkz.
-# `RoleExpressionProbe.is_trustworthy`) bu script normal yoldan devam eder
-# ve bu sabite hiç bakılmaz.
-MEASURED_PROBE_HOLDOUT_AGREEMENT = 0.635
+
+def _measure_fallback_probe_holdout_agreement(
+    records: list[dict],
+    role_of_row: dict[int, str],
+    judge_labels: dict[str, str],
+) -> tuple[float | None, str]:
+    """Bu modelin KENDİ probe held-out uyumunu ZATEN diskteki hakem
+    etiketlerinden ölç — SADECE `role_expression.json`'un provenance
+    kaydı içindir.
+
+    ÖNEMLİ: bu ölçüm `--role-level-fallback`'ın kategori kararını (>=10
+    kuralı, bkz. `run_role_level_fallback`/`decide_role_category`) HİÇ
+    ETKİLEMEZ — o karar bu fonksiyon hiç çağrılmasa da AYNI olurdu. Tek
+    amacı, "neden fallback'e gidildi" sorusunun cevabının bu modelin
+    GERÇEK ölçümü olması, başka bir modelden (ya da SABİT bir kayıttan)
+    ödünç alınmamasıdır — bkz. görev tanımı.
+
+    Yalnızca ZATEN etiketli (~2.000) yanıt embed edilir — TÜM ~14.400 rol
+    yanıtı DEĞİL — bu yüzden yerel GPU'da ~1 dakika sürer ve HİÇBİR
+    gateway çağrısı yapmaz (`embed_answers` yerel bir SentenceTransformer
+    modeli kullanır, `RoleExpressionProbe` yerel scikit-learn'dür; ikisi
+    de ağa çıkmaz).
+
+    Dönüş: `(uyum, not)`. Fit HERHANGİ bir nedenle (yetersiz etiket,
+    embedding hatası, eğitim hatası) başarısız olursa `(None, kısa_neden)`
+    döner — asla başka bir modelden ya da SABİT bir değerden ödünç
+    alınmaz.
+    """
+    valid = sorted(
+        (int(row_str), category)
+        for row_str, category in judge_labels.items()
+        if int(row_str) in role_of_row
+    )
+    if not valid:
+        return None, "etiketli rol satırı yok — probe eğitilemedi"
+
+    rows = [row for row, _ in valid]
+    categories = [category for _, category in valid]
+    answers = [records[row]["answer"] for row in rows]
+    try:
+        embeddings = embed_answers(answers)
+        probe = RoleExpressionProbe(seed=SEED)
+        probe.fit(embeddings, categories)
+    except Exception as exc:  # bilerek geniş: "herhangi bir nedenle" (görev tanımı)
+        return None, f"probe eğitimi başarısız: {exc}"
+    return probe.holdout_agreement, "measured_during_role_level_fallback_run"
 
 
 def decide_role_category(
@@ -300,13 +349,18 @@ def decide_role_category(
 
 
 def run_role_level_fallback(records: list[dict], role_rows: list[int]) -> int:
-    """Probe'u tamamen atla; `role_expression.json`'ı VAR OLAN hakem
-    etiketlerinden (`data/probe_labels.json`) rol düzeyinde türet.
+    """Probe'u KATEGORİ KARARI için tamamen atla; `role_expression.json`'ı
+    VAR OLAN hakem etiketlerinden (`data/probe_labels.json`) rol düzeyinde
+    türet.
 
-    Hiçbir embedding çağrısı yapılmaz (`embed_answers` hiç çağrılmaz),
-    hiçbir gateway istemcisi kurulmaz (`build_default_client` hiç
-    çağrılmaz) — bu fonksiyon YALNIZCA yerel dosya okur/yazar, ağa hiç
-    çıkmaz.
+    Hiçbir gateway istemcisi kurulmaz (`build_default_client` hiç
+    çağrılmaz) — bu fonksiyon ağa hiç çıkmaz. `embed_answers` YİNE DE bir
+    kez çağrılır (bkz. `_measure_fallback_probe_holdout_agreement`), ama
+    YALNIZCA zaten etiketli (~2.000) yanıt üzerinde ve YALNIZCA bu modelin
+    KENDİ probe held-out uyumunu `role_expression.json`'a doğru şekilde
+    kaydetmek için — bu ölçüm >=10 kuralının kategori kararını HİÇ
+    ETKİLEMEZ (o karar yukarıdaki `decide_role_category` çağrılarından,
+    yalnızca `judge_labels`'tan türer).
     """
     try:
         raw_labels = LABELS_PATH.read_text(encoding="utf-8")
@@ -364,6 +418,14 @@ def run_role_level_fallback(records: list[dict], role_rows: list[int]) -> int:
         category for category in role_category.values() if category is not None
     )
 
+    # Bu modelin KENDİ probe held-out uyumu — SABİT bir kayıt DEĞİL, bu koşuda
+    # ölçülür. Kategori kararını (yukarıdaki `role_category`) HİÇ etkilemez;
+    # yalnızca provenance kaydı içindir (bkz. `_measure_fallback_probe_
+    # holdout_agreement` docstring'i).
+    measured_holdout_agreement, holdout_agreement_provenance = (
+        _measure_fallback_probe_holdout_agreement(records, role_of_row, judge_labels)
+    )
+
     OUT_PATH.write_text(
         json.dumps(
             {
@@ -374,7 +436,14 @@ def run_role_level_fallback(records: list[dict], role_rows: list[int]) -> int:
                 "method": "role_level_fallback",
                 "fallback_threshold": ROLE_LEVEL_FALLBACK_MIN_LABELS,
                 "fallback_label_source": "existing_probe_labels_zero_new_gateway_calls",
-                "probe_holdout_agreement": MEASURED_PROBE_HOLDOUT_AGREEMENT,
+                "probe_holdout_agreement": measured_holdout_agreement,
+                # `probe_holdout_agreement` bu MODELİN kendi ölçümü mü, yoksa
+                # (ölçülemediyse) neden `null` olduğu — bir okuyucu bu sayıyı
+                # tam bir probe koşusunun (normal yoldaki `holdout_agreement`
+                # alanı) ürettiği sayıdan AYIRT edebilsin diye. Başarılı
+                # ölçümde her zaman "measured_during_role_level_fallback_run";
+                # başarısızlıkta kısa bir Türkçe neden.
+                "probe_holdout_agreement_provenance": holdout_agreement_provenance,
                 "probe_threshold": FALLBACK_THRESHOLD,
                 "n_roles_fully": assigned_counts.get("fully", 0),
                 "n_roles_somewhat": assigned_counts.get("somewhat", 0),

@@ -931,6 +931,7 @@ def test_unlabelled_items_do_not_count_toward_role_level_fallback_tally(tmp_path
     # yok — tıpkı `_label_batch`'in etiketlenemeyen bir satırı asla
     # `labels`'a EKLEMEMESİ gibi).
     _write_probe_labels(tmp_path / "probe_labels.json", {i: "fully" for i in range(9)})
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
 
     exit_code = ltp.main(["--role-level-fallback"])
 
@@ -1419,6 +1420,7 @@ def test_role_level_fallback_assigns_category_reaching_at_least_ten_labels(
         tmp_path / "probe_labels.json",
         {i: "fully" for i in range(10)} | {i: "no" for i in range(10, 12)},
     )
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
 
     exit_code = ltp.main(["--role-level-fallback"])
 
@@ -1445,6 +1447,7 @@ def test_role_level_fallback_drops_role_when_no_category_reaches_ten(tmp_path, m
         | {i: "somewhat" for i in range(6, 10)}
         | {i: "no" for i in range(10, 13)},
     )
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
 
     exit_code = ltp.main(["--role-level-fallback"])
 
@@ -1476,6 +1479,7 @@ def test_role_level_fallback_dropped_roles_contribute_no_rows_kept_roles_unaffec
         | {i: "somewhat" for i in range(26, 30)}
         | {i: "no" for i in range(30, 33)},
     )
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
 
     exit_code = ltp.main(["--role-level-fallback"])
 
@@ -1491,11 +1495,15 @@ def test_role_level_fallback_dropped_roles_contribute_no_rows_kept_roles_unaffec
     assert payload["n_rollouts_covered"] == 20
 
 
-def test_role_level_fallback_artifact_records_method_threshold_and_probe_agreement(
+def test_role_level_fallback_artifact_records_method_threshold_and_measured_probe_agreement(
     tmp_path, monkeypatch
 ):
-    """Künye: yöntem, eşik, probe'un ÖLÇÜLEN uyumu ve reddettiği eşik, ve
-    atılan rol listesi — hepsi role_expression.json'da açıkça durmalı."""
+    """Künye: yöntem, eşik, bu koşuda ÖLÇÜLEN probe uyumu (SABİT bir değer
+    değil) ve reddettiği eşik, ve atılan rol listesi — hepsi
+    role_expression.json'da açıkça durmalı. Provenance alanı, sayının bir
+    tam probe koşusundan değil bu fallback koşusunda ölçüldüğünü söylemeli
+    (bkz. görev tanımı: 'record alongside it that the number was measured
+    during the fallback run')."""
     from aax.rollouts import rollouts_run_id
 
     _patch_paths(monkeypatch, tmp_path)
@@ -1511,13 +1519,22 @@ def test_role_level_fallback_artifact_records_method_threshold_and_probe_agreeme
         | {i: "somewhat" for i in range(26, 30)}
         | {i: "no" for i in range(30, 33)},
     )
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
 
     assert ltp.main(["--role-level-fallback"]) == 0
 
     payload = json.loads(ltp.OUT_PATH.read_text(encoding="utf-8"))
     assert payload["method"] == "role_level_fallback"
     assert payload["fallback_threshold"] == 10
-    assert payload["probe_holdout_agreement"] == pytest.approx(0.635)
+    # Eski davranış SABİT 0.635 yazardı (başka bir modelde ölçülmüştü) —
+    # artık bu koşuda GERÇEKTEN ölçülen bir sayı olmalı: 0-1 aralığında bir
+    # float, ve o eski sabitle KARIŞTIRILMAMALI.
+    agreement = payload["probe_holdout_agreement"]
+    assert isinstance(agreement, float)
+    assert 0.0 <= agreement <= 1.0
+    assert payload["probe_holdout_agreement_provenance"] == (
+        "measured_during_role_level_fallback_run"
+    )
     assert payload["probe_threshold"] == pytest.approx(0.85)
     assert payload["dropped_roles"] == ["sage"]
     assert payload["n_roles_dropped"] == 1
@@ -1527,11 +1544,69 @@ def test_role_level_fallback_artifact_records_method_threshold_and_probe_agreeme
     assert payload["run_id"] == rollouts_run_id(records)
 
 
-def test_role_level_fallback_bypasses_probe_entirely_no_embedding_no_gateway_client(
+def test_role_level_fallback_measured_agreement_differs_across_models_not_a_shared_constant(
     tmp_path, monkeypatch
 ):
-    """Bayrak verildiğinde probe'a hiç girilmemeli: ne embedding hesaplanır
-    ne de bir gateway istemcisi kurulur."""
+    """İki 'farklı model' (burada: aynı satırlar, iki FARKLI embedding
+    kaynağı — bkz. görev tanımı) çalıştırıldığında `probe_holdout_agreement`
+    de FARKLI olmalı. Eski davranış her modelde AYNI sabiti (0.635) yazardı;
+    bu test o davranışın geri gelmediğini KANITLAR: biri açıkça ayrıştırılan
+    (neredeyse mükemmel), diğeri ayrıştırılamayan (sabit/bilgisiz) embedding
+    üretir, ikisi de GERÇEK RoleExpressionProbe.fit() ile ölçülür."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    records = _make_role_records(roles, per_role=30)  # satır 0..29, hepsi pirate
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+    # 12 fully + 9 somewhat + 9 no = 30 etiket; yalnızca "fully" (>=10) eşiği
+    # geçer — kategori kararı bu testte önemli değil, yalnızca ÖLÇÜM önemli.
+    labels_by_row = (
+        {i: "fully" for i in range(12)}
+        | {i: "somewhat" for i in range(12, 21)}
+        | {i: "no" for i in range(21, 30)}
+    )
+    _write_probe_labels(tmp_path / "probe_labels.json", labels_by_row)
+
+    def _row_of(answer: str) -> int:
+        return int(answer.rsplit(" ", 1)[-1])
+
+    def _separable_embed(answers, *, model_id: str = "BAAI/bge-m3"):
+        # Kategoriyi NEREDEYSE mükemmel ayıran vektörler — probe yüksek bir
+        # held-out uyumla eğitilir.
+        vector_by_category = {"fully": [10.0, 0.0, 0.0], "somewhat": [0.0, 10.0, 0.0], "no": [0.0, 0.0, 10.0]}
+        return np.array(
+            [vector_by_category[labels_by_row[_row_of(a)]] for a in answers], dtype=float
+        )
+
+    def _uninformative_embed(answers, *, model_id: str = "BAAI/bge-m3"):
+        # Kategoriden BAĞIMSIZ, sabit vektörler — probe hiçbir sinyal bulamaz.
+        return np.array([[1.0, 1.0, 1.0] for _ in answers], dtype=float)
+
+    monkeypatch.setattr(ltp, "embed_answers", _separable_embed)
+    assert ltp.main(["--role-level-fallback"]) == 0
+    payload_separable = json.loads(ltp.OUT_PATH.read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(ltp, "embed_answers", _uninformative_embed)
+    assert ltp.main(["--role-level-fallback"]) == 0
+    payload_uninformative = json.loads(ltp.OUT_PATH.read_text(encoding="utf-8"))
+
+    agreement_separable = payload_separable["probe_holdout_agreement"]
+    agreement_uninformative = payload_uninformative["probe_holdout_agreement"]
+    assert agreement_separable == pytest.approx(1.0)
+    assert agreement_uninformative < 0.7
+    assert agreement_separable != agreement_uninformative
+    # Ne biri ne öbürü eski, tek modelden ödünç alınmış sabitle örtüşüyor.
+    assert agreement_separable != pytest.approx(0.635)
+    assert agreement_uninformative != pytest.approx(0.635)
+
+
+def test_role_level_fallback_records_null_agreement_with_reason_when_probe_fit_cannot_run(
+    tmp_path, monkeypatch
+):
+    """Probe fit HERHANGİ bir nedenle başarısız olursa `probe_holdout_
+    agreement` `null` olmalı ve nedeni `probe_holdout_agreement_provenance`
+    alanında kısaca durmalı — BAŞKA bir modelden ya da SABİT bir değerden
+    ASLA ödünç alınmamalı (görev tanımı)."""
     _patch_paths(monkeypatch, tmp_path)
     roles = ["pirate"]
     _write_roles_catalog(tmp_path / "roles.json", roles)
@@ -1542,15 +1617,61 @@ def test_role_level_fallback_bypasses_probe_entirely_no_embedding_no_gateway_cli
         {i: "fully" for i in range(10)} | {i: "no" for i in range(10, 12)},
     )
 
-    def _must_not_be_called(*args, **kwargs):
-        raise AssertionError("--role-level-fallback probe'a girmemeli — bu hiç çağrılmamalı")
+    def _broken_embed(answers, *, model_id: str = "BAAI/bge-m3"):
+        raise RuntimeError("simüle edilmiş embedding hatası")
 
-    monkeypatch.setattr(ltp, "embed_answers", _must_not_be_called)
+    monkeypatch.setattr(ltp, "embed_answers", _broken_embed)
+
+    exit_code = ltp.main(["--role-level-fallback"])
+
+    # Ölçüm başarısız oldu diye fallback'in KENDİSİ (kategori kararı)
+    # başarısız SAYILMAZ — yalnızca provenance alanı null+neden taşır.
+    assert exit_code == 0
+    payload = json.loads(ltp.OUT_PATH.read_text(encoding="utf-8"))
+    assert payload["probe_holdout_agreement"] is None
+    assert "simüle edilmiş embedding hatası" in payload["probe_holdout_agreement_provenance"]
+    assert payload["probe_holdout_agreement_provenance"] != "measured_during_role_level_fallback_run"
+    # Kategori kararı ölçümden ETKİLENMEMİŞ: >=10 kuralı normal çalışmış.
+    assert payload["dropped_roles"] == []
+    assert set(payload["expression"].values()) == {"fully"}
+
+
+def test_role_level_fallback_never_calls_gateway_client_but_does_call_embed_answers(
+    tmp_path, monkeypatch
+):
+    """Bayrak verildiğinde bir gateway istemcisi HİÇ kurulmamalı (sıfır yeni
+    gateway çağrısı garantisi budur) — ama `embed_answers` ARTIK çağrılır:
+    yalnızca zaten etiketli yanıtlar üzerinde, provenance kaydı için (bkz.
+    `_measure_fallback_probe_holdout_agreement`)."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    records = _make_role_records(roles, per_role=20)
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+    _write_probe_labels(
+        tmp_path / "probe_labels.json",
+        {i: "fully" for i in range(10)} | {i: "no" for i in range(10, 12)},
+    )
+
+    embed_calls: list[list[str]] = []
+
+    def _spy_embed(answers, *, model_id: str = "BAAI/bge-m3"):
+        embed_calls.append(list(answers))
+        return _fake_embed_answers(answers, model_id=model_id)
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError(
+            "--role-level-fallback hiçbir gateway istemcisi kurmamalı — bu hiç çağrılmamalı"
+        )
+
+    monkeypatch.setattr(ltp, "embed_answers", _spy_embed)
     monkeypatch.setattr(ltp, "build_default_client", _must_not_be_called)
 
     exit_code = ltp.main(["--role-level-fallback"])
 
     assert exit_code == 0
+    assert len(embed_calls) == 1, "embed_answers TAM OLARAK bir kez çağrılmalı (provenance ölçümü için)"
+    assert len(embed_calls[0]) == 12, "yalnızca ZATEN etiketli (12) yanıt embed edilmeli, tüm 20 değil"
 
 
 def test_role_level_fallback_still_rejects_pilot_rollout_set_before_reading_labels(
