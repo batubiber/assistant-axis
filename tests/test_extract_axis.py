@@ -59,6 +59,8 @@ _RUN_ID = "testrun00000001"
 def _patch_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(ea.config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(ea, "ROLE_EXPRESSION_PATH", tmp_path / "role_expression.json")
+    monkeypatch.setattr(ea, "ACTS_PATH", tmp_path / "activations.npy")
+    monkeypatch.setattr(ea, "INDEX_PATH", tmp_path / "activations_index.json")
     monkeypatch.setattr(ea, "OUT_DIR", tmp_path / "axis")
 
 

@@ -108,13 +108,40 @@ assistant-axis/                     # kendi git repo'su (nested; ev dizini repo'
       capabilities.py               # GSM8k, IFEval
   scripts/                          # 00_… 70_… aşama giriş noktaları
   data/                             # .gitignore — rollout'lar, aktivasyonlar, hakem cache'i
+    roles.json, questions.json      # MODEL BAĞIMSIZ — gateway'den üretilir, hedef modelden değil
+    gateway_budget.json(.lock)      # MODEL BAĞIMSIZ — tek proje-geneli tavan (bkz. Bölüm 6)
+    gateway_cache/, gateway_calls.jsonl  # MODEL BAĞIMSIZ — cache payload'a göre anahtarlanır
+    models/<slug>/                  # MODEL ÖZEL — pilot/judge-gate/rollout/aktivasyon/probe artefaktı
+      pilot_rollouts.jsonl, judge_gate_labels.csv, judge_gate_machine.json, judge_gate.json
+      rollouts.jsonl, rollouts_meta.json, activations.npy, activations_index.json
+      probe_labels.json, role_expression.json
   results/                          # commit edilir — vektör metadata'sı, figürler, tablolar
+    models/<slug>/axis/             # MODEL ÖZEL — vektörler, PCA, criterion_a.json
   tests/
   docs/superpowers/specs/
 ```
 
 `data/` commit edilmez: 16k rollout metni, ham aktivasyonlar ve jailbreak yanıtları buraya yazılır.
 `results/` commit edilir: sayısal özetler, figürler, konfigürasyonlar.
+
+**Çoklu model desteği (2026-08-10).** İkinci bir hedef modelle (ör. `Qwen/Qwen3-0.6B`) aynı
+pipeline'ı koşmak birinci modelin sonuçlarını EZMEMELİ. Bu yüzden model BAĞIMLI her artefakt
+(yukarıdaki liste) `<slug>` ile anahtarlanan bir alt dizine yazılır — `<slug>`, `config.model_slug()`
+ile hedef model id'sinden türetilir (`"Qwen/Qwen3-1.7B"` → `"qwen3-1.7b"`: son path bileşeni,
+küçük harfe çevrilmiş). `config.model_data_dir()` ve `config.model_results_dir()` bu dizinleri
+verir; her script bunları `config.DATA_DIR`/`config.RESULTS_DIR` yerine kullanır. Model BAĞIMSIZ
+artefaktlar (rol kataloğu, ortak sorular, gateway bütçesi/cache'i) kasıtlı olarak `<slug>`'a
+DOKUNMAZ — bunlar gateway'den üretilir, hedef modelden değil, ve bütçe zaten tek bir proje-geneli
+tavan (bkz. Bölüm 6).
+
+Aktif hedef model `config.TARGET_MODEL`'dedir; varsayılanı `"Qwen/Qwen3-1.7B"`'dir ve
+`AAX_TARGET_MODEL` ortam değişkeniyle kaynak değişikliği YAPMADAN geçersiz kılınabilir:
+
+```
+AAX_TARGET_MODEL="Qwen/Qwen3-0.6B" uv run --extra ml python scripts/02_pilot_rollouts.py
+```
+
+Okuma import ANINDA olur (her script kendi süreci içinde `uv run` ile koştuğu için bu yeterlidir).
 
 ### 4.3 Modül sınırları
 
@@ -194,9 +221,9 @@ response token'larının ortalaması alınır (~10 dk). Rollout başına saklana
 kaydına aittir ve `activations_index.json`'ın `rows[i]`'si onu tarif eder. Aşama 3'ün rol/default
 ayrımının tamamı buna dayanır.
 
-**Pilot işareti.** `--limit` ile üretilen bir duman testi kanonik yola (`data/rollouts.jsonl`)
+**Pilot işareti.** `--limit` ile üretilen bir duman testi kanonik yola (`data/models/<slug>/rollouts.jsonl`)
 yazar ve dosyanın kendisinde bunu belli eden hiçbir şey yoktur — Aşama 0'ın `roles.json` zarfının
-çözdüğü problemin aynısı. Bu yüzden `04` yanına `data/rollouts_meta.json` yazar (`limit`, `n`,
+çözdüğü problemin aynısı. Bu yüzden `04` yanına `data/models/<slug>/rollouts_meta.json` yazar (`limit`, `n`,
 içerikten türetilen `run_id`) ve hem `05` hem `06` pilot bir künyeyi `--allow-pilot` verilmedikçe
 **reddeder** — `06` `05`'in çıktısına bağımlı değildir (`rollouts.jsonl`'ı doğrudan okur), bu
 yüzden künye kontrolü ikisine de AYRI AYRI kurulmak zorundaydı; aksi hâlde hakem harcamasının
@@ -224,8 +251,8 @@ rollout'lar aynı satır sayısıyla yeniden üretilebilir, yeni yakalama ilk ch
 düzeyinde öldürülebilir — işaret hiç yazılmadan. Marker olmadan `--start-row` bu senaryoda eski ve
 yeni koşuyu sessizce karıştırırdı.
 
-Çıktı: `data/rollouts.jsonl`, `data/rollouts_meta.json`, `data/activations.npy`,
-`data/activations_index.json`.
+Çıktı: `data/models/<slug>/rollouts.jsonl`, `data/models/<slug>/rollouts_meta.json`,
+`data/models/<slug>/activations.npy`, `data/models/<slug>/activations_index.json`.
 
 ### Aşama 2 — Rol ifadesi filtresi · ~250 çağrı
 
@@ -252,7 +279,7 @@ sonuçlarda böyle raporlanır.
 >
 > **GÜNCELLEME (2026-08-07) — geri çekilme fiilen tetiklendi:** Probe pass'i gerçek gateway'e
 > karşı koştu: 240 gönderim harcandı, 120 rolün tamamını kapsayan 2.000 hakem etiketi
-> (`data/probe_labels.json`, rol başına ~17) toplandı. Probe **%63,5 held-out uyumla** (eşik %85,
+> (`data/models/<slug>/probe_labels.json`, rol başına ~17) toplandı. Probe **%63,5 held-out uyumla** (eşik %85,
 > çoğunluk-sınıf tabanı %53,8) reddedildi — eğitim uyumu da yalnızca %69,4 idi (6 puanlık fark),
 > yani darboğaz etiket SAYISI değil etiket GÜRÜLTÜSÜydü (rol, etiketlerin varyansının %75,6'sını
 > açıklıyor; soru yalnızca %55,4'ünü — `bard`/`bohemian` 17/17 neredeyse oybirliği, `survivor`
@@ -328,7 +355,7 @@ kaydedilmiş bir hüküm için maddi bir sapmadır ve yalnızca `n_role_vectors`
 karar üretilemedi. `1` **yalnızca** kriter fiilen değerlendirilip sağlanmadığında üretilir; eksik
 girdi, bayat artefakt, yetersiz rol vektörü ve her türlü çökme 2'dir.
 
-Çıktı: `results/axis/` — vektörler, PCA, figürler, `criterion_a.json`.
+Çıktı: `results/models/<slug>/axis/` — vektörler, PCA, figürler, `criterion_a.json`.
 
 ### Aşama 4 — Steering ile rol yatkınlığı · ~175 çağrı
 
@@ -511,7 +538,7 @@ Hepsi bilinçli ve gerekçelidir; sonuç raporunda bu tabloyla birlikte sunulur.
 | 6 | Gemma 2 27B, Qwen 3 32B, Llama 3.3 70B | Qwen3-1.7B | 8 GB VRAM |
 | 7 | Steering normu LMSYS-CHAT-1M'den | Kendi default Assistant rollout'larımızdan | LMSYS elde yok |
 | 8 | Base model deneyleri (Bölüm 3.2.2), trait uzayı (Ek C) | Yok | Kapsam dışı — bkz. Bölüm 11 |
-| 9 | Hakem kapısı **insan** etiketiyle doğrulanır (makale: 200 örnek, %91.6 insan uyumu) | 45 örnek, **model** (ikinci bir model) etiketiyle, %77.8 | Operatörün kararı (2026-08-07). Ölçülen şey iki LLM arası uyum; insan-model uyumu değil. İki dil modeli aynı hataya birlikte düşebilir. Ayrıntılı künye `data/judge_gate.json` → `human_labels_provenance` |
+| 9 | Hakem kapısı **insan** etiketiyle doğrulanır (makale: 200 örnek, %91.6 insan uyumu) | 45 örnek, **model** (ikinci bir model) etiketiyle, %77.8 | Operatörün kararı (2026-08-07). Ölçülen şey iki LLM arası uyum; insan-model uyumu değil. İki dil modeli aynı hataya birlikte düşebilir. Ayrıntılı künye `data/models/<slug>/judge_gate.json` → `human_labels_provenance` |
 | 10 | (spec'in kendi ilk varsayımı) Probe reddedilirse rol başına 15 rollout hakeme sor, rol düzeyinde tut/at (**~180 YENİ çağrı**) | `--role-level-fallback`: aynı >=10 kuralı, ama VAR OLAN 2k hakem etiketinden (rol başına ~17), **0 yeni çağrı** | Etiketler probe eğitimi için zaten toplanmış ve ödenmişti (240 gönderim) — response-level bir örneklem daha sormak parayı ikinci kez harcamak olurdu. Fiilen tetiklendi (2026-08-07): probe %63,5 uyumla reddedildi (eşik %85), fallback 55 fully / 38 somewhat / 3 no / 24 atık verdi. Ayrıntı: Aşama 2 altındaki güncelleme kutusu, `.superpowers/sdd/p2-fallback-report.md` |
 
 **Aşama 0.5'in sonucu ve bir uyarı.** Kapı %77.8 ile geçti (eşik %75, 45'te 35). Uyuşmazlık rastgele değil:
@@ -588,5 +615,5 @@ Bilinçli olarak yapılmayacaklar:
   mutlak yol içermedi (`config.py` yolları `__file__`'dan türetiyor), bu yüzden taşıma
   yalnızca iki dokümanı ve bir izin girdisini etkiledi.
 - `data/`, `.env`, `*.npy` ve tüm anahtarlar `.gitignore`'da. **İstisna:** `results/**/*.npy`
-  commit EDİLİR — `results/axis/assistant_axis.npy` Plan 3-4'ün girdisidir ve onu üreten kararla
+  commit EDİLİR — `results/models/<slug>/axis/assistant_axis.npy` Plan 3-4'ün girdisidir ve onu üreten kararla
   (`criterion_a.json`) aynı commit'te durmalıdır.

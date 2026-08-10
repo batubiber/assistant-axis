@@ -39,9 +39,11 @@ from aax.axis import (
     role_vectors,
 )
 
-OUT_DIR = config.RESULTS_DIR / "axis"
+OUT_DIR = config.model_results_dir() / "axis"
 
-ROLE_EXPRESSION_PATH = config.DATA_DIR / "role_expression.json"
+ROLE_EXPRESSION_PATH = config.model_data_dir() / "role_expression.json"
+ACTS_PATH = config.model_data_dir() / "activations.npy"
+INDEX_PATH = config.model_data_dir() / "activations_index.json"
 
 # Spec Bölüm 9'un "<40 rol kalıyor" riski ve Bölüm 5/Aşama 2'nin kuralı ile
 # aynı sayı. Bu bir uyarı eşiği DEĞİL, sert bir tabandır: `n` rol vektörüyle
@@ -70,8 +72,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _run(argv: list[str] | None) -> int:
     args = build_arg_parser().parse_args(argv)
 
-    acts_path = config.DATA_DIR / "activations.npy"
-    index_path = config.DATA_DIR / "activations_index.json"
+    acts_path = ACTS_PATH
+    index_path = INDEX_PATH
 
     # `role_expression.json` için zaten var olan desenin AYNISI, Aşama 1'in
     # iki çıktısı için. Bu iki dosya eksikken script çıplak bir
