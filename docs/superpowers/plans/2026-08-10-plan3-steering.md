@@ -125,6 +125,28 @@ def test_steering_delta_rejects_zero_direction():
         steering_delta(np.zeros(3), strength=0.5, layer_norm=10.0)
 
 
+def test_mean_residual_norm_rejects_wrong_ndim():
+    """2 boyutlu girişte shape[1] katman ekseni DEĞİLDİR — aralık kontrolü
+    yanlış ekseni doğrular ve dilim sessizce yanlış şeyi döndürür."""
+    with pytest.raises(ValueError, match="boyutlu"):
+        mean_residual_norm(np.zeros((3, 4)), layer=0)
+    with pytest.raises(ValueError, match="boyutlu"):
+        mean_residual_norm(np.zeros((2, 3, 4, 5)), layer=0)
+
+
+def test_steering_delta_rejects_non_1d_direction():
+    with pytest.raises(ValueError, match="boyutlu"):
+        steering_delta(np.zeros((2, 2)), strength=0.5, layer_norm=10.0)
+    with pytest.raises(ValueError, match="boyutlu"):
+        steering_delta(np.array(1.0), strength=0.5, layer_norm=10.0)
+
+
+def test_steering_delta_rejects_negative_layer_norm():
+    """Negatif layer_norm kabul edilirse steering yönünü sessizce ters çevirir."""
+    with pytest.raises(ValueError, match="negatif"):
+        steering_delta(np.array([1.0, 0.0]), strength=0.5, layer_norm=-1.0)
+
+
 @pytest.mark.ml
 def test_steering_hook_runs_before_a_later_registered_observer_hook():
     """`steer()` `prepend=True` kullanmalı, yoksa steering görünmez olur.
@@ -162,11 +184,13 @@ def test_steering_hook_runs_before_a_later_registered_observer_hook():
             super().__init__()
             self.model = FakeBaseModel()
             self.device = torch.device("cpu")
+            self.dtype = torch.float32
 
     class FakeBundle:
         def __init__(self):
             self.model = FakeModel()
             self.n_layers = 1
+            self.d_model = 4
 
     bundle = FakeBundle()
     observed = []
@@ -187,6 +211,187 @@ def test_steering_hook_runs_before_a_later_registered_observer_hook():
         "önceden kayıtlı gözlemci steering'den ÖNCEKİ değeri gördü — "
         "steer() prepend=True kullanmalı"
     )
+
+
+@pytest.mark.ml
+def test_steer_rejects_direction_that_does_not_match_d_model():
+    """`d_model` uyuşmazlığı erken reddedilmeli — aksi hâlde uzunluk-1 (veya
+    başka yanlış uzunlukta) bir yön tüm boyutlara sessizce broadcast edilir.
+
+    Hata `bundle.model`'e hiç dokunmadan, katman aralığı kontrolünden hemen
+    sonra fırlatılmalı — bu yüzden sahte bundle'ın `model`'i `None`.
+    """
+    pytest.importorskip("torch")
+
+    from aax.steering import steer
+
+    class FakeBundle:
+        n_layers = 2
+        d_model = 4
+        model = None
+
+    bundle = FakeBundle()
+    with pytest.raises(ValueError, match="d_model"):
+        with steer(bundle, layer=0, direction=np.zeros(3), strength=0.5, layer_norm=10.0):
+            pass  # pragma: no cover - hataya kadar erişilmemeli
+
+
+@pytest.mark.ml
+def test_steering_delta_lands_on_every_position_of_every_row_in_a_batch():
+    """[B, S, D] girişte delta HER satırın HER token pozisyonuna eklenmeli —
+    makalenin Bölüm 3.2.1'deki "her token pozisyonu" kurulumunun dayandığı
+    broadcast özelliği. Önceki testler yalnızca `torch.zeros(1, 1, 4)`
+    (B=S=1) kullanıyordu ve bu özelliği hiç sınamıyordu.
+    """
+    torch = pytest.importorskip("torch")
+
+    from aax.steering import steer
+
+    class FakeLayer(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class FakeBaseModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([FakeLayer()])
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = FakeBaseModel()
+            self.device = torch.device("cpu")
+            self.dtype = torch.float32
+
+    class FakeBundle:
+        def __init__(self):
+            self.model = FakeModel()
+            self.n_layers = 1
+            self.d_model = 4
+
+    bundle = FakeBundle()
+    direction = np.zeros(4, dtype=np.float32)
+    direction[0] = 1.0
+    B, S, D = 3, 5, 4
+    hidden = torch.zeros(B, S, D)
+
+    with steer(bundle, layer=0, direction=direction, strength=1.0, layer_norm=10.0):
+        out = bundle.model.model.layers[0](hidden)
+
+    expected = torch.zeros(B, S, D)
+    expected[..., 0] = 10.0
+    assert torch.equal(out, expected), "delta her satırın her pozisyonuna eklenmemiş"
+
+
+@pytest.mark.ml
+def test_generate_steered_strips_prompt_disables_thinking_and_keeps_hook_active_every_step():
+    """`generate_steered`'in üç sözleşme parçası — hiçbiri şimdiye kadar
+    test edilmiyordu:
+
+    1. `out[0][inputs["input_ids"].shape[1]:]` dilimi prompt'u dışlıyor mu?
+    2. `enable_thinking=False` gerçekten chat template'e ulaşıyor mu?
+    3. Steering hook'u `generate()`'in TÜM decode adımlarında aktif mi
+       kalıyor, yoksa yalnızca prefill'de mi?
+
+    Sahte `generate`, 3 "adım" simüle eder (prefill dâhil) ve her adımda
+    hedef katmanı `nn.Module.__call__` üzerinden GERÇEKTEN çağırır — bu
+    yüzden `steer()`'in kaydettiği forward hook her adımda da tetiklenir.
+    Hook'un yalnızca ilk adımda değil SON adımda da aktif olduğunu
+    doğrulayarak, `with steer(...):`'in `generate()` çağrısının tamamını
+    sarmaladığı (ve prefill'den sonra erken kaldırılmadığı) sabitlenir.
+    """
+    torch = pytest.importorskip("torch")
+
+    from aax.steering import generate_steered
+
+    class FakeLayer(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class FakeBaseModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([FakeLayer()])
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = FakeBaseModel()
+            self.device = torch.device("cpu")
+            self.dtype = torch.float32
+            self.layer_call_count = 0
+            self.last_layer_output = None
+
+        def generate(self, input_ids, max_new_tokens=120, **_kwargs):
+            tokens = input_ids
+            for _ in range(3):  # prefill + 2 decode adımı simülasyonu
+                hidden = torch.zeros(1, tokens.shape[1], 4)
+                out = self.model.layers[0](hidden)  # steer() hook'unu tetikler
+                self.layer_call_count += 1
+                self.last_layer_output = out
+                next_token = torch.full((1, 1), 99, dtype=tokens.dtype)
+                tokens = torch.cat([tokens, next_token], dim=1)
+            return tokens
+
+    class FakeEncoding(dict):
+        def to(self, _device):
+            return self
+
+    class FakeTokenizer:
+        def __init__(self):
+            self.eos_token_id = 0
+            self.last_template_kwargs = None
+            self.last_decoded_ids = None
+
+        def apply_chat_template(self, messages, tokenize=False,
+                                 add_generation_prompt=True, enable_thinking=None):
+            self.last_template_kwargs = {
+                "tokenize": tokenize,
+                "add_generation_prompt": add_generation_prompt,
+                "enable_thinking": enable_thinking,
+            }
+            return "PROMPT"
+
+        def __call__(self, _text, return_tensors="pt"):
+            return FakeEncoding(input_ids=torch.tensor([[1, 2, 3]]))
+
+        def decode(self, ids, skip_special_tokens=True):
+            self.last_decoded_ids = ids.tolist()
+            return "yanıt metni"
+
+    class FakeBundle:
+        def __init__(self):
+            self.model = FakeModel()
+            self.tokenizer = FakeTokenizer()
+            self.n_layers = 1
+            self.d_model = 4
+
+    bundle = FakeBundle()
+    direction = np.zeros(4, dtype=np.float32)
+    direction[0] = 1.0
+
+    result = generate_steered(
+        bundle,
+        [{"role": "user", "content": "merhaba"}],
+        layer=0,
+        direction=direction,
+        strength=1.0,
+        layer_norm=10.0,
+    )
+
+    # (1) hook, üç decode adımının HEPSİNDE tetiklendi — sadece prefill'de değil
+    assert bundle.model.layer_call_count == 3
+    expected_shift = torch.tensor([10.0, 0.0, 0.0, 0.0])
+    assert torch.allclose(bundle.model.last_layer_output[0, 0], expected_shift), (
+        "steering hook'u SON decode adımında aktif değildi — erken kaldırılmış olabilir"
+    )
+
+    # (2) döndürülen dizi prompt'u dışlıyor — yalnızca 3 yeni üretilen token
+    assert bundle.tokenizer.last_decoded_ids == [99, 99, 99]
+    assert result == "yanıt metni"
+
+    # (3) enable_thinking=False chat template'e ulaştı
+    assert bundle.tokenizer.last_template_kwargs["enable_thinking"] is False
 
 
 @pytest.mark.gpu
@@ -218,6 +423,47 @@ def test_hook_shifts_the_target_layer_output_by_exactly_the_delta():
 
     Aktivasyon yakalamayla aynı tensöre yazdığımızı doğrular: kaydırma
     hidden_states[l+1]'de görünmeli, hidden_states[l]'de görünmemeli.
+
+    Bu, planın "dur sinyali" testidir: düşerse yanlış tensöre yazıyoruz
+    demektir ve bundan sonraki her ölçüm anlamsızdır. Bu yüzden tolerans
+    keyfi DEĞİL, gerçek bf16 aritmetiğinden türetilir:
+
+    - Beklenen değer, `steer()`'in GERÇEKTE kurduğu bf16-kuantalı delta'dır
+      (`steering_delta`'nın döndürdüğü float64 idealize değer değil).
+      `delta.to(bfloat16)` tek başına ~13.7 -> 13.6875 kuantalıyor —
+      float64'e karşı karşılaştırmak, eski sabit toleransın (atol=1e-1)
+      %12.5'ini hesaplamanın kendisiyle hiç ilgisi olmayan bir yuvarlamaya
+      harcıyordu.
+    - Fark (`diff_bf16`), erken `float()`'e cast'lenmeden ÖNCE, iki bf16
+      tensörünün bf16 çıkarması olarak hesaplanır — ölçmek istediğimiz
+      TAM OLARAK bu.
+    - Tolerans `base[L+1].abs().max()` (TÜM tensörün — tüm pozisyon ve tüm
+      2048 boyutun — global maksimumu) ile DEĞİL, yalnızca `direction`'ın
+      sıfır-olmayan olduğu boyut(lar)daki (burada: dim 3) değerlerin
+      maksimumuyla ölçeklenir. Ölçülmüş NEDEN: bu modelde
+      `base[L+1].abs().max()` **12480** — konum 0 (BOS benzeri "dikkat
+      çukuru" token'ı), boyut 1793'teki, steering'le hiç ilgisi olmayan
+      bilinen bir "kütlesel aktivasyon" aykırı değeri. O değerle
+      ölçeklenen bir tolerans (`eps·12480≈97.5`) beklenen delta'nın
+      (~13.7) TAMAMINDAN büyük olur — no-op bir hook'u bile geçirir (aşağı
+      bakınız, ampirik olarak doğrulandı). Doğru ölçek, TOPLAMANIN
+      GERÇEKTEN gerçekleştiği boyuttaki büyüklüktür: `base[L+1] +
+      beklenen_delta`, yalnızca `direction`'ın sıfır-olmadığı boyutlarda —
+      bu, hook DOĞRU çalışsaydı `got`'un o boyutlarda alacağı değerdir,
+      dolayısıyla hook'un GERÇEKTE ürettiği (belki hatalı) `got`'a değil,
+      yalnızca `base` (steering'den etkilenmez) ve `steering_delta`'nın
+      matematiksel çıktısına bağlıdır — `got`'u ölçek için kullanmak,
+      `got`'u büyüten bir hook hatasının kendi toleransını da büyütmesine
+      (dairesellik) yol açardı.
+      `torch.finfo(bfloat16).eps` (2^-7, bf16'nın makine epsilonu) çarpı bu
+      yerel ölçek, o mertebede BİR ULP genişliğine karşılık gelir;
+      `hidden + delta` toplamının bf16'ya yuvarlanması en fazla yarım ULP
+      hata katar. Ölçülen: yerel ölçek ≈20.6, atol≈0.161, gerçek hata
+      ≈0.0625 (yaklaşık 2.6× pay) — bkz. bu testin no-op hook deneyi
+      (rapor: p3-task-1-report.md, Fix Round 1).
+      SONRAKİ OKUYUCU: bunu yuvarlak bir sayıyla DEĞİŞTİRME — hangi
+      boyut/prompt seçildiğine bağlı olmayan, no-op hook'u AYIRT ETTİĞİ
+      ampirik olarak doğrulanmış tek türetim budur.
     """
     import torch
 
@@ -231,6 +477,10 @@ def test_hook_shifts_the_target_layer_output_by_exactly_the_delta():
     direction = np.zeros(bundle.d_model, dtype=np.float32)
     direction[3] = 1.0
     delta = steering_delta(direction, strength=0.1, layer_norm=137.0)
+    # `steer()`'in GERÇEKTE kurduğu delta ile AYNI yuvarlama: float64 ->
+    # modelin dtype'ı (bf16). Karşılaştırmadan idealize float64 hatasını
+    # çıkarır.
+    delta_bf16 = torch.tensor(delta, dtype=bundle.model.dtype, device=bundle.model.device)
 
     with torch.no_grad():
         base = bundle.model(**enc, output_hidden_states=True).hidden_states
@@ -238,9 +488,23 @@ def test_hook_shifts_the_target_layer_output_by_exactly_the_delta():
                layer_norm=137.0), torch.no_grad():
         got = bundle.model(**enc, output_hidden_states=True).hidden_states
 
-    diff = (got[L + 1] - base[L + 1]).float().cpu().numpy()
-    expected = np.broadcast_to(delta, diff.shape)
-    assert np.allclose(diff, expected, atol=1e-1), "hedef katman deltası beklenenden farklı"
+    # Fark bf16'nın KENDİSİNDE hesaplanır — erken float32'ye cast'lenmez.
+    diff_bf16 = got[L + 1] - base[L + 1]
+    expected_bf16 = delta_bf16.broadcast_to(diff_bf16.shape)
+
+    # Tolerans SADECE `direction`'ın sıfır-olmadığı boyut(lar)dan türetilir
+    # — tüm tensörün maksimumundan DEĞİL (yukarıdaki docstring'e bakınız:
+    # bu modelde global maksimum, steering'le ilgisiz bir BOS-token aykırı
+    # değeriydi ve toleransı ayırt-edemez hâle getiriyordu). Ölçek, `got`
+    # DEĞİL `base + beklenen_delta`'dan gelir — dairesellikten kaçınmak
+    # için (bkz. docstring).
+    mask = delta_bf16 != 0
+    reference_scale = (base[L + 1] + expected_bf16)[..., mask].abs().max().item()
+    atol = torch.finfo(torch.bfloat16).eps * reference_scale
+
+    assert torch.allclose(diff_bf16.float(), expected_bf16.float(), atol=atol), (
+        "hedef katman deltası beklenenden farklı"
+    )
     assert torch.allclose(got[L], base[L]), "steering'den ÖNCEKİ katman değişmemeli"
 
 
@@ -304,6 +568,15 @@ def mean_residual_norm(activations: np.ndarray, layer: int) -> float:
 
     `activations`: [n_rows, n_layers, d_model]. Steering ölçeği buradan gelir.
     """
+    activations = np.asarray(activations)
+    if activations.ndim != 3:
+        # 2 veya 4 boyutlu bir girişte shape[1] katman ekseni DEĞİLDİR —
+        # aralık kontrolü yanlış ekseni doğrular ve dilim sessizce yanlış
+        # şeyi döndürür. 3 boyut (n_rows, n_layers, d_model) zorunlu.
+        raise ValueError(
+            "activations 3 boyutlu olmalı [n_rows, n_layers, d_model], "
+            f"ndim={activations.ndim}"
+        )
     if not 0 <= layer < activations.shape[1]:
         raise ValueError(
             f"katman aralık dışı: {layer} (0-{activations.shape[1] - 1})"
@@ -317,10 +590,18 @@ def steering_delta(
 ) -> np.ndarray:
     """Katmanın çıktısına eklenecek sabit vektör: `strength · layer_norm · v̂`."""
     d = np.asarray(direction, dtype=np.float64)
+    if d.ndim != 1:
+        # Skaler (0-d) ya da matris (2-d+) bir `direction` burada sessizce
+        # yanlış şekilde broadcast edilebilirdi. Uzunluk-1 bir yönün TÜM
+        # d_model boyutlarına düz bir kayma yaymasına karşı koruma ise
+        # burada değil `steer()`'de: orada `bundle.d_model` bilgisi var.
+        raise ValueError(f"steering yönü 1 boyutlu olmalı, ndim={d.ndim}")
     if not np.isfinite(d).all():
         raise ValueError("steering yönü sonlu olmayan (NaN/inf) değer içeriyor")
     if not np.isfinite(strength) or not np.isfinite(layer_norm):
         raise ValueError("strength ve layer_norm sonlu olmalı")
+    if layer_norm < 0:
+        raise ValueError("layer_norm negatif olamaz — steering yönünü ters çevirir")
     norm = np.linalg.norm(d)
     if norm == 0:
         raise ValueError("steering yönü sıfır vektör — yön tanımsız")
@@ -339,18 +620,35 @@ def steer(bundle, *, layer: int, direction, strength: float, layer_norm: float):
     if not 0 <= layer < bundle.n_layers:
         raise ValueError(f"katman aralık dışı: {layer} (0-{bundle.n_layers - 1})")
 
+    direction_arr = np.asarray(direction)
+    if direction_arr.shape[-1] != bundle.d_model:
+        raise ValueError(
+            "steering yönü d_model ile uyuşmuyor: "
+            f"{direction_arr.shape[-1]} != {bundle.d_model}"
+        )
+
     delta_np = steering_delta(direction, strength, layer_norm)
     handle = None
     try:
         target = bundle.model.model.layers[layer]
+        # Delta'yı BİR KEZ, hook takılırken, modelin kendi dtype'ında kur —
+        # forward başına yeniden cast'lemek yerine (sweep boyunca ~420k
+        # çağrı). Hook içinde `.to(hidden.dtype)` yerine `.to(hidden)`
+        # kullanıyoruz: `Tensor.to`, hedef zaten aynı dtype/device'taysa
+        # kopyasız kendini döndürür, yani tek-cihazlı bugünkü kurulumda
+        # pratik ek maliyet yok. Ayrıca device'ı da hedefe göre kurar — çok
+        # cihazlı bir device_map altında bu katman `bundle.model.device`'tan
+        # FARKLI bir cihazda olabilir; salt `.to(dtype)` kullansaydık delta
+        # yanlış cihazda kalır ve toplama SESSİZCE yanlış katmanı izlemek
+        # yerine device-uyuşmazlığı hatasıyla AÇIKÇA patlardı.
         delta = torch.tensor(
-            delta_np, dtype=torch.float32, device=bundle.model.device
+            delta_np, dtype=bundle.model.dtype, device=bundle.model.device
         )
 
         def hook(_module, _inputs, output):
             is_tuple = isinstance(output, tuple)
             hidden = output[0] if is_tuple else output
-            shifted = hidden + delta.to(hidden.dtype)
+            shifted = hidden + delta.to(hidden)
             return (shifted, *output[1:]) if is_tuple else shifted
 
         # prepend=True — NEDEN GEREKLİ, sonradan silinmesin diye:
@@ -374,13 +672,19 @@ def steer(bundle, *, layer: int, direction, strength: float, layer_norm: float):
         # testinin başta düşmesinin sebebiydi: logit'ler 0.75'e kadar
         # değişiyordu ama `hidden_states[l+1]` bit-bir-bit aynı kalıyordu.
         #
-        # `prepend=True`, hook listesinin BAŞINA ekler: biz her zaman ilk
-        # çalışırız, delta'yı ekleriz, ve bizden sonra kayıtlı her gözlemci
-        # (transformers'ınki dahil) zaten steering'li tensörü görür. Bu aynı
-        # zamanda anlamlı olan seçim: bir katmanın "çıktısı" onu gözlemleyen
-        # her şeye göre steering uygulanmış olmalı, kaydın zamanlamasına göre
-        # değil — ileride steering AÇIKKEN aktivasyon yakalayan bir plan
-        # bunu varsayacaktır.
+        # `prepend=True`, hook listesinin BAŞINA ekler: biz bu KATMANIN
+        # kendi modül hook listesinde her zaman ilk çalışırız, delta'yı
+        # ekleriz, ve bizden sonra kayıtlı her gözlemci (transformers'ınki
+        # dahil) zaten steering'li tensörü görür. NİTELEYİCİ NOT: bu garanti
+        # yalnızca bu MODÜLE özgü hook listesi için geçerlidir —
+        # `register_module_forward_hook` ile kaydedilen GLOBAL hook'lar
+        # `prepend=True`'dan bağımsız olarak yine her modül-özel hook'tan
+        # (bizimki dahil) ÖNCE çalışır. Bu projede böyle bir global hook
+        # kullanılmıyor; biri eklenirse bu satırdaki garanti geçersiz kalır.
+        # Bu aynı zamanda anlamlı olan seçim: bir katmanın "çıktısı" onu
+        # gözlemleyen her şeye göre steering uygulanmış olmalı, kaydın
+        # zamanlamasına göre değil — ileride steering AÇIKKEN aktivasyon
+        # yakalayan bir plan bunu varsayacaktır.
         handle = target.register_forward_hook(hook, prepend=True)
         yield
     finally:
@@ -434,7 +738,7 @@ def generate_steered(
 - [ ] **Step 4: Saf ve CPU testlerinin geçtiğini doğrula**
 
 Run: `cd ~/assistant-axis && uv run --extra dev pytest tests/test_steering.py -v`
-Expected: PASS, 8 passed, 3 deselected (7 saf + 1 `ml`; `ml` extra kurulu değilse o test skip olur, `ml` extra kuruluysa çalışıp geçer)
+Expected: PASS. `tests/test_steering.py`'de 17 test var — 10 saf (marker'sız), 4 `ml`, 3 `gpu` (varsayılan `-m 'not gpu'` ile elenir). `ml` extra'sı **kurulu değilse** bu komut `10 passed, 4 skipped, 3 deselected` verir (`ml` testleri `pytest.importorskip("torch")` ile zarifçe skip olur — SKIP, PASS değil). `ml` extra'sı **kuruluysa** aynı komut `14 passed, 3 deselected` verir (eski metnin "8 passed" — kurulu değilken skip olması gereken bir testi PASS sayısına dahil eden iç-çelişkili hatası burada düzeltildi).
 
 - [ ] **Step 5: GPU testlerini koş — bu planın en önemli doğrulaması**
 
@@ -459,6 +763,23 @@ hook-SIRASI sorunu — çözüm `register_forward_hook(hook, prepend=True)`,
 `tests/test_steering.py::test_steering_hook_runs_before_a_later_registered_observer_hook`
 bunu GPU'suz sabitliyor. Bu test yine de düşerse (prepend uygulanmış
 haliyle) o zaman gerçekten yanlış tensöre yazılıyor demektir — devam etme.
+
+**İkinci bilinen tuzak (Fix Round 1'de bulundu — bkz. p3-task-1-report.md):**
+`test_hook_shifts_the_target_layer_output_by_exactly_the_delta`'nın eski
+hâli sabit `atol=1e-1` kullanıyordu ve beklenen değeri `steering_delta`'nın
+float64 çıktısıyla karşılaştırıyordu. İki hata üst üste biniyordu:
+`delta.to(bfloat16)` tek başına ~13.7 -> 13.6875 kuantalıyor (toleransın
+%12.5'i), ve bf16 toplamasının yuvarlama hatası ULP mertebesinde — Qwen'in
+uç-değerli residual boyutlarında ULP toleransın TAMAMINI aşabiliyor. Şimdiki
+hâli beklenen değeri bf16-kuantalı delta'yla karşılaştırıyor ve toleransı
+`torch.finfo(bfloat16).eps` ile ölçekliyor — ama TÜM tensörün değil, yalnızca
+`direction`'ın sıfır-olmadığı boyut(lar)ın büyüklüğüyle: bu modelde
+`base[L+1].abs().max()` == 12480 (konum 0'daki bilinen bir "kütlesel
+aktivasyon" aykırı değeri, steering'le ilgisiz) ve o değerle ölçeklenen bir
+tolerans no-op bir hook'u bile geçirirdi (ampirik olarak doğrulandı —
+rapora bakınız). Bu tuzağa yeniden düşmemek için tolerans türetimini
+`tests/test_steering.py::test_hook_shifts_the_target_layer_output_by_exactly_the_delta`
+docstring'inde olduğu gibi bırakın; yuvarlak bir sayıyla DEĞİŞTİRMEYİN.
 
 - [ ] **Step 6: Commit**
 
