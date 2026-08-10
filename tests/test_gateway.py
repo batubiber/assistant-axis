@@ -1099,3 +1099,208 @@ def test_close_is_noop_for_plain_callable_transport(tmp_path):
 
     client, _ = make_client(tmp_path, transport)
     client.close()  # close()'u olmayan transport ile de patlamamalı
+
+
+# --- model-bağımlı aşama bütçeleri (2026-08-10 bütçe düzeltmesi) ----------
+#
+# İkinci bir hedef modelin koşusu, birinci modelin aynı aşamada zaten
+# harcadığı payı görmemeli — ama global 1500 tavanı hâlâ TÜM anahtarların
+# (bare + model-scoped) toplamı üzerinden bağlamalı. Bu blok bunu kanıtlar.
+
+
+def make_model_scoped_client(
+    tmp_path,
+    transport,
+    *,
+    model_slug: str,
+    global_budget: int = 99,
+    stage_budget: int = 99,
+    stage: str = "stageX",
+    model_dependent_stages=frozenset({"stageX"}),
+    budget_path=None,
+):
+    """`make_client` ile aynı, ama `model_dependent_stages`/`model_slug`
+    ayarlanabilir. `budget_path` verilmezse `tmp_path/budget.json` kullanılır
+    — aynı `budget_path`'i paylaşan iki istemci aynı diskteki sayaca yazar,
+    tıpkı iki ayrı `AAX_TARGET_MODEL` koşusunun aynı `gateway_budget.json`'ı
+    paylaşması gibi.
+    """
+    cfg = GatewayConfig(
+        base_url="https://example.invalid/Jailbreak",
+        model="hakem-llm",
+        api_key="test-key",
+        global_budget=global_budget,
+        stage_budgets={stage: stage_budget},
+        model_dependent_stages=frozenset(model_dependent_stages),
+        model_slug=model_slug,
+    )
+    client = GatewayClient(
+        cfg,
+        cache_dir=tmp_path / f"cache-{model_slug}",
+        budget_path=budget_path or (tmp_path / "budget.json"),
+        log_path=tmp_path / f"calls-{model_slug}.jsonl",
+        transport=transport,
+    )
+    return client
+
+
+def test_model_dependent_stage_budget_is_tracked_separately_per_model(tmp_path):
+    """Model-bağımlı bir aşamada iki farklı model AYRI sayaç anahtarı kullanır
+    — birinin tavana çarpması diğerini etkilemez."""
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 200, ok_body()
+
+    client_a = make_model_scoped_client(
+        tmp_path, transport, model_slug="qwen3-1.7b", stage_budget=1
+    )
+    client_a.chat([{"role": "user", "content": "a"}], stage="stageX")
+    with pytest.raises(BudgetExceeded):
+        client_a.chat([{"role": "user", "content": "a2"}], stage="stageX")
+
+    # B modelinin kendi sayacı sıfırdan başlar — A'nın harcaması onu bağlamaz.
+    client_b = make_model_scoped_client(
+        tmp_path, transport, model_slug="qwen3-0.6b", stage_budget=1
+    )
+    assert client_b.chat([{"role": "user", "content": "b"}], stage="stageX") == "merhaba"
+
+    counts = budget_counts(tmp_path)
+    assert counts == {"stageX:qwen3-1.7b": 1, "stageX:qwen3-0.6b": 1}
+    assert len(calls) == 2
+
+
+def test_model_independent_stage_budget_is_shared_across_models(tmp_path):
+    """Model-bağımsız bir aşamada (`model_dependent_stages` DIŞINDA) iki
+    model AYNI bare sayaç anahtarını paylaşır — smoke testi ve rol
+    kataloğu gibi bir kez üretilip her modelce paylaşılan artefaktlar
+    böyle davranmalı."""
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 200, ok_body()
+
+    client_a = make_model_scoped_client(
+        tmp_path,
+        transport,
+        model_slug="qwen3-1.7b",
+        stage="stage0_roles",
+        stage_budget=1,
+        model_dependent_stages=frozenset(),  # bu aşama model-bağımsız
+    )
+    client_a.chat([{"role": "user", "content": "a"}], stage="stage0_roles")
+
+    client_b = make_model_scoped_client(
+        tmp_path,
+        transport,
+        model_slug="qwen3-0.6b",
+        stage="stage0_roles",
+        stage_budget=1,
+        model_dependent_stages=frozenset(),
+    )
+    # B'nin kendi model_slug'ı var ama aşama model-bağımsız olduğu için
+    # A'nın harcadığı PAYLAŞILAN tavana çarpar.
+    with pytest.raises(BudgetExceeded):
+        client_b.chat([{"role": "user", "content": "b"}], stage="stage0_roles")
+
+    counts = budget_counts(tmp_path)
+    assert counts == {"stage0_roles": 1}
+    assert len(calls) == 1
+
+
+def test_global_budget_still_binds_across_model_scoped_stage_keys(tmp_path):
+    """KRİTİK: aşama başına-model ayrımı global tavanı GENİŞLETMEMELİ.
+
+    İki farklı model aynı aşamayı kullanınca ayrı sayaç anahtarlarına
+    yazarlar (`stageX:model-a`, `stageX:model-b`), ama TOPLAM harcama yine
+    `global_budget`'ı aşınca — her iki modelin aşama-özel tavanı çok uzakta
+    olsa bile — `BudgetExceeded` fırlamalı. Model-bağımlı bütçelemenin
+    kullanıcının onayladığı 1500'lük tavanı delmediğinin kanıtı budur.
+    """
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 200, ok_body()
+
+    # Aşama tavanı bilerek ÇOK gevşek (99) — burada bağlayan SADECE global.
+    client_a = make_model_scoped_client(
+        tmp_path, transport, model_slug="model-a", global_budget=2, stage_budget=99
+    )
+    client_b = make_model_scoped_client(
+        tmp_path, transport, model_slug="model-b", global_budget=2, stage_budget=99
+    )
+
+    client_a.chat([{"role": "user", "content": "a"}], stage="stageX")
+    client_b.chat([{"role": "user", "content": "b"}], stage="stageX")
+
+    # global_budget=2 artık dolu (1 model-a'dan, 1 model-b'den) — ikisinin de
+    # aşama sayacı 99'luk tavanın ÇOK altında (1/99), ama global tavan bağlar.
+    with pytest.raises(BudgetExceeded):
+        client_a.chat([{"role": "user", "content": "c"}], stage="stageX")
+    with pytest.raises(BudgetExceeded):
+        client_b.chat([{"role": "user", "content": "d"}], stage="stageX")
+
+    counts = budget_counts(tmp_path)
+    assert counts == {"stageX:model-a": 1, "stageX:model-b": 1}
+    assert sum(counts.values()) == 2, "global tavan diskteki TÜM anahtarların toplamıdır"
+    assert len(calls) == 2, "tavan dolduktan sonra hiç istek gitmemeli"
+
+
+def test_unknown_stage_rejected_even_as_crafted_model_scoped_string(tmp_path):
+    """Bilinmeyen aşama reddi, `stage:model` biçimini TAKLİT eden uydurma bir
+    dizeyle de delinemez.
+
+    `_ledger_key` yalnızca `model_dependent_stages` içindeki KANONİK aşama
+    adlarına model soneki ekler — `stage` argümanının kendisi asla serbestçe
+    yeni bir sayaç anahtarı icat etmek için kullanılamaz. Tavan araması her
+    zaman ÇIPLAK `stage` argümanıyla `stage_budgets`'ta yapılır; bu sözlükte
+    yalnızca kanonik bare adlar var, `"test:baska-model"` gibi bir bileşik
+    dize orada asla bulunmaz.
+    """
+
+    def transport(payload):
+        return 200, ok_body()
+
+    client, _ = make_client(tmp_path, transport)  # stage_budgets={"test": ...}
+    with pytest.raises(ValueError):
+        client.chat(MSG, stage="test:baska-model")
+    with pytest.raises(ValueError):
+        client.remaining_budget("test:baska-model")
+
+
+def test_legacy_bare_stage_key_still_counts_toward_global_sum(tmp_path):
+    """Geçmiş bir koşudan kalan ÇIPLAK anahtar (ör. `stage2_probe_labels: 300`,
+    ilk modelin harcaması) model-bağımlı hale getirilen bir aşamada bile
+    global toplama katkıda bulunmaya devam etmeli — geriye dönük yeniden
+    etiketleme YAPILMAZ, ledger'daki eski anahtar OLDUĞU GİBİ kalır ve
+    sayılır."""
+    calls = []
+
+    def transport(payload):
+        calls.append(payload)
+        return 200, ok_body()
+
+    budget_path = tmp_path / "budget.json"
+    # Birinci modelin GEÇMİŞ harcaması: bare anahtar, hiç değiştirilmeden.
+    budget_path.write_text(json.dumps({"stageX": 300}), encoding="utf-8")
+
+    client_b = make_model_scoped_client(
+        tmp_path,
+        transport,
+        model_slug="model-b",
+        global_budget=301,
+        stage_budget=999,
+        budget_path=budget_path,
+    )
+    client_b.chat([{"role": "user", "content": "b"}], stage="stageX")
+    counts = budget_counts(tmp_path)
+    assert counts == {"stageX": 300, "stageX:model-b": 1}
+    assert sum(counts.values()) == 301
+
+    # Global tavan (301) şimdi dolu — eski bare anahtarın 300'ü hâlâ sayılıyor.
+    with pytest.raises(BudgetExceeded):
+        client_b.chat([{"role": "user", "content": "c"}], stage="stageX")
+    assert len(calls) == 1
