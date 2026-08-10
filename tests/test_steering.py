@@ -157,6 +157,36 @@ def test_steer_rejects_direction_that_does_not_match_d_model():
 
 
 @pytest.mark.ml
+def test_steer_rejects_0d_direction_with_clean_value_error_not_index_error():
+    """0-d (skaler) bir `direction`, `direction_arr.shape[-1]` erişiminde
+    IndexError DEĞİL, `steering_delta`'nın ürettiğiyle aynı temiz Türkçe
+    ValueError'ı vermeli.
+
+    `steering_delta` tek başına bu girişi doğru ele alıyor
+    (`test_steering_delta_rejects_non_1d_direction`), ama `steer()` d_model
+    kontrolü ndim kontrolünden ÖNCE çalışırsa oraya hiç ulaşılmıyordu —
+    bkz. p3-task-1-fix2-brief.md F1. Sahte bundle'ın `model`'i `None`:
+    hata `bundle.model`'e hiç dokunmadan fırlatılmalı.
+    """
+    pytest.importorskip("torch")
+
+    from aax.steering import steer
+
+    class FakeBundle:
+        n_layers = 2
+        d_model = 4
+        model = None
+
+    bundle = FakeBundle()
+    # `pytest.raises(ValueError, ...)` IndexError'ı KABUL ETMEZ — regresyon
+    # (guard'ın yanlış sırası) bu testi ValueError yerine IndexError ile
+    # düşürerek işaret eder.
+    with pytest.raises(ValueError, match="boyutlu"):
+        with steer(bundle, layer=0, direction=np.array(1.0), strength=0.5, layer_norm=10.0):
+            pass  # pragma: no cover - hataya kadar erişilmemeli
+
+
+@pytest.mark.ml
 def test_steering_delta_lands_on_every_position_of_every_row_in_a_batch():
     """[B, S, D] girişte delta HER satırın HER token pozisyonuna eklenmeli —
     makalenin Bölüm 3.2.1'deki "her token pozisyonu" kurulumunun dayandığı
@@ -381,9 +411,20 @@ def test_hook_shifts_the_target_layer_output_by_exactly_the_delta():
       hata katar. Ölçülen: yerel ölçek ≈20.6, atol≈0.161, gerçek hata
       ≈0.0625 (yaklaşık 2.6× pay) — bkz. bu testin no-op hook deneyi
       (rapor: p3-task-1-report.md, Fix Round 1).
-      SONRAKİ OKUYUCU: bunu yuvarlak bir sayıyla DEĞİŞTİRME — hangi
-      boyut/prompt seçildiğine bağlı olmayan, no-op hook'u AYIRT ETTİĞİ
-      ampirik olarak doğrulanmış tek türetim budur.
+      SONRAKİ OKUYUCU: bunu yuvarlak bir sayıyla DEĞİŞTİRME — bu türetim
+      (bf16 eps × yönün dokunduğu boyutlara maskelenmiş referans ölçek)
+      no-op hook'u AYIRT EDİYOR, ama bu ampirik doğrulamanın kapsamı
+      DAR: yalnızca burada kullanılan tek yön indeksi (`direction[3] =
+      1.0`, aşağıda) ve tek prompt ("Kısa bir cümle.", aşağıda) ile
+      koşuldu — BOYUT ekseninde genellenmedi. `mask = delta_bf16 != 0`
+      (aşağıda) yalnızca yönün DOKUNMADIĞI aykırı boyutları dışarıda
+      bırakır; yönün KENDİ boyutu (burada dim 3) bir "kütlesel
+      aktivasyon" boyutu olsaydı bu maskeleme hiçbir koruma sağlamazdı.
+      UYARI: testi başka bir yön indeksi üzerinden parametrize eden
+      okuyucu, o boyutun kendisi kütlesel-aktivasyon boyutu OLABİLECEĞİ
+      için ayırt etme özelliğini YENİDEN doğrulamak zorundadır —
+      `atol`'un beklenen delta'ya (~13.7) yaklaşması bu başarısızlığın
+      işaretidir.
     """
     import torch
 

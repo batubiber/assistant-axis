@@ -77,6 +77,13 @@ def steer(bundle, *, layer: int, direction, strength: float, layer_norm: float):
         raise ValueError(f"katman aralık dışı: {layer} (0-{bundle.n_layers - 1})")
 
     direction_arr = np.asarray(direction)
+    if direction_arr.ndim != 1:
+        # `shape[-1]` erişimi (hemen aşağıdaki d_model kontrolü) ndim=0'da
+        # IndexError atardı — bu kontrol ONDAN ÖNCE gelmeli. Mesaj
+        # `steering_delta`'nın ürettiğiyle birebir aynı: 0-d/2-d+ bir yön
+        # için okuyucu hangi yoldan geçtiğinden bağımsız aynı temiz Türkçe
+        # hatayı görmeli.
+        raise ValueError(f"steering yönü 1 boyutlu olmalı, ndim={direction_arr.ndim}")
     if direction_arr.shape[-1] != bundle.d_model:
         raise ValueError(
             "steering yönü d_model ile uyuşmuyor: "
