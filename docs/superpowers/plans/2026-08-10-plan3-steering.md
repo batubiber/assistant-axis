@@ -2109,6 +2109,107 @@ def test_record_strength_field_matches_the_strength_that_actually_generated_it(
         # bununla uyuşmalı.
         assert record["answer"] == f"yanit L{call['layer']} g{call['strength']}"
         assert record["strength"] == call["strength"]
+
+
+# --- Fix Round 3: role ekseni çökmesini yakalar - system prompt ve soru ------
+#
+# Reviewer'ın uyguladığı mutasyon: `catalog[role]` → `catalog[role_keys[0]]`.
+# Bu, her üretimi ilk rolün system prompt'uyla yapar, role ekseni çöker. Eski
+# sahte (`**_kwargs` yutan) bunu göremezdi çünkü mesajları kaydetmiyordu ve
+# yapılan kayıtlara bakıp sistem promptuyla ilişki kuramıyordu. Aşağıdaki
+# testler `.calls`'taki kaydedilmiş `messages` ve record'ların `role` alanıyla
+# birlikte ilişkiyi kontrol eder.
+
+
+def test_generator_receives_system_prompt_for_each_selected_role(tmp_path, monkeypatch):
+    """Üretici her seçili rol için o rolün instructions[0]'ını almalı.
+    Sistem promptu adı role tarafından belirlenmiş şekilde codlanmıştır:
+    `catalog[role]` tam bir role adı alır, yani prompt seti `catalog[role]`'den,
+    `catalog[role_keys[0]]`'dan değil gelir."""
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "5"])
+
+    assert exit_code == 0
+    # Seçili roller: role0, role1, role2, role3, role4
+    expected_prompts = {f"You are a role{i}." for i in range(5)}
+    # Her çağrının messages[0]["content"] bir beklenen prompt olmalı
+    actual_prompts = {call["messages"][0]["content"] for call in gen.calls}
+    assert actual_prompts == expected_prompts
+
+
+def test_generator_receives_all_introspective_questions(tmp_path, monkeypatch):
+    """Üretici tüm INTROSPECTIVE_QUESTIONS değerlerini almalı. messages[1]['content']
+    (user message) kümesi tam olarak INTROSPECTIVE_QUESTIONS olmalı."""
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "5"])
+
+    assert exit_code == 0
+    # Her çağrının messages[1]["content"] bir INTROSPECTIVE_QUESTION olmalı
+    actual_questions = {call["messages"][1]["content"] for call in gen.calls}
+    assert actual_questions == set(ss.INTROSPECTIVE_QUESTIONS)
+
+
+def test_system_prompt_and_question_pairs_form_full_cross_product(
+    tmp_path, monkeypatch
+):
+    """(system_prompt, question) çiftleri tam cross product oluşturmalı:
+    her role × her soru kombinasyonu en az bir kez görülmeli (beri verilen kısmı
+    layer × strength tarafsız geçtiği için)."""
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3"])
+
+    assert exit_code == 0
+    # Çiftler: system_prompt (messages[0]["content"]) ve question (messages[1]["content"])
+    actual_pairs = {
+        (call["messages"][0]["content"], call["messages"][1]["content"])
+        for call in gen.calls
+    }
+    # Beklenen: {f"You are a role{i}."} × INTROSPECTIVE_QUESTIONS
+    expected_pairs = {
+        (f"You are a role{i}.", q)
+        for i in range(3)
+        for q in ss.INTROSPECTIVE_QUESTIONS
+    }
+    assert actual_pairs == expected_pairs
+
+
+def test_role_field_in_record_matches_system_prompt_used(tmp_path, monkeypatch):
+    """`catalog[role]` yerine `catalog[role_keys[0]]` gibi bir sabitlemesi
+    katça yakalar: kayıtlar hâlâ role bilgisini taşır ama sistem prompt'u
+    farklı bir rolün olur. Burada üretici sahte her çağrıyı sırası ile işliyor
+    (`itertools.product`'ın sırasıyla kayıtlar sırasıyla eşleşir), ve her
+    kayıt'ın role alanı o kayıt'ı üreten çağrı'nın system prompt'uyla uyuşmalı."""
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3"])
+
+    assert exit_code == 0
+    records = ss.read_sweep(model_data / "steering_sweep.jsonl")
+    # Sahte hiçbir zaman boş yanıt döndürmez, yani her çağrı tam olarak bir
+    # kayıt üretir ve sıra korunur (itertools.product'ın ürettiği sırayla).
+    assert len(records) == len(gen.calls)
+    for record, call in zip(records, gen.calls):
+        # call["messages"][0]["content"] = "You are a role{X}."
+        # record["role"] = "role{X}"
+        # Bunlar uyuşmalı
+        system_prompt = call["messages"][0]["content"]
+        expected_role = system_prompt.replace("You are a ", "").replace(".", "")
+        assert record["role"] == expected_role
 ```
 
 - [ ] **Step 2: Test'lerin başarısız olduğunu doğrula**
@@ -2639,7 +2740,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
 Run: `cd ~/assistant-axis && uv run --extra dev pytest tests/test_steering_sweep.py -v`
-Expected: PASS, 31 passed
+Expected: PASS, 35 passed
 
 - [ ] **Step 5: Duman testi — 3 rol, tek katman**
 
