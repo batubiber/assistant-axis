@@ -1,0 +1,24 @@
+{
+  "tarih": "2026-08-10",
+  "durum": "SONUC GORULMEDEN YAZILDI",
+  "hipotez": "Persona temsili kucuk modellerde GORELI olarak daha gec katmanlarda konsolide olur. Varsayilan Assistant'in Assistant Axis uzerinde uc noktaya yerlesmesi, model kuculdukce daha buyuk bir goreli derinlik gerektirir.",
+  "gozlem_1_7B": {
+    "model": "Qwen/Qwen3-1.7B",
+    "n_layers": 28,
+    "orta_katman_L14": {"cos": 0.943, "default_percentile": 0.839, "kriter": "DUSTU"},
+    "her_iki_kosulu_saglayan_ilk_katman": 19,
+    "goreli_derinlik": 0.679
+  },
+  "test": {
+    "model": "Qwen/Qwen3-0.6B",
+    "gerekce": "Ayni aile ve ayni post-training receteси; tek degisen olcek. Llama-3.2-3B olcegi mimariyle karistirirdi, ayrica gated repo ve batch-2 kisiti var.",
+    "hat": "Ayni: 16000 rollout -> aktivasyon -> hakem etiketleri -> rol duzeyi geri cekilmesi -> eksen"
+  },
+  "tahminler": {
+    "hipotez_dogruysa": "Her iki kosulu saglayan ilk katmanin GORELI derinligi > 0.679. Yani 0.6B'de varsayilan, eksende ancak daha da gec uc noktaya yerlesir; orta katman persentili 0.839'un ALTINDA olur.",
+    "hipotez_yanlissa": "Goreli derinlik <= 0.679 cikar; bu durumda 1.7B'nin orta katmanda kalmasi olcekle degil, o modele ozgu bir seyle ilgilidir.",
+    "ucuncu_ihtimal": "0.6B'de cos hicbir katmanda 0.6'yi gecmez — bu durumda eksen o olcekte hic olusmuyor demektir ve karsilastirma anlamsizlasir (ama bu da bir bulgudur)."
+  },
+  "kriter_degistirilmedi": "A kriteri 1.7B icin DUSTU olarak kalir. Bu deney o sonucu degistirmez, YORUMLAR.",
+  "butce": {"harcanan_once": 371, "bu_deney_tahmini": 240, "global_tavan": 1500}
+}
