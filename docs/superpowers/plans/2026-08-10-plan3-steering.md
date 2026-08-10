@@ -1412,11 +1412,23 @@ git commit -m "feat: rol seçimi, Assistant-dışı oran ve B kriteri"
 `tests/test_steering_sweep.py`:
 
 ```python
+"""`scripts/08_steering_sweep.py` testleri.
+
+İlk 8 test (Task 4'ün ilk turu) yalnızca 4 saf yardımcıyı kapsıyordu. Fix
+Round 1 (bkz. `.superpowers/sdd/p3-task-4-fix1-brief.md`) `main()`'i sahte
+`load_hf_model` / `generate_steered` ile uçtan uca koşan testler ekliyor —
+`tests/test_extract_axis.py` ve `tests/test_label_and_train_probe.py` ile
+aynı desen (`monkeypatch` + sahte yol/veriyle `main()`'i çağırmak). Model,
+GPU, ağ yok: tüm veri sentetik, tüm yollar `tmp_path`'e yönlendirilir.
+"""
+from __future__ import annotations
+
 import importlib.util
 import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 _P = Path(__file__).resolve().parents[1] / "scripts" / "08_steering_sweep.py"
@@ -1487,6 +1499,353 @@ def test_read_rejects_a_truncated_file(tmp_path):
     path.write_text('{"layer": 14}\n{"layer": 1', encoding="utf-8")
     with pytest.raises(ValueError, match="satır"):
         ss.read_sweep(path)
+
+
+# --- F2: meta yazımı da atomik ------------------------------------------------
+
+
+def test_meta_write_is_atomic_and_leaves_no_temp(tmp_path):
+    path = tmp_path / "meta.json"
+    ss.write_json_atomic(path, {"a": 1})
+    assert [p.name for p in tmp_path.iterdir()] == ["meta.json"]
+    assert json.loads(path.read_text(encoding="utf-8")) == {"a": 1}
+
+
+def test_meta_write_failure_leaves_existing_file_untouched(tmp_path, monkeypatch):
+    path = tmp_path / "meta.json"
+    path.write_text("ONCEKI", encoding="utf-8")
+
+    def boom_replace(*_args, **_kwargs):
+        raise RuntimeError("bilerek")
+
+    monkeypatch.setattr(ss.os, "replace", boom_replace)
+
+    with pytest.raises(RuntimeError):
+        ss.write_json_atomic(path, {"a": 1})
+    assert path.read_text(encoding="utf-8") == "ONCEKI"
+    assert [p.name for p in tmp_path.iterdir()] == ["meta.json"]
+
+
+# --- main() uçtan uca testleri: sahte load_hf_model / generate_steered -------
+#
+# `select_assistant_end_roles`/`role_vectors` gerçek boyut kontrolleri
+# yaptığı için sabitler tutarlı olmalı: N_LAYERS her aktivasyon/eksen
+# dizisinde aynı, D_MODEL de öyle.
+
+N_LAYERS = 20
+D_MODEL = 6
+
+
+def _patch_paths(monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    model_data = data_dir / "models" / "m"
+    model_results = tmp_path / "results" / "models" / "m"
+    monkeypatch.setattr(ss.config, "DATA_DIR", data_dir)
+    monkeypatch.setattr(ss.config, "model_data_dir", lambda model_id=None: model_data)
+    monkeypatch.setattr(ss.config, "model_results_dir", lambda model_id=None: model_results)
+    return model_data, model_results / "axis"
+
+
+def _write_fixture(
+    tmp_path,
+    monkeypatch,
+    *,
+    n_role_vectors: int = 5,
+    n_default_rows: int = 8,
+    roles_in_catalog: list[str] | None = None,
+):
+    """Aşama 3 artifact'lerinin (eksen, rol vektörleri, aktivasyon indeksi/
+    matrisi) ve rol kataloğunun sentetik bir kopyasını `tmp_path`'e yaz."""
+    model_data, axis_dir = _patch_paths(monkeypatch, tmp_path)
+    model_data.mkdir(parents=True, exist_ok=True)
+    axis_dir.mkdir(parents=True, exist_ok=True)
+    ss.config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    rng = np.random.default_rng(0)
+    axis = rng.normal(size=(N_LAYERS, D_MODEL)).astype(np.float32)
+    np.save(axis_dir / "assistant_axis.npy", axis)
+
+    names = [f"role{i}" for i in range(n_role_vectors)]
+    vectors = rng.normal(size=(n_role_vectors, N_LAYERS, D_MODEL)).astype(np.float32)
+    np.save(axis_dir / "role_vectors.npy", vectors)
+    (axis_dir / "role_names.json").write_text(json.dumps(names), encoding="utf-8")
+
+    rows = [{"kind": "role", "role": name} for name in names]
+    rows += [{"kind": "default"} for _ in range(n_default_rows)]
+    acts = rng.normal(size=(len(rows), N_LAYERS, D_MODEL)).astype(np.float32)
+    np.save(model_data / "activations.npy", acts)
+    (model_data / "activations_index.json").write_text(
+        json.dumps({"rows": rows, "run_id": "testrun00000001"}), encoding="utf-8"
+    )
+
+    catalog_roles = roles_in_catalog if roles_in_catalog is not None else names
+    (ss.config.DATA_DIR / "roles.json").write_text(
+        json.dumps({
+            "roles": [
+                {"role": r, "instructions": [f"You are a {r}."]} for r in catalog_roles
+            ]
+        }),
+        encoding="utf-8",
+    )
+    return model_data
+
+
+class _FakeBundle:
+    n_layers = N_LAYERS
+    d_model = D_MODEL
+
+
+def _fake_load_hf_model():
+    return _FakeBundle()
+
+
+def _fake_generate_steered(bundle, messages, *, layer, strength, layer_norm,
+                            max_new_tokens, **_kwargs):
+    return f"yanit L{layer} g{strength}"
+
+
+def _refuse_to_load_model():
+    pytest.fail("model YÜKLENMEMELİYDİ")
+
+
+# --- F3: Task 3'ün yeni ValueError'ları — traceback + çıkış 1 değil, 2 -------
+
+
+def test_more_roles_requested_than_exist_exits_2_not_1(tmp_path, monkeypatch, capsys):
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _refuse_to_load_model)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "200"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "200" in err and "3" in err
+    assert "Traceback" not in err
+
+
+def test_limit_roles_zero_exits_2_not_1(tmp_path, monkeypatch, capsys):
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _refuse_to_load_model)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3", "--limit-roles", "0"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "sıfır" in err
+    assert "Traceback" not in err
+
+
+# --- F4: default satırsız/sonlu-olmayan norm → model YÜKLENMEDEN 2 ----------
+
+
+def test_missing_default_rows_exits_2_before_loading_model(tmp_path, monkeypatch, capsys):
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=3, n_default_rows=0)
+    monkeypatch.setattr(ss, "load_hf_model", _refuse_to_load_model)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "default" in err
+    assert "Traceback" not in err
+
+
+def test_non_finite_layer_norm_exits_2_before_loading_model(tmp_path, monkeypatch, capsys):
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=3, n_default_rows=5)
+    acts_path = model_data / "activations.npy"
+    acts = np.load(acts_path)
+    acts[-5:, 14, :] = np.nan  # tüm 'default' satırlarında L14'ü boz
+    np.save(acts_path, acts)
+    monkeypatch.setattr(ss, "load_hf_model", _refuse_to_load_model)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "sonlu" in err
+
+
+# --- F5: main()'in uçtan uca kapsamı ------------------------------------------
+
+
+def test_main_end_to_end_happy_path_writes_expected_schema_and_meta(tmp_path, monkeypatch):
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    monkeypatch.setattr(ss, "generate_steered", _fake_generate_steered)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "5"])
+
+    assert exit_code == 0
+    total = 1 * len(ss.STRENGTHS) * 5 * len(ss.INTROSPECTIVE_QUESTIONS)
+    records = ss.read_sweep(model_data / "steering_sweep.jsonl")
+    assert len(records) == total
+    for r in records:
+        assert set(r) == {"layer", "strength", "role", "question", "answer"}
+
+    meta = json.loads((model_data / "steering_sweep_meta.json").read_text(encoding="utf-8"))
+    assert meta["planned"] == total
+    assert meta["attempted"] == total
+    assert meta["produced"] == total
+    assert meta["complete"] is True
+
+
+def test_main_reports_missing_stage3_artifacts_cleanly(tmp_path, monkeypatch, capsys):
+    _patch_paths(monkeypatch, tmp_path)
+    # Hiçbir artifact yazılmadı.
+
+    exit_code = ss.main(["--layers", "14"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "Traceback" not in err
+
+
+def test_main_rejects_out_of_range_layer(tmp_path, monkeypatch, capsys):
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+
+    exit_code = ss.main(["--layers", "999", "--n-roles", "3"])
+
+    assert exit_code == 2
+    assert "aralık dışı" in capsys.readouterr().err
+
+
+def test_main_fails_when_selected_role_missing_from_catalog(tmp_path, monkeypatch, capsys):
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=3, roles_in_catalog=["role0"])
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "katalogda yok" in err
+
+
+# --- F1: artımlı kalıcılık — çökme o ana kadarki kayıtları kaybettirmez -----
+
+
+def test_writes_records_incrementally_during_the_loop(tmp_path, monkeypatch):
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=10)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    monkeypatch.setattr(ss, "generate_steered", _fake_generate_steered)
+
+    seen_lengths: list[int] = []
+    real_write_sweep = ss.write_sweep
+
+    def spy_write_sweep(path, records):
+        seen_lengths.append(len(records))
+        real_write_sweep(path, records)
+
+    monkeypatch.setattr(ss, "write_sweep", spy_write_sweep)
+
+    # 1 katman × 7 güç × 10 rol × 5 soru = 350 üretim -> PROGRESS_PERIOD=100
+    # sınırını en az iki kez geçer, yani döngü içinde en az iki ARA yazım +
+    # döngü sonunda bir final yazım olmalı.
+    exit_code = ss.main(["--layers", "14", "--n-roles", "10"])
+
+    assert exit_code == 0
+    assert len(seen_lengths) >= 3
+    assert seen_lengths == sorted(seen_lengths)
+    assert seen_lengths[0] < seen_lengths[-1]
+    assert (model_data / "steering_sweep.jsonl").exists()
+
+
+def test_exception_during_generation_persists_progress_and_exits_2(
+    tmp_path, monkeypatch, capsys
+):
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+
+    calls = {"n": 0}
+
+    def boom_generate(bundle, messages, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > 5:
+            raise RuntimeError("simüle edilmiş CUDA OOM")
+        return f"yanit {calls['n']}"
+
+    monkeypatch.setattr(ss, "generate_steered", boom_generate)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "RuntimeError" in err
+    assert "simüle edilmiş CUDA OOM" in err
+
+    out_path = model_data / "steering_sweep.jsonl"
+    assert out_path.exists()
+    records = ss.read_sweep(out_path)
+    assert len(records) == 5
+
+    meta_path = model_data / "steering_sweep_meta.json"
+    assert meta_path.exists()
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert meta["attempted"] == 5
+    assert meta["produced"] == 5
+    assert meta["complete"] is False
+
+
+def test_keyboard_interrupt_preserves_todays_behavior_exit_0(tmp_path, monkeypatch):
+    """F1'in Gereksinimi: `KeyboardInterrupt` bugünkü davranışını korusun —
+    o ana kadarki kayıtlar yazılır ve çıkış kodu 0 kalır (Exception'dan
+    farklı olarak — operatörün Ctrl-C'si bir "BAŞARISIZ" tanısına dönüşmez)."""
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+
+    calls = {"n": 0}
+
+    def interrupt_after_a_few(bundle, messages, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > 4:
+            raise KeyboardInterrupt
+        return f"yanit {calls['n']}"
+
+    monkeypatch.setattr(ss, "generate_steered", interrupt_after_a_few)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3"])
+
+    assert exit_code == 0
+    records = ss.read_sweep(model_data / "steering_sweep.jsonl")
+    assert len(records) == 4
+    meta = json.loads(
+        (model_data / "steering_sweep_meta.json").read_text(encoding="utf-8")
+    )
+    assert meta["attempted"] == 4
+    assert meta["complete"] is False
+
+
+# --- Ek gereksinim: `complete` artık `attempted == planned`, `produced` değil -
+
+
+def test_complete_reflects_attempted_not_produced_when_some_answers_are_blank(
+    tmp_path, monkeypatch
+):
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=2)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+
+    calls = {"n": 0}
+
+    def sometimes_blank(bundle, messages, **kwargs):
+        calls["n"] += 1
+        return "" if calls["n"] % 7 == 0 else "yanit"
+
+    monkeypatch.setattr(ss, "generate_steered", sometimes_blank)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "2"])
+
+    assert exit_code == 0
+    total = 1 * len(ss.STRENGTHS) * 2 * len(ss.INTROSPECTIVE_QUESTIONS)
+    meta = json.loads(
+        (model_data / "steering_sweep_meta.json").read_text(encoding="utf-8")
+    )
+    assert meta["attempted"] == total
+    assert meta["produced"] < total
+    assert meta["complete"] is True
 ```
 
 - [ ] **Step 2: Test'lerin başarısız olduğunu doğrula**
@@ -1508,10 +1867,43 @@ mutlak ölçek karşılaştırmayı anlamsız kılardı.
 Kullanım:
     uv run --extra ml python scripts/08_steering_sweep.py --layers 14 19
     uv run --extra ml python scripts/08_steering_sweep.py --layers 14 --limit-roles 3
+
+Dayanıklılık düzeltmesi (Fix Round 1; bkz.
+`.superpowers/sdd/p3-task-4-fix1-brief.md`): operatör bu script'i ~2 saat
+GÖZETİMSİZ koşturuyor — 3500 üretimlik bir sweep'in 3400'ünde bir CUDA OOM
+ya da geçici cihaz hatası (ikisi de `RuntimeError` alt sınıfı), düzeltme
+öncesi hiçbir artefakt yazmadan `main()`'den dışarı çıkıyordu. Bu, tam
+olarak `06_label_and_train_probe.py`'de commit 44dd90e ile çözülen sınıfın
+aynısı (bkz. o dosyanın "Etiketleme geçişi DAYANIKLIDIR" paragrafı) ama bu
+script bu dersi plan metninden (3ddb783) SONRA öğrendiği için ilk sürüme
+yansımamıştı. Artık:
+
+  - üretim döngüsü her `PROGRESS_PERIOD` (100) üretimde bir `records`'ı
+    `write_sweep` ile diske yazıyor (tam yeniden yazım — 3500 kaydın
+    ~2 MB'lık dosyasını 35 kez yeniden yazmak bedava, append modunun
+    kısmi-satır riski hiç doğmuyor);
+  - tek bir üretim çağrısı beklenmeyen bir `Exception` fırlatırsa (CUDA
+    OOM, geçici cihaz hatası) koşu o ana kadar üretilenleri yazıp temiz bir
+    Türkçe teşhisle çıkış 2 döner — `KeyboardInterrupt` (operatörün
+    Ctrl-C'si) eskisi gibi ele alınmaya devam eder;
+  - meta dosyası da (`write_sweep`'in zaten kullandığı tempfile +
+    `os.replace` deseniyle) ATOMİK yazılıyor — düz `Path.write_text` bir
+    kill/OOM-kill/disk dolması sırasında geçerli bir `.jsonl`'in yanına
+    budanmış bir meta bırakabiliyordu;
+  - `select_assistant_end_roles` ve `planned_generation_count`'un attığı
+    `ValueError`'lar (taban commit cec3483, plan metninden SONRA eklendi)
+    artık sarmalı — sarmasız hâlleri traceback + çıkış kodu 1 veriyordu,
+    oysa bu projede 1 "kriter değerlendirildi ve düştü" demek, bir kullanım
+    hatası (ör. `--n-roles` mevcut rol sayısından büyük) değil;
+  - `default` türünde satırı olmayan (ya da sonlu olmayan bir norm üreten)
+    bir `activations_index.json` artık model YÜKLENMEDEN önce temiz bir
+    Türkçe mesajla reddediliyor — eskiden `nan` basıp GPU'ya modeli yükler,
+    ilk `generate_steered` çağrısında sarmalanmamış bir `ValueError` alırdı.
 """
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import sys
@@ -1530,6 +1922,11 @@ from aax.susceptibility import (
     STRENGTHS,
     select_assistant_end_roles,
 )
+
+# İlerleme çıktısı VE artımlı kalıcılık (bkz. modül docstring'i) AYNI
+# periyotla hizalı: ~2 saatlik bir koşuda operatör zaten bu periyotta bir
+# ilerleme satırı görüyordu, artık aynı anda diske de bir kaydediliyor.
+PROGRESS_PERIOD = 100
 
 
 def planned_generation_count(
@@ -1584,7 +1981,32 @@ def read_sweep(path: str | Path) -> list[dict]:
     return out
 
 
-def main() -> int:
+def write_json_atomic(path: str | Path, payload: dict) -> None:
+    """`write_sweep`'in tempfile + `os.replace` deseninin JSON-metin hâli.
+
+    Meta dosyası eskiden düz `Path.write_text` ile yazılıyordu; hemen
+    yanındaki `write_sweep` çağrısı ise zaten atomikti. O yazım sırasında
+    bir kill/OOM-kill/disk dolması, geçerli ve tam bir `steering_sweep.jsonl`
+    yanına budanmış bir meta bırakabiliyordu — aşağı akıştaki okuyucunun bunu
+    fark etmesinin yolu yoktu. Bu yardımcı ile süreç ya ESKİ ya YENİ tam
+    içeriği görür, asla yarım bir JSON değil.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--layers", type=int, nargs="+", required=True,
                         help="steering yapılacak katmanlar, ör. --layers 14 19")
@@ -1594,7 +2016,7 @@ def main() -> int:
                         help="duman testi: yalnızca ilk N rol")
     parser.add_argument("--max-new-tokens", type=int, default=120,
                         help="yanıt başına üretilecek azami token")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     D = config.model_data_dir()
     R = config.model_results_dir() / "axis"
@@ -1615,7 +2037,28 @@ def main() -> int:
                   file=sys.stderr)
             return 2
 
-    roles = select_assistant_end_roles(vectors, names, axis, args.layers[0], args.n_roles)
+    # Rol seçimi BİLEREK tek katmana (args.layers[0]) sabitlenir ve TÜM
+    # sweep boyunca değişmeden kullanılır — katman başına yeniden seçilmez.
+    # Aksi hâlde L14 ve L19 farklı rol kümeleriyle karşılaştırılmış olur ve
+    # iki katmanı aynı sweep'te koşmanın amacı (aynı roller üstünde etki
+    # kıyası) kaybolur. Seçilen roller aşağıda meta artifact'ine yazıldığı
+    # için bu seçim geriye dönük denetlenebilir kalır.
+    #
+    # `select_assistant_end_roles` (`src/aax/susceptibility.py`) `n < 1`,
+    # `n > len(names)` ve isim/vektör uzunluk uyuşmazlığında Türkçe
+    # `ValueError` atıyor (taban commit cec3483). Sarmasız bırakılırsa bu
+    # traceback + çıkış kodu 1 verir — bu projede 1 "kriter değerlendirildi
+    # ve düştü" demek, `--n-roles`'a mevcut rol sayısından büyük bir değer
+    # verilmesi gibi bir kullanım hatası değil.
+    try:
+        roles = select_assistant_end_roles(vectors, names, axis, args.layers[0], args.n_roles)
+    except ValueError as exc:
+        print(
+            f"BAŞARISIZ: rol seçimi kurulamadı.\n  {exc}\n"
+            "  --n-roles değerini mevcut rol vektörü sayısına göre küçültün.",
+            file=sys.stderr,
+        )
+        return 2
     if args.limit_roles is not None:
         roles = roles[: args.limit_roles]
     # "rol::kategori" biçimindeki adlarda yalnızca rol kısmı sistem promptu araması için kullanılır.
@@ -1632,16 +2075,65 @@ def main() -> int:
         print(f"BAŞARISIZ: şu roller katalogda yok: {missing[:5]}", file=sys.stderr)
         return 2
 
+    # `default` türünde hiç satır yoksa `mean_residual_norm` boş bir dilim
+    # üzerinde çalışır ve yalnızca bir `RuntimeWarning` ile `nan` döner —
+    # fırlatmaz. Düzeltme öncesi bu `nan` kontrolsüz kalıyor, script
+    # "L14 ortalama residual normu: nan" basıp DEVAM ediyor, modeli
+    # yüklüyor, ve ancak ilk `generate_steered` çağrısında (`aax.steering`
+    # `strength ve layer_norm sonlu olmalı` der) sarmalanmamış bir
+    # `ValueError` alıyordu. Bu guard model YÜKLENMEDEN önce, ucuzca çalışır.
     default_rows = [i for i, r in enumerate(index["rows"]) if r["kind"] == "default"]
-    layer_norms = {
-        L: mean_residual_norm(np.asarray(acts[default_rows[:1000]]), L)
-        for L in args.layers
-    }
+    if not default_rows:
+        print(
+            "BAŞARISIZ: activations_index.json içinde 'default' türünde hiç satır "
+            "yok — steering ölçeği (mean_residual_norm) tanımsız.\n"
+            "  Kontrol edin: scripts/04_generate_rollouts.py'nin default rollout'ları "
+            "ürettiğini ve scripts/05_capture_activations.py'nin bunları "
+            "activations_index.json'a yazdığını.\n"
+            "  Model YÜKLENMEDİ.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        layer_norms = {
+            L: mean_residual_norm(np.asarray(acts[default_rows[:1000]]), L)
+            for L in args.layers
+        }
+    except ValueError as exc:
+        print(
+            f"BAŞARISIZ: residual normu hesaplanamadı.\n  {exc}\n"
+            "  Model YÜKLENMEDİ.",
+            file=sys.stderr,
+        )
+        return 2
+    non_finite = {L: n for L, n in layer_norms.items() if not np.isfinite(n)}
+    if non_finite:
+        print(
+            "BAŞARISIZ: şu katmanlarda ortalama residual normu sonlu değil "
+            f"(nan/inf): {non_finite} — steering ölçeği tanımsız.\n"
+            "  Girdi (activations.npy / activations_index.json) bozuk olabilir; "
+            "scripts/05_capture_activations.py'yi tekrar çalıştırıp yeniden üretin.\n"
+            "  Model YÜKLENMEDİ.",
+            file=sys.stderr,
+        )
+        return 2
 
-    total = planned_generation_count(
-        n_layers=len(args.layers), n_strengths=len(STRENGTHS),
-        n_roles=len(role_keys), n_questions=len(INTROSPECTIVE_QUESTIONS),
-    )
+    # `planned_generation_count` de aynı biçimde sarmasız çağrılıyordu —
+    # ör. `--limit-roles 0` rol boyutunu sıfıra indirdiğinde attığı
+    # `ValueError` de traceback + çıkış 1 veriyordu.
+    try:
+        total = planned_generation_count(
+            n_layers=len(args.layers), n_strengths=len(STRENGTHS),
+            n_roles=len(role_keys), n_questions=len(INTROSPECTIVE_QUESTIONS),
+        )
+    except ValueError as exc:
+        print(
+            f"BAŞARISIZ: üretim planı kurulamadı.\n  {exc}\n"
+            "  --limit-roles / --n-roles değerini sıfırdan farklı ve mevcut rol "
+            "kümesine sığacak şekilde ayarlayın.",
+            file=sys.stderr,
+        )
+        return 2
     print(f"{total} üretim planlandı "
           f"({len(args.layers)} katman × {len(STRENGTHS)} güç × "
           f"{len(role_keys)} rol × {len(INTROSPECTIVE_QUESTIONS)} soru)")
@@ -1652,38 +2144,77 @@ def main() -> int:
     records: list[dict] = []
     started = monotonic()
     done = 0
+    out = D / "steering_sweep.jsonl"
+    meta_path = D / "steering_sweep_meta.json"
+    # Yalnızca üretim çağrısı sırasında fırlayan beklenmeyen bir `Exception`
+    # (CUDA OOM, geçici cihaz hatası — ikisi de `RuntimeError` alt sınıfı)
+    # burada tutulur; `KeyboardInterrupt` `BaseException`dır ve içteki
+    # `except Exception`'ı ATLAYIP dıştaki `except KeyboardInterrupt`'a
+    # düşer — operatörün Ctrl-C'si bir "BAŞARISIZ" tanısına dönüşmez.
+    crashed: Exception | None = None
     try:
-        for layer in args.layers:
+        for layer, strength, role, question in itertools.product(
+            args.layers, STRENGTHS, role_keys, INTROSPECTIVE_QUESTIONS
+        ):
             direction = axis[layer]
-            for strength in STRENGTHS:
-                for role in role_keys:
-                    system_prompt = catalog[role]["instructions"][0]
-                    for question in INTROSPECTIVE_QUESTIONS:
-                        answer = generate_steered(
-                            bundle,
-                            [{"role": "system", "content": system_prompt},
-                             {"role": "user", "content": question}],
-                            layer=layer, direction=direction, strength=strength,
-                            layer_norm=layer_norms[layer],
-                            max_new_tokens=args.max_new_tokens,
-                        )
-                        done += 1
-                        if answer.strip():
-                            records.append(sweep_record(
-                                layer=layer, strength=strength, role=role,
-                                question=question, answer=answer))
-                        if done % 100 == 0:
-                            el = monotonic() - started
-                            eta = el / done * (total - done)
-                            print(f"\r  {done}/{total} — geçen {timedelta(seconds=int(el))}, "
-                                  f"kalan ~{timedelta(seconds=int(eta))}", end="", flush=True)
+            # Her katalog rolü üç sistem promptu varyantı taşır; sweep
+            # boyunca sabit ilkini kullanmak koşuyu deterministik tutar
+            # (varyant başına 3× daha fazla üretim yerine).
+            system_prompt = catalog[role]["instructions"][0]
+            try:
+                answer = generate_steered(
+                    bundle,
+                    [{"role": "system", "content": system_prompt},
+                     {"role": "user", "content": question}],
+                    layer=layer, direction=direction, strength=strength,
+                    layer_norm=layer_norms[layer],
+                    max_new_tokens=args.max_new_tokens,
+                )
+            except Exception as exc:
+                print(
+                    f"\nBAŞARISIZ: üretim sırasında beklenmeyen bir hata oluştu "
+                    f"({done}/{total} tamamlanmıştı) — o ana kadar üretilenler "
+                    "diske yazılacak.\n"
+                    f"  {type(exc).__name__}: {exc}\n"
+                    "  Olası neden: CUDA bellek yetersizliği "
+                    "(torch.cuda.OutOfMemoryError) ya da geçici bir cihaz hatası — "
+                    "ikisi de RuntimeError alt sınıfıdır.\n"
+                    "  Koşu planlanan sonucu üretemedi; kısmi kayıtlar ve meta "
+                    "yine de yazıldı.",
+                    file=sys.stderr,
+                )
+                crashed = exc
+                break
+            done += 1
+            if answer.strip():
+                records.append(sweep_record(
+                    layer=layer, strength=strength, role=role,
+                    question=question, answer=answer))
+            if done % PROGRESS_PERIOD == 0:
+                # Artımlı kalıcılık: 3500 kaydın ~2 MB'lık dosyasını 35 kez
+                # tam yeniden yazmak bedava — bir sonraki çökme/kesinti bu
+                # ana kadarki ilerlemeyi kaybettirmez.
+                write_sweep(out, records)
+                el = monotonic() - started
+                eta = el / done * (total - done)
+                print(f"\r  {done}/{total} — geçen {timedelta(seconds=int(el))}, "
+                      f"kalan ~{timedelta(seconds=int(eta))}", end="", flush=True)
     except KeyboardInterrupt:
         print("\nKESİLDİ — o ana kadar üretilenler yazılıyor.", file=sys.stderr)
 
     print()
-    out = D / "steering_sweep.jsonl"
     write_sweep(out, records)
-    (D / "steering_sweep_meta.json").write_text(json.dumps({
+    # `planned`: dört boyutun (katman × güç × rol × soru) çarpımı — koşu HİÇ
+    # kesilmese/çökmese kaç üretim yapılacaktı (`total`, yukarıda).
+    # `attempted`: döngünün fiilen kaç kez `generate_steered`'ı TAMAMLADIĞI
+    # (`done`) — bir kesinti/çökme bunu `planned`'dan KÜÇÜK bırakır.
+    # `produced`: bunlardan kaçının boş OLMAYAN bir yanıtla kayda dönüştüğü
+    # (`len(records)`) — `attempted`'tan küçük olması KESİNTİ değil, birkaç
+    # üretimin boş yanıt verdiği anlamına gelir. `complete` bu yüzden
+    # `attempted == planned`e bakar (`produced == planned`e DEĞİL): hiç
+    # kesilmemiş ama birkaç boş yanıt üretmiş tam bir koşu artık
+    # `complete: false` görünmez.
+    write_json_atomic(meta_path, {
         "layers": args.layers,
         "strengths": list(STRENGTHS),
         "n_roles": len(role_keys),
@@ -1692,20 +2223,27 @@ def main() -> int:
         "layer_norms": {str(k): v for k, v in layer_norms.items()},
         "axis_run_id": index.get("run_id"),
         "planned": total,
+        "attempted": done,
         "produced": len(records),
-        "complete": len(records) == total,
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
+        "complete": done == total,
+    })
 
     print(f"Yazıldı: {out} ({len(records)}/{total} kayıt)")
     if len(records) != total:
-        print(f"UYARI: {total - len(records)} üretim boş yanıt verdi ya da koşu kesildi.")
+        print(f"UYARI: {total - len(records)} üretim boş yanıt verdi ya da koşu kesildi/çöktü.")
+    if crashed is not None:
+        return 2
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
 
 - [ ] **Step 4: Testlerin geçtiğini doğrula**
 
 Run: `cd ~/assistant-axis && uv run --extra dev pytest tests/test_steering_sweep.py -v`
-Expected: PASS, 8 passed
+Expected: PASS, 22 passed
 
 - [ ] **Step 5: Duman testi — 3 rol, tek katman**
 
