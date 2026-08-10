@@ -173,6 +173,69 @@ class FakeJudgeClient:
         return json.dumps([self._role_scores[role]] * n_items)
 
 
+class PoisonItemClient:
+    """Ağsız sahte hakem istemcisi: içeriğinde `poison_marker` geçen HERHANGİ
+    bir batch/yarı/tekil öğe isteği DAİMA `JudgeParseError` fırlatır (gerçek
+    hakemin belirli bir öğeyi hiçbir boyutta ayrıştıramaması senaryosunun
+    sahtesi); geri kalan her istek normal skoru döndürür. `_label_batch`'in
+    zehirli öğeyi sonunda "etiketlenemedi" sayıp KOŞUYU DÜŞÜRMEDEN devam
+    ettiğini kanıtlamak içindir."""
+
+    def __init__(self, role_scores: dict[str, int], *, poison_marker: str) -> None:
+        self._role_scores = dict(role_scores)
+        self._poison_marker = poison_marker
+        self.calls = 0
+        self.sends_made = 0
+
+    def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+        self.calls += 1
+        self.sends_made += 1
+        content = messages[0]["content"]
+        if self._poison_marker in content:
+            raise JudgeParseError("zehirli öğe: hakem hiçbir boyutta ayrıştırılabilir yanıt vermiyor")
+        role = next(r for r in self._role_scores if f"the role: {r}." in content)
+        n_items = content.count("[ITEM ")
+        return json.dumps([self._role_scores[role]] * n_items)
+
+
+class RoleAwareFlakyClient:
+    """Ağsız sahte hakem istemcisi: `normal_role`'ün TÜM istekleri her zaman
+    başarılı; `flaky_role`'ün İLK isteği (tüm batch) `JudgeParseError`,
+    kurtarma denemelerinden (yarı) BİRİ ise `mid_recovery_exc` fırlatır.
+    `BudgetExceeded`/`CircuitOpen`'ın KURTARMA SIRASINDA (basit ilk denemede
+    değil) fırlaması senaryosunu üretmek içindir — hangi rolün hangi çağrıda
+    patlayacağını çağrı SIRASINA değil İÇERİĞE göre belirler, böylece daha
+    önce başarıyla tamamlanmış bir rolün etiketleri kazara tüketilen bir
+    istisnayla çakışmaz."""
+
+    def __init__(
+        self,
+        role_scores: dict[str, int],
+        *,
+        flaky_role: str,
+        mid_recovery_exc: Exception,
+    ) -> None:
+        self._role_scores = dict(role_scores)
+        self._flaky_role = flaky_role
+        self._mid_recovery_exc = mid_recovery_exc
+        self._flaky_calls = 0
+        self.calls = 0
+        self.sends_made = 0
+
+    def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+        self.calls += 1
+        self.sends_made += 1
+        content = messages[0]["content"]
+        role = next(r for r in self._role_scores if f"the role: {r}." in content)
+        if role == self._flaky_role:
+            self._flaky_calls += 1
+            if self._flaky_calls == 1:
+                raise JudgeParseError("uzunluk uyuşmazlığı: 11 != 10")
+            raise self._mid_recovery_exc
+        n_items = content.count("[ITEM ")
+        return json.dumps([self._role_scores[role]] * n_items)
+
+
 def _make_fixed_probe_class(*, trustworthy: bool, predict_label: str = "no"):
     """`RoleExpressionProbe` yerine geçen, kapı davranışını istatistiksel
     gürültüden bağımsız test etmeye yarayan sabit bir sahte sınıf."""
@@ -612,7 +675,14 @@ def test_main_missing_api_key_produces_diagnostic(tmp_path, monkeypatch, capsys)
     assert "Traceback" not in err
 
 
-# --- BudgetExceeded / CircuitOpen / GatewayError / JudgeParseError -------------
+# --- BudgetExceeded / CircuitOpen / GatewayError --------------------------------
+#
+# `JudgeParseError` ARTIK bu grupta DEĞİL: 2026-08-10 düzeltmesinden önce
+# hakemin TEK bir batch'te bozuk yanıt vermesi tüm koşuyu düşürüyordu (bkz.
+# üretim olayı: 1182/2000'de "Hakem yanıtı uzunluk uyuşmazlığı: 11 != 10" ile
+# ölümcül duruş). Artık `_label_batch` bunu böl-ve-tekrar-dene ile KAPSAR —
+# ayrıntılı testler aşağıda ("böl-ve-kurtar" ve "etiketlenemedi" bölümleri).
+# Yalnızca `BudgetExceeded`/`CircuitOpen`/`GatewayError` hâlâ koşuyu durdurur.
 
 
 @pytest.mark.parametrize(
@@ -623,6 +693,9 @@ def test_main_missing_api_key_produces_diagnostic(tmp_path, monkeypatch, capsys)
     ],
 )
 def test_main_stops_on_budget_or_circuit_exceptions(tmp_path, monkeypatch, capsys, istisna):
+    """Tek batch, hiçbir etiket toplanmadan patlıyor — artımlı kalıcılık
+    yine de HARCANMAYAN (boş) durumu diske yazar; `role_expression.json`
+    asla üretilmez."""
     _patch_paths(monkeypatch, tmp_path)
     roles = ["pirate"]
     _write_roles_catalog(tmp_path / "roles.json", roles)
@@ -635,23 +708,20 @@ def test_main_stops_on_budget_or_circuit_exceptions(tmp_path, monkeypatch, capsy
     assert exit_code == 2
     err = capsys.readouterr().err
     assert "DURDURULDU" in err
-    assert not ltp.LABELS_PATH.exists()
+    assert "kalıcı olarak" in err
+    payload = json.loads(ltp.LABELS_PATH.read_text(encoding="utf-8"))
+    assert payload["labels"] == {}, "bu koşuda hiç etiket toplanmadı — boş durum yine de yazılır"
     assert not ltp.OUT_PATH.exists()
 
 
-@pytest.mark.parametrize(
-    "istisna",
-    [
-        GatewayError("HTTP 500"),
-        JudgeParseError("bozuk JSON"),
-    ],
-)
-def test_main_reports_gateway_or_judge_parse_failures(tmp_path, monkeypatch, capsys, istisna):
+def test_main_reports_gateway_failure_after_persisting_progress_so_far(
+    tmp_path, monkeypatch, capsys
+):
     _patch_paths(monkeypatch, tmp_path)
     roles = ["pirate"]
     _write_roles_catalog(tmp_path / "roles.json", roles)
     _write_rollouts(tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=5))
-    client = FakeJudgeClient({"pirate": 3}, exceptions=[istisna])
+    client = FakeJudgeClient({"pirate": 3}, exceptions=[GatewayError("HTTP 500")])
     monkeypatch.setattr(ltp, "build_default_client", lambda: client)
 
     exit_code = ltp.main(["--sample-size", "5"])
@@ -659,7 +729,393 @@ def test_main_reports_gateway_or_judge_parse_failures(tmp_path, monkeypatch, cap
     assert exit_code == 2
     err = capsys.readouterr().err
     assert "BAŞARISIZ" in err
-    assert not ltp.LABELS_PATH.exists()
+    assert "kalıcı olarak" in err
+    payload = json.loads(ltp.LABELS_PATH.read_text(encoding="utf-8"))
+    assert payload["labels"] == {}
+    assert not ltp.OUT_PATH.exists()
+
+
+# --- böl-ve-kurtar: bozuk bir batch koşuyu düşürmez -----------------------------
+
+
+def test_bad_batch_is_split_and_recovered_directly_via_label_batch():
+    """`_label_batch`'in saf birim testi: TÜM batch `JudgeParseError`
+    fırlatır (gerçek olaydaki "11 != 10" uzunluk uyuşmazlığının sahtesi),
+    ama daha AZ öğe içeren yarılar (FARKLI bir payload, dolayısıyla FARKLI
+    bir cache anahtarı) başarıyla döner — tam da bölmenin neden basit bir
+    retry'dan farklı olduğunun kanıtı."""
+
+    class FailsWholeBatchOnlyClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.sizes_seen: list[int] = []
+
+        def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+            self.calls += 1
+            content = messages[0]["content"]
+            n_items = content.count("[ITEM ")
+            self.sizes_seen.append(n_items)
+            if n_items == 10:
+                raise JudgeParseError("Hakem yanıtı uzunluk uyuşmazlığı: 11 != 10")
+            return json.dumps([3] * n_items)
+
+    client = FailsWholeBatchOnlyClient()
+    rows = list(range(10))
+    items = [(f"soru {i}", f"cevap {i}") for i in rows]
+
+    labels, unlabelled, split = ltp._label_batch(
+        client,
+        role="pirate",
+        description="the role of a pirate",
+        rows=rows,
+        items=items,
+        stage=ltp.STAGE,
+    )
+
+    assert unlabelled == []
+    assert labels == {row: "fully" for row in rows}
+    assert split == 1
+    # 1 (tüm batch, başarısız) + 2 (yarılar, ikisi de başarılı) = 3 gönderim —
+    # tekil öğelere HİÇ inilmedi çünkü yarılar yeterliydi.
+    assert client.calls == 3
+    assert client.sizes_seen == [10, 5, 5]
+
+
+def test_label_batch_worst_case_cost_is_bounded_at_thirteen_sends_for_ten_items():
+    """Tüm batch, HER yarı ve HER tekil öğe sürekli `JudgeParseError`
+    fırlatırsa bile toplam gönderim görev tanımının verdiği üst sınırı
+    (1 + 2 + 10 = 13) aşmaz."""
+
+    class AlwaysFailsClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+            self.calls += 1
+            raise JudgeParseError("hep bozuk")
+
+    client = AlwaysFailsClient()
+    rows = list(range(10))
+    items = [(f"soru {i}", f"cevap {i}") for i in rows]
+
+    labels, unlabelled, split = ltp._label_batch(
+        client,
+        role="pirate",
+        description="the role of a pirate",
+        rows=rows,
+        items=items,
+        stage=ltp.STAGE,
+    )
+
+    assert labels == {}
+    assert sorted(unlabelled) == rows
+    assert split == 1
+    assert client.calls == 13
+
+
+def test_label_batch_size_one_half_is_not_retried_with_an_identical_payload():
+    """2 öğelik bir batch başarısız olursa yarılar zaten tekil (1 öğe) —
+    bu yarıları "tekil öğe olarak tekrar" denemek AYNI payload'ı (dolayısıyla
+    AYNI cache anahtarını) üretirdi; `_label_batch` bu gereksiz ikinci
+    gönderimi ATLAR."""
+
+    class AlwaysFailsClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+            self.calls += 1
+            raise JudgeParseError("hep bozuk")
+
+    client = AlwaysFailsClient()
+    labels, unlabelled, split = ltp._label_batch(
+        client,
+        role="pirate",
+        description="the role of a pirate",
+        rows=[0, 1],
+        items=[("soru 0", "cevap 0"), ("soru 1", "cevap 1")],
+        stage=ltp.STAGE,
+    )
+
+    assert labels == {}
+    assert sorted(unlabelled) == [0, 1]
+    assert split == 1
+    # 1 (tüm batch) + 2 (yarılar, İKİSİ de zaten tekil) = 3 — YİNELENEN
+    # tekil deneme YOK, bu yüzden 5 değil 3.
+    assert client.calls == 3
+
+
+def test_main_recovers_a_bad_batch_and_labels_survive_to_disk(tmp_path, monkeypatch, capsys):
+    """`main()` üzerinden uçtan uca: hakemin İLK yanıtı (tüm batch) bozuk,
+    ama koşu DÜŞMÜYOR — kurtarılan etiketler diske yazılıyor ve rapor
+    bölünen batch sayısını gösteriyor."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=10))
+    client = FakeJudgeClient(
+        {"pirate": 3}, exceptions=[JudgeParseError("Hakem yanıtı uzunluk uyuşmazlığı: 11 != 10")]
+    )
+    monkeypatch.setattr(ltp, "build_default_client", lambda: client)
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
+    monkeypatch.setattr(ltp, "RoleExpressionProbe", _make_fixed_probe_class(trustworthy=True))
+
+    exit_code = ltp.main(["--sample-size", "10"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "bölünüp kurtarılmaya çalışılan batch: 1" in out
+    assert "Etiketlenemeyen: 0/10" in out
+    labels_payload = json.loads(ltp.LABELS_PATH.read_text(encoding="utf-8"))
+    assert len(labels_payload["labels"]) == 10
+    assert set(labels_payload["labels"].values()) == {"fully"}
+    # İlk deneme (10 öğe) + 2 yarı (5+5) = 3 gönderim; kurtarma işe yaradığı
+    # için tekil öğelere HİÇ inilmedi.
+    assert client.calls == 3
+
+
+# --- etiketlenemeyen öğe: tek başına da başarısız olan bir öğe koşuyu -----------
+# düşürmez, "etiketlenemedi" sayılır ve koşu devam eder -------------------------
+
+
+def test_item_that_fails_even_alone_is_recorded_unlabelled_and_run_continues(
+    tmp_path, monkeypatch, capsys
+):
+    """Bir öğe (batch -> yarı -> tekil) her boyutta başarısız olsa bile
+    koşu DÜŞMEZ: o öğe 'etiketlenemedi' sayılır, AYNI batch'teki diğer
+    öğeler VE sonraki roller etiketlenmeye devam eder."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate", "sage"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    # pirate: 4 satır, ilkinin cevabı ASLA ayrıştırılamayan "zehirli" öğe.
+    # sage: 3 temiz satır — pirate'ın zehirli öğesinden SONRA işlenir,
+    # "koşu devam ediyor"un kanıtı.
+    records = _make_role_records(["pirate"], per_role=4) + _make_role_records(["sage"], per_role=3)
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+    poison_marker = records[0]["answer"]  # "pirate answer 0"
+    client = PoisonItemClient({"pirate": 3, "sage": 0}, poison_marker=poison_marker)
+    monkeypatch.setattr(ltp, "build_default_client", lambda: client)
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
+    monkeypatch.setattr(ltp, "RoleExpressionProbe", _make_fixed_probe_class(trustworthy=True))
+
+    exit_code = ltp.main(["--sample-size", "7"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Etiketlenemeyen: 1/7" in out
+    assert "bölünüp kurtarılmaya çalışılan batch: 1" in out
+
+    labels_payload = json.loads(ltp.LABELS_PATH.read_text(encoding="utf-8"))
+    judge_labels = labels_payload["labels"]
+    assert len(judge_labels) == 6, "zehirli öğe HARİÇ 6 satır etiketlenmeli"
+    assert "0" not in judge_labels, "zehirli öğenin satırı (0) etiketlenemedi sayılmalı"
+    # Zehirli öğeyle AYNI batch'teki (rol pirate) diğer 3 satır kurtarılmış olmalı.
+    for row in (1, 2, 3):
+        assert judge_labels[str(row)] == "fully"
+    # sage (SONRAKİ rol) pirate'ın başarısızlığından hiç etkilenmemiş olmalı.
+    for row in (4, 5, 6):
+        assert judge_labels[str(row)] == "no"
+
+
+def test_unlabelled_items_do_not_count_toward_role_level_fallback_tally(tmp_path, monkeypatch):
+    """Görev kısıtı: etiketlenemeyen öğeler `--role-level-fallback`'ın >=10
+    kuralına HİÇ katkı yapmamalı. Bir rolün etiketli 9 + etiketlenemeyen 1
+    (toplam 10 satır) durumunda, etiketlenemeyen satır SAYILMADIĞI için o
+    kategori eşiği (>=10) GEÇEMEZ — rol atılır."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    records = _make_role_records(roles, per_role=10)
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+    # `probe_labels.json`'da yalnızca 9 "fully" etiket VAR (10. satır hiç
+    # yok — tıpkı `_label_batch`'in etiketlenemeyen bir satırı asla
+    # `labels`'a EKLEMEMESİ gibi).
+    _write_probe_labels(tmp_path / "probe_labels.json", {i: "fully" for i in range(9)})
+
+    exit_code = ltp.main(["--role-level-fallback"])
+
+    assert exit_code == 0
+    payload = json.loads(ltp.OUT_PATH.read_text(encoding="utf-8"))
+    assert payload["dropped_roles"] == ["pirate"], "9 < 10 eşiği — rol atılmalı"
+    assert payload["expression"] == {}
+
+
+# --- artımlı kalıcılık: kesintiye uğrayan bir koşu diskten devam eder ----------
+
+
+def test_labels_persist_across_an_interrupted_run_and_are_reloaded_not_rerequested(
+    tmp_path, monkeypatch, capsys
+):
+    """Önceki bir koşudan kalma etiketler diskten yüklenir ve o satırlar
+    hakeme HİÇ tekrar sorulmaz — yalnızca eksik satırlar için istek atılır."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    records = _make_role_records(roles, per_role=6)  # satır 0..5
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+    # Önceki (kesintiye uğramış) bir koşudan kalma: ilk 3 satır zaten etiketli.
+    _write_probe_labels(tmp_path / "probe_labels.json", {0: "fully", 1: "fully", 2: "fully"})
+
+    class SpyClient:
+        def __init__(self, role_scores: dict[str, int]) -> None:
+            self._role_scores = dict(role_scores)
+            self.calls = 0
+            self.sends_made = 0
+            self.seen_prompts: list[str] = []
+
+        def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+            self.calls += 1
+            self.sends_made += 1
+            content = messages[0]["content"]
+            self.seen_prompts.append(content)
+            role = next(r for r in self._role_scores if f"the role: {r}." in content)
+            n_items = content.count("[ITEM ")
+            return json.dumps([self._role_scores[role]] * n_items)
+
+    client = SpyClient({"pirate": 3})
+    monkeypatch.setattr(ltp, "build_default_client", lambda: client)
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
+    monkeypatch.setattr(ltp, "RoleExpressionProbe", _make_fixed_probe_class(trustworthy=True))
+
+    exit_code = ltp.main(["--sample-size", "6"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "3 etiket diskten yüklendi" in out
+
+    # Yalnızca EKSİK 3 satır (3, 4, 5) için TEK bir batch gönderildi.
+    assert client.calls == 1
+    joined_prompts = "\n".join(client.seen_prompts)
+    for row in (0, 1, 2):
+        assert records[row]["answer"] not in joined_prompts, (
+            f"satır {row} zaten etiketliydi — tekrar hakeme SORULMAMALIYDI"
+        )
+    for row in (3, 4, 5):
+        assert records[row]["answer"] in joined_prompts
+
+    labels_payload = json.loads(ltp.LABELS_PATH.read_text(encoding="utf-8"))
+    assert len(labels_payload["labels"]) == 6
+    assert set(labels_payload["labels"].values()) == {"fully"}
+
+
+# --- BudgetExceeded KURTARMA SIRASINDA fırlarsa: temiz dur, o ana kadarki -------
+# HER ŞEY kalıcı olsun ------------------------------------------------------
+
+
+def test_budget_exceeded_during_recovery_stops_cleanly_with_everything_so_far_persisted(
+    tmp_path, monkeypatch, capsys
+):
+    """Rol `pirate` TAMAMEN etiketlenip diske YAZILDIKTAN sonra rol `sage`nin
+    batch'i bozuk yanıtla başlar (kurtarma tetiklenir) ve kurtarma
+    SIRASINDA (bir yarı denemesinde) `BudgetExceeded` fırlar. Koşu TEMİZ
+    durmalı ve `pirate`nin etiketleri diskte KALICI olmalı — `sage`ninkiler
+    hiç yazılmamış olmalı (o batch hiç tamamlanmadı)."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate", "sage"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=5))
+    client = RoleAwareFlakyClient(
+        {"pirate": 3, "sage": 0},
+        flaky_role="sage",
+        mid_recovery_exc=BudgetExceeded("'stage2_probe_labels' aşama bütçesi doldu: 300/300"),
+    )
+    monkeypatch.setattr(ltp, "build_default_client", lambda: client)
+
+    exit_code = ltp.main(["--sample-size", "10"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "DURDURULDU" in err
+    assert "kalıcı olarak" in err
+
+    labels_payload = json.loads(ltp.LABELS_PATH.read_text(encoding="utf-8"))
+    judge_labels = labels_payload["labels"]
+    assert len(judge_labels) == 5, "yalnızca TAMAMLANMIŞ pirate batch'i kalıcı olmalı"
+    assert set(judge_labels.values()) == {"fully"}
+    assert not ltp.OUT_PATH.exists()
+
+
+# --- rapor: koşu sonu sayıları doğru olmalı -------------------------------------
+
+
+def test_unlabelled_fraction_warning_threshold_is_two_percent():
+    """Eşik BİLEREK sabitlenmiş — bkz. `LABEL_BATCH_SIZE` yanındaki yorum:
+    gerçek olayda 2.000 öğeden yalnızca 1 batch'in 1 bozuk yanıtı vardı
+    (%0,05'in altında); %2 gürültüyü BULGU'dan ayıran makul bir eşik."""
+    assert ltp.UNLABELLED_FRACTION_WARNING_THRESHOLD == pytest.approx(0.02)
+
+
+def test_final_report_prints_prominent_warning_when_unlabelled_fraction_exceeds_threshold(
+    tmp_path, monkeypatch, capsys
+):
+    """1/7 ≈ %14,3 — %2'lik eşiği açıkça aşıyor, UYARI BASILMALI."""
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate", "sage"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    records = _make_role_records(["pirate"], per_role=4) + _make_role_records(["sage"], per_role=3)
+    _write_rollouts(tmp_path / "rollouts.jsonl", records)
+    poison_marker = records[0]["answer"]
+    client = PoisonItemClient({"pirate": 3, "sage": 0}, poison_marker=poison_marker)
+    monkeypatch.setattr(ltp, "build_default_client", lambda: client)
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
+    monkeypatch.setattr(ltp, "RoleExpressionProbe", _make_fixed_probe_class(trustworthy=True))
+
+    assert ltp.main(["--sample-size", "7"]) == 0
+
+    out = capsys.readouterr().out
+    assert "UYARI" in out
+    assert "%2" in out
+    assert "%14.3" in out or "%14,3" in out
+
+
+def test_final_report_omits_warning_when_unlabelled_fraction_is_zero(tmp_path, monkeypatch, capsys):
+    _patch_paths(monkeypatch, tmp_path)
+    roles = ["pirate", "sage"]
+    _write_roles_catalog(tmp_path / "roles.json", roles)
+    _write_rollouts(tmp_path / "rollouts.jsonl", _make_role_records(roles, per_role=5))
+    client = FakeJudgeClient({"pirate": 3, "sage": 0})
+    monkeypatch.setattr(ltp, "build_default_client", lambda: client)
+    monkeypatch.setattr(ltp, "embed_answers", _fake_embed_answers)
+    monkeypatch.setattr(ltp, "RoleExpressionProbe", _make_fixed_probe_class(trustworthy=True))
+
+    assert ltp.main(["--sample-size", "10"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Etiketlenemeyen: 0/10 (%0.0), bölünüp kurtarılmaya çalışılan batch: 0" in out
+    assert "UYARI" not in out
+
+
+# --- probe_labels.json OKU/YAZ: saf birim testleri ------------------------------
+
+
+def test_load_existing_labels_returns_empty_dict_when_file_missing(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    assert ltp.load_existing_labels(ltp.LABELS_PATH) == {}
+
+
+def test_load_existing_labels_raises_on_corrupt_file(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    ltp.LABELS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ltp.LABELS_PATH.write_text("{bozuk json", encoding="utf-8")
+    with pytest.raises(ValueError):
+        ltp.load_existing_labels(ltp.LABELS_PATH)
+
+
+def test_load_existing_labels_raises_when_labels_key_missing(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    ltp.LABELS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ltp.LABELS_PATH.write_text(json.dumps({"seed": 1}), encoding="utf-8")
+    with pytest.raises(KeyError):
+        ltp.load_existing_labels(ltp.LABELS_PATH)
+
+
+def test_save_labels_round_trips_and_leaves_no_stray_tmp_files(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    ltp.save_labels({0: "fully", 5: "no"})
+
+    assert ltp.load_existing_labels(ltp.LABELS_PATH) == {0: "fully", 5: "no"}
+    leftover_tmp = list(tmp_path.glob("*.tmp"))
+    assert leftover_tmp == [], f"atomik yazım artığı temp dosya bırakmamalı: {leftover_tmp}"
 
 
 # --- is_trustworthy kapısı: güvenilmez probe role_expression.json'a asla yazmaz

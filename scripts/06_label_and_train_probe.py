@@ -31,13 +31,28 @@ yapılması hiçbir şeyle engellenmezdi.
 `1` bilinçli olarak TEK bir anlama ayrılmıştır. Eskiden `--dry-run`'ın bütçe
 reddi de 1 döndürüyordu; bir kabuk pipeline'ı "probe güvenilmez" ile "koşu
 hiç başlamadı"yı ayırt edemiyordu.
+
+Etiketleme geçişi DAYANIKLIDIR (2026-08-10 düzeltmesi; bkz.
+`.superpowers/sdd/label-resilience-report.md`): `probe_labels.json` HER
+batch'ten sonra atomik yazılır (kesinti en fazla bir batch'lik işi
+kaybettirir, tüm geçişi değil), bir sonraki koşu diskteki etiketleri yükleyip
+o satırları TEKRAR sormaz, ve hakemin tek bir batch'te bozuk (`JudgeParseError`)
+yanıt vermesi artık koşuyu düşürmez — `_label_batch()` batch'i yarılara, gerekirse
+tekil öğelere bölerek KURTARMAYA çalışır (bkz. o fonksiyonun docstring'i:
+bölme neden basit bir retry'dan farklı ve neden işe yarıyor). Yalnızca tek
+başına bile ayrıştırılamayan öğeler "etiketlenemedi" sayılır ve `labels`
+sözlüğüne HİÇ girmez — `--role-level-fallback`'ın >=10 kuralı bu yüzden
+etkilenmez (bkz. `decide_role_category`).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from collections import Counter, defaultdict
+from pathlib import Path
 
 from aax import config
 from aax.gateway import BudgetExceeded, CircuitOpen, GatewayError, build_default_client
@@ -57,6 +72,29 @@ SEED = 20260806
 LABEL_SAMPLE_SIZE = 2000
 LABELS_PATH = config.model_data_dir() / "probe_labels.json"
 OUT_PATH = config.model_data_dir() / "role_expression.json"
+
+# `judge.score_role_expression`'ın varsayılan `batch_size`'ıyla (10) AYNI
+# olmak ZORUNDA. Bu script artık batch'leri KENDİSİ oluşturur — her batch'i
+# AYRI bir `score_role_expression` çağrısıyla işler (bkz. `_label_batch`) ki
+# bir batch'in `JudgeParseError`'ı önceki batch'lerin ZATEN toplanmış
+# etiketlerini silmesin. Buradaki gruplama `judge.py`'deki (ve `--dry-run`'ın
+# `build_role_score_prompts` üzerinden kurduğu plandaki) gruplamadan
+# SAPARSA, gerçekte gönderilen promptlar `--dry-run`'ın öngördüğünden
+# farklı olur.
+LABEL_BATCH_SIZE = 10
+
+# "Etiketlenemeyen" (hakemin tek başına bile ayrıştıramadığı) oran bu eşiği
+# AŞARSA koşu sonunda BELİRGİN bir UYARI basılır. %2 seçildi: bu düzeltmeye
+# yol açan gerçek olayda (2026-08-07 koşusu, 2.000 öğe) TEK bir batch'in TEK
+# bir bozuk yanıtı vardı — %0,05'in çok altında. Birkaç YALITILMIŞ öğenin tek
+# tek sorulduğunda bile başarısız olması (ör. batch bölünmesiyle bile
+# giderilemeyen nadir bir biçimlendirme tuhaflığı) gürültü sayılabilir; ama
+# örneklemin %2'sinden FAZLASı hakem tarafından — TEK TEK sorulsa BİLE —
+# yanıtlanamıyorsa bu artık gürültü değildir, hakemin belirli bir içerik
+# sınıfını SİSTEMATİK olarak ayrıştıramadığının işaretidir. Bu, ölçümün
+# kendisi hakkında bir BULGUdur ve aşağı akıştaki probe/rol düzeyi
+# kararların güvenilirliğini etkiler — sessizce geçilmez.
+UNLABELLED_FRACTION_WARNING_THRESHOLD = 0.02
 # `05_capture_activations.py` ile aynı isimler/dizin — bu script `rollouts.jsonl`'ı
 # `05`'e bağlı olmadan DOĞRUDAN okur (bkz. `main()` içindeki yorum), ama
 # hedef dosya AYNI modele özel dizindedir.
@@ -72,6 +110,137 @@ def collapse(score: int) -> str:
     if score in (0, 1):
         return "no"
     raise ValueError(f"Puan 0-3 aralığı dışında: {score!r}")
+
+
+# --- artımlı kalıcılık: probe_labels.json'ı OKU/YAZ ----------------------------
+
+
+def load_existing_labels(path: Path) -> dict[int, str]:
+    """`probe_labels.json`'da VAR OLAN etiketleri (varsa) yükle.
+
+    Bu, artımlı kalıcılığın OKUMA ucudur: önceki bir koşu kesintiye uğradıysa
+    (çökme, `CircuitOpen`, `BudgetExceeded`, Ctrl-C) bu satırlar TEKRAR
+    hakeme SORULMAZ — zaten toplandı ve zaten ödendi. Dosya yoksa (ilk koşu)
+    boş sözlük döner.
+
+    Dosya VARSA ama ayrıştırılamıyorsa (`ValueError`) ya da beklenen `labels`
+    anahtarını taşımıyorsa (`KeyError`) istisna SARMALANMADAN çağırana
+    (`main()`) yükselir — sessizce sıfırdan başlamak, önceden ÖDENMİŞ
+    etiketleri sessizce silip aynı satırları yeniden ücretlendirmek demektir;
+    bu da bu düzeltmenin "kesinti veriyi kaybetmesin" hedefini bizzat ihlal
+    ederdi.
+    """
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw_labels = payload["labels"]
+    return {int(row): category for row, category in raw_labels.items()}
+
+
+def save_labels(labels: dict[int, str]) -> None:
+    """`probe_labels.json`'ı ATOMİK yaz — `aax.rollouts.write_rollouts`'un
+    temp-dosya + `os.replace` deseninin AYNISI.
+
+    Etiketleme döngüsü bunu HER batch'ten sonra çağırır: bir çökme/kesinti
+    en fazla BİR batch'lik (<=`LABEL_BATCH_SIZE` öğe) işi kaybettirir, o ana
+    kadar toplanan 1.182 (ya da kaç varsa) etiketin TAMAMINI değil. Yazım
+    ortasında kesilme dosyayı KIRPMAZ — süreç ya ESKİ ya YENİ tam içeriği
+    görür, asla yarım bir JSON değil.
+    """
+    LABELS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"seed": SEED, "labels": {str(row): category for row, category in labels.items()}}
+    fd, tmp_name = tempfile.mkstemp(dir=str(LABELS_PATH.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, LABELS_PATH)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def _label_batch(
+    client,
+    *,
+    role: str,
+    description: str,
+    rows: list[int],
+    items: list[tuple[str, str]],
+    stage: str,
+) -> tuple[dict[int, str], list[int], int]:
+    """Bir hakem batch'ini etiketle; `JudgeParseError` fırlarsa böl-ve-tekrar-
+    dene ile KURTAR — tek bir bozuk batch tüm koşuyu düşürmesin.
+
+    Bölme TAM İKİ seviyelidir: batch -> yarılar -> tekil öğeler (bir yarı da
+    başarısız olursa TEKRAR yarılanmaz, doğrudan tekil öğelere iner). Bu,
+    kurtarma maliyetini SINIRLAR: N öğelik bir batch'in tam kurtarması en
+    kötü durumda 1 (tüm batch) + 2 (yarılar) + N (tüm tekil öğeler) gönderime
+    mal olur — N=10 için bu 13'tür.
+
+    ÖNEMLİ — bölme yalnızca bir RETRY DEĞİLDİR: `GatewayClient._cache_key`
+    payload'ın (mesajlar + sıcaklık + max_tokens) sha256'sıdır; daha AZ öğe
+    içeren bir yarı/tekil öğe `judge._build_prompt`'un ürettiği FARKLI bir
+    metin (farklı öğe sayısı, farklı içerik) demektir, dolayısıyla FARKLI bir
+    cache anahtarı. `temperature=0` olduğu için AYNI payload'ı tekrar
+    göndermek (basit bir retry) zehirlenmiş cache'teki AYNI bozuk yanıtı
+    geri getirir — orijinal olayda koşunun sonsuza dek aynı noktada
+    ölmesinin nedeni tam olarak buydu. Payload'ı DEĞİŞTİRMEK ise hakemi
+    GERÇEKTEN yeniden sorar. Bu satırlar bu kurtarmanın işe yaramasının TEK
+    nedenidir — bkz. görev tanımı.
+
+    `BudgetExceeded`/`CircuitOpen`/`GatewayError` burada YAKALANMAZ —
+    bilerek: bunlar koşuyu durdurması GEREKEN fatal durumlardır ve
+    `main()`'in dış `try/except`'ine kadar olduğu gibi yükselirler. Yalnızca
+    `JudgeParseError` (hakemin şekli bozuk bir yanıt vermesi —
+    `judge.score_role_expression`'ın validasyonu DEĞİŞMEDİ, bkz. o
+    fonksiyon) burada KAPSANIR.
+
+    Dönüş: `(etiketler, etiketlenemeyen_satırlar, bölündü_mü)`. `bölündü_mü`
+    1 ise bu batch en az bir kez bölünmek ZORUNDA kaldı (yalnızca raporlama
+    içindir).
+    """
+    try:
+        scores = score_role_expression(
+            client, role=role, description=description, items=items, stage=stage
+        )
+        return {row: collapse(score) for row, score in zip(rows, scores)}, [], 0
+    except JudgeParseError:
+        pass
+
+    if len(rows) <= 1:
+        # Zaten tekil öğe — daha fazla bölünemez, doğrudan etiketlenemeyen.
+        return {}, list(rows), 0
+
+    mid = len(rows) // 2
+    halves = [(rows[:mid], items[:mid]), (rows[mid:], items[mid:])]
+    labels: dict[int, str] = {}
+    unlabelled: list[int] = []
+    for half_rows, half_items in halves:
+        try:
+            scores = score_role_expression(
+                client, role=role, description=description, items=half_items, stage=stage
+            )
+            labels.update({row: collapse(score) for row, score in zip(half_rows, scores)})
+            continue
+        except JudgeParseError:
+            pass
+        if len(half_rows) == 1:
+            # Yarı zaten tek öğeydi (tekil bölme ile örtüşüyor) — tekrar
+            # tek öğe olarak denemek AYNI payload'ı (dolayısıyla AYNI cache
+            # anahtarını) üretirdi, bu yüzden ikinci bir gönderim ATLANIR.
+            unlabelled.append(half_rows[0])
+            continue
+        for row, item in zip(half_rows, half_items):
+            try:
+                single_scores = score_role_expression(
+                    client, role=role, description=description, items=[item], stage=stage
+                )
+                labels[row] = collapse(single_scores[0])
+            except JudgeParseError:
+                unlabelled.append(row)
+    return labels, unlabelled, 1
 
 
 # --- rol düzeyi geri çekilme (spec Bölüm 5/Aşama 2, Bölüm 9) -------------------
@@ -447,33 +616,95 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return run_dry_run(client, by_role, records, catalog)
 
-    labels: dict[int, str] = {}
+    # Artımlı kalıcılığın OKUMA ucu: önceki bir koşudan kalan etiketler
+    # varsa yükle — bu satırlar aşağıdaki döngüde TEKRAR sorulmayacak
+    # (`pending_rows` filtresi). Dosya bozuksa (sıfırdan başlamak önceden
+    # ÖDENMİŞ etiketleri sessizce silmek demektir) BAŞARISIZ olunur.
+    try:
+        labels: dict[int, str] = load_existing_labels(LABELS_PATH)
+    except (ValueError, KeyError) as exc:
+        print(
+            f"BAŞARISIZ: {LABELS_PATH} bozuk — önceki koşudan kalma etiketler okunamıyor.\n"
+            f"  Ayrıntı: {exc}\n"
+            "  Dosyayı elle onarın ya da (var olan etiketleri kaybetmeyi göze alarak) silin.",
+            file=sys.stderr,
+        )
+        return 2
+    if labels:
+        print(
+            f"{len(labels)} etiket diskten yüklendi ({LABELS_PATH}) — "
+            "bu satırlar tekrar hakeme sorulmayacak."
+        )
+
+    unlabelled_rows: list[int] = []
+    batches_split = 0
     try:
         for role, rows in by_role.items():
-            items = [(records[i]["question"], records[i]["answer"]) for i in rows]
-            scores = score_role_expression(
-                client,
-                role=role,
-                description=catalog[role],
-                items=items,
-                stage=STAGE,
-            )
-            for row, score in zip(rows, scores):
-                labels[row] = collapse(score)
-            print(f"\r{len(labels)}/{len(chosen)} etiketlendi", end="")
+            pending_rows = [row for row in rows if row not in labels]
+            for start in range(0, len(pending_rows), LABEL_BATCH_SIZE):
+                chunk_rows = pending_rows[start : start + LABEL_BATCH_SIZE]
+                chunk_items = [
+                    (records[row]["question"], records[row]["answer"]) for row in chunk_rows
+                ]
+                batch_labels, batch_unlabelled, split = _label_batch(
+                    client,
+                    role=role,
+                    description=catalog[role],
+                    rows=chunk_rows,
+                    items=chunk_items,
+                    stage=STAGE,
+                )
+                labels.update(batch_labels)
+                unlabelled_rows.extend(batch_unlabelled)
+                batches_split += split
+                # Artımlı kalıcılığın YAZMA ucu: HER batch'ten sonra diske
+                # yaz. Bir çökme/kesinti bu yüzden en fazla BİR batch'lik
+                # (<=`LABEL_BATCH_SIZE` öğe) işi kaybettirir — orijinal
+                # olayda kaybolan 1.182 etiketin TAMAMINI değil.
+                save_labels(labels)
+                print(
+                    f"\r{len(labels)}/{len(chosen)} etiketlendi "
+                    f"(etiketlenemeyen: {len(unlabelled_rows)})",
+                    end="",
+                )
     except (BudgetExceeded, CircuitOpen) as exc:
+        save_labels(labels)
         print(f"\nDURDURULDU: {exc}", file=sys.stderr)
+        print(
+            f"  Bu ana kadar toplanan {len(labels)} etiket {LABELS_PATH}'e kalıcı olarak "
+            "yazıldı — tekrar koşuda bu satırlar tekrar sorulmayacak.",
+            file=sys.stderr,
+        )
         return 2
-    except (GatewayError, JudgeParseError) as exc:
+    except GatewayError as exc:
+        save_labels(labels)
         print(f"\nBAŞARISIZ: {exc}", file=sys.stderr)
+        print(
+            f"  Bu ana kadar toplanan {len(labels)} etiket {LABELS_PATH}'e kalıcı olarak "
+            "yazıldı.",
+            file=sys.stderr,
+        )
         return 2
 
     print()
-    LABELS_PATH.write_text(
-        json.dumps({"seed": SEED, "labels": {str(k): v for k, v in labels.items()}}, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    save_labels(labels)
+    n_sampled = len(chosen)
+    n_unlabelled = len(unlabelled_rows)
+    unlabelled_fraction = (n_unlabelled / n_sampled) if n_sampled else 0.0
     print(f"Yazıldı: {LABELS_PATH} ({len(labels)} etiket), gönderilen istek: {client.sends_made}")
+    print(
+        f"Etiketlenemeyen: {n_unlabelled}/{n_sampled} (%{unlabelled_fraction * 100:.1f}), "
+        f"bölünüp kurtarılmaya çalışılan batch: {batches_split}"
+    )
+    if unlabelled_fraction > UNLABELLED_FRACTION_WARNING_THRESHOLD:
+        print(
+            f"UYARI: etiketlenemeyen oran %{unlabelled_fraction * 100:.1f}, eşik "
+            f"%{UNLABELLED_FRACTION_WARNING_THRESHOLD * 100:.0f}'i AŞIYOR.\n"
+            "  Hakem, örneklemin küçümsenemeyecek bir kısmına — TEK TEK sorulduğunda BİLE —\n"
+            "  yanıt VEREMEDİ. Bu kendi başına bir BULGUDUR: hakemin belirli bir içerik\n"
+            "  sınıfını sistematik olarak ayrıştıramadığını gösterir ve aşağıdaki probe/rol\n"
+            "  düzeyi kararların GÜVENİLİRLİĞİNİ etkiler — sonuçları buna göre değerlendirin."
+        )
 
     # Tüm rol yanıtlarını TEK GEÇİŞTE embed et. Hakem etiketli ~2.000 satır
     # rol yanıtlarının (~16.000) bir alt kümesi olduğu için burada AYRICA
@@ -565,6 +796,12 @@ def main(argv: list[str] | None = None) -> int:
                 "run_id": rollouts_run_id(records),
                 "holdout_agreement": probe.holdout_agreement,
                 "n_judge_labels": len(labels),
+                # Bu KOŞUDA (süreç içi) etiketlenemeyen ve bölünüp kurtarılmaya
+                # çalışılan batch sayısı — `client.sends_made` gibi SÜREÇ
+                # YEREL bir tanı sayısıdır, tam tersine `n_judge_labels`/
+                # `n_probe_labels` diskteki (kalıcı) `labels` durumunu yansıtır.
+                "n_judge_unlabelled_this_run": n_unlabelled,
+                "n_batches_split_this_run": batches_split,
                 "n_probe_labels": len(role_rows) - len(labels),
                 "expression": expression,
             },
