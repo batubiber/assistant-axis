@@ -130,9 +130,11 @@ pipeline'ı koşmak birinci modelin sonuçlarını EZMEMELİ. Bu yüzden model B
 ile hedef model id'sinden türetilir (`"Qwen/Qwen3-1.7B"` → `"qwen3-1.7b"`: son path bileşeni,
 küçük harfe çevrilmiş). `config.model_data_dir()` ve `config.model_results_dir()` bu dizinleri
 verir; her script bunları `config.DATA_DIR`/`config.RESULTS_DIR` yerine kullanır. Model BAĞIMSIZ
-artefaktlar (rol kataloğu, ortak sorular, gateway bütçesi/cache'i) kasıtlı olarak `<slug>`'a
-DOKUNMAZ — bunlar gateway'den üretilir, hedef modelden değil, ve bütçe zaten tek bir proje-geneli
-tavan (bkz. Bölüm 6).
+artefaktlar (rol kataloğu, ortak sorular, gateway cache'i) kasıtlı olarak `<slug>`'a DOKUNMAZ —
+bunlar gateway'den üretilir, hedef modelden değil. `gateway_budget.json` da DOSYA YOLU olarak
+`<slug>`'a dokunmaz (tek bir paylaşılan dosyada kalır), ama 2026-08-10 bütçe düzeltmesinden sonra
+dosyanın İÇİNDEKİ bazı sayaç ANAHTARLARI model-scoped'dur (`f"{aşama}:{slug}"`) — global tavan
+yine de tek bir proje-geneli sayıdır (bkz. Bölüm 6).
 
 Aktif hedef model `config.TARGET_MODEL`'dedir; varsayılanı `"Qwen/Qwen3-1.7B"`'dir ve
 `AAX_TARGET_MODEL` ortam değişkeniyle kaynak değişikliği YAPMADAN geçersiz kılınabilir:
@@ -462,25 +464,71 @@ taşır (≈ %20, küçük aşamalarda en az 10 gönderim, 5'in katına yuvarlan
 bir aşamanın bütçesi çağrı sayısına eşit olurdu ve **tek bir geçici 5xx** aşamayı sonuna
 varmadan keserdi.
 
-| Aşama | Anahtar (`STAGE_BUDGETS`) | Mantıksal çağrı | Retry payı | Bütçe (gönderim) |
-|---|---|---:|---:|---:|
-| — smoke testi (Plan 1) | `smoke` | 2 | 8 | 10 |
-| 0 — rol/soru üretimi | `stage0_roles` | 120 | 25 | 145 |
-| 0.5 — hakem doğrulama | `stage05_judge_gate` | 5 | 10 | 15 |
-| 1 — rollout/aktivasyon | — | 0 | 0 | 0 |
-| 2 — rol ifadesi filtresi | `stage2_probe_labels` | 250 | 50 | 300 |
-| 3 — eksen çıkarımı | — | 0 | 0 | 0 |
-| 4 — steering sweep | `stage4_steering` | 175 | 35 | 210 |
-| 5 — persona drift | `stage5_drift` | 320 | 65 | 385 |
-| 6 — capping | `stage6_capping` | 150 | 30 | 180 |
-| 7 — Türkçe transfer | `stage7_turkish` | 60 | 15 | 75 |
-| **Toplam** | | **1,082** | **238** | **1,320** |
-| **Kodda sert tavan** | `GLOBAL_BUDGET` | | | **1,500** |
+**Model kapsamı (2026-08-10 bütçe düzeltmesi).** Aşağıdaki bütçe SAYILARI değişmedi,
+ama sayacın hangi ANAHTARA yazdığı aşamaya göre ikiye ayrılır:
+
+- **Paylaşılan (model-bağımsız):** `smoke`, `stage0_roles`. Bunlar gateway'den üretilir,
+  hedef modelden değil (rol kataloğu ve smoke testi bir kez üretilip HER model tarafından
+  yeniden kullanılır — bkz. Bölüm 4.2) — sayaç anahtarı BARE kalır, tavan tüm modeller
+  arasında TEK bir ortak havuzdur.
+- **Model başına (model-bağımlı):** `stage05_judge_gate`, `stage2_probe_labels`,
+  `stage4_steering`, `stage5_drift`, `stage6_capping`, `stage7_turkish`. Bunların girdisi
+  (rollout metni, steering çıktısı, drift/capping yanıtları) doğrudan hedef modelin
+  ürettiği metindir; sayaç anahtarı `f"{aşama}:{model_slug}"` olur (`config.
+  MODEL_DEPENDENT_STAGES`) ve aşağıdaki tablodaki bütçe **her hedef model için AYRI
+  AYRI** uygulanır — ikinci bir modelin koşusu birincinin harcadığı payı görmez.
+
+Bunun nedeni somut bir tıkanıklıktı: ikinci hedef modelle (`Qwen/Qwen3-0.6B`) yapılan bir
+izleme koşusu, `stage2_probe_labels`'ın PAYLAŞILAN tavanının çoğunu (240/300) birinci
+modelin (`Qwen/Qwen3-1.7B`) tamamlanmış koşusunun zaten tükettiğini gördü ve 2.000
+etiketin yalnızca 500'ünde durdu — ayrıntı: `.superpowers/sdd/per-model-budget-report.md`.
+
+**Global tavan DEĞİŞMEDİ.** `GLOBAL_BUDGET = 1500` hâlâ diskteki sayaç dosyasındaki
+**TÜM anahtarların** (bare + model-scoped) toplamıdır; model başına bütçeleme bu toplamı
+genişletmez — bir model-scoped aşamanın kendi tavanı bol olsa bile global toplam dolarsa
+`BudgetExceeded` yine fırlar (bkz. `tests/test_gateway.py::
+test_global_budget_still_binds_across_model_scoped_stage_keys`).
+
+Geçmiş harcama GERİYE DÖNÜK yeniden anahtarlanmaz: `stage2_probe_labels: 300` gibi eski
+bare bir kayıt kimin harcadığı karışık olsa bile OLDUĞU GİBİ kalır ve global toplama
+katkıda bulunmaya devam eder — yalnızca YENİ gönderimler yeni model-scoped anahtara yazılır.
+
+| Aşama | Anahtar (`STAGE_BUDGETS`) | Model kapsamı | Mantıksal çağrı | Retry payı | Bütçe (gönderim) |
+|---|---|---|---:|---:|---:|
+| — smoke testi (Plan 1) | `smoke` | paylaşılan | 2 | 8 | 10 |
+| 0 — rol/soru üretimi | `stage0_roles` | paylaşılan | 120 | 25 | 145 |
+| 0.5 — hakem doğrulama | `stage05_judge_gate` | model başına | 5 | 10 | 15 |
+| 1 — rollout/aktivasyon | — | — | 0 | 0 | 0 |
+| 2 — rol ifadesi filtresi | `stage2_probe_labels` | model başına | 250 | 50 | 300 |
+| 3 — eksen çıkarımı | — | — | 0 | 0 | 0 |
+| 4 — steering sweep | `stage4_steering` | model başına | 175 | 35 | 210 |
+| 5 — persona drift | `stage5_drift` | model başına | 320 | 65 | 385 |
+| 6 — capping | `stage6_capping` | model başına | 150 | 30 | 180 |
+| 7 — Türkçe transfer | `stage7_turkish` | model başına | 60 | 15 | 75 |
+| **Toplam (TEK model)** | | | **1,082** | **238** | **1,320** |
+| **Kodda sert tavan** | `GLOBAL_BUDGET` | | | | **1,500** |
 
 Bu tablo `src/aax/config.py`'deki `STAGE_LOGICAL_CALLS` ve `STAGE_BUDGETS` ile birebir
-aynıdır ve `tests/test_config.py` ikisinin sürüklenmesini engeller. Aşama bütçeleri
-toplamı sert tavanın altında kalmak **zorundadır**; tavan yükseltilmez, sığmayan batch
-küçültülür.
+aynıdır ve `tests/test_config.py` ikisinin sürüklenmesini engeller. **"Toplam" sütunu TEK
+bir modelin tüketebileceği ÜST SINIRDIR** — model başına aşamalarda ikinci bir model AYNI
+tavanı kendi anahtarıyla yeniden açar, yani N modelle TEORİK üst sınır `paylaşılan +
+N × model-başına` olur (paylaşılan = 10+145=155, model-başına = 15+300+210+385+180+75=1165).
+Pratikte bu üst sınıra hiç yaklaşılmaz: cache payload'a göre anahtarlandığı için farklı
+modellerin rollout metni doğal olarak farklı payload → çakışma yok, ama gerçek harcama
+her zaman planlanan çağrı sayısı kadardır, tavan kadar değil. Sert tavan (`GLOBAL_BUDGET`,
+1500) yükseltilmez; bir aşama (paylaşılan ya da model başına) sığmıyorsa batch küçültülür.
+
+**İki-model deneyi için projeksiyon (2026-08-10, Qwen3-1.7B + Qwen3-0.6B, yalnızca Aşama
+0–2 — Aşama 4-7 henüz script'e dökülmedi).** Birinci model tamamlandı (Aşama 0-3, 431
+gönderim: `smoke` 2 + `stage0_roles` 120 + `stage05_judge_gate` 9 (paylaşılan geçmiş
+anahtar, iki modelin karışık harcaması) + `stage2_probe_labels` 300 (paylaşılan geçmiş
+anahtar — 240'ı model 1'in tam koşusu, 60'ı model 2'nin yarım kalan koşusu, bkz. yukarı).
+İkinci modelin `stage2_probe_labels:qwen3-0.6b` sayacı SIFIRDAN başlar; 500/2000 etiket
+60 gönderimle üretildiği için (0.12 gönderim/etiket — model 1'in kendi 240 gönderim/2000
+etiket oranıyla TUTARLI), kalan 1500 etiket için ~180 YENİ gönderim öngörülüyor (60'ı
+zaten cache'te, tekrar harcanmaz). Projeksiyon: **431 (mevcut) + ~180 (yeni) ≈ 611/1500**
+— model 2'nin kendi 300'lük tavanının içinde (~240/300 kullanılmış olur) ve global tavanın
+hâlâ **889 gönderim altında**.
 
 1 istek/sn'de bu ~22 dakikalık gerçek istek süresidir, günlere yayılmış — production
 trafiği içinde fark edilmez.

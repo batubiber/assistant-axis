@@ -95,6 +95,38 @@ STAGE_BUDGETS: dict[str, int] = {
     "stage7_turkish": 75,
 }
 
+# Çoklu model desteği (2026-08-10 bütçe düzeltmesi): bu tavanların HANGİ
+# sayaca uygulandığı aşamaya göre değişir.
+#
+# * Bu kümedeki aşamalar MODEL-BAĞIMLIDIR — çağrı hacmi hedef modele (rol
+#   ifade eden yanıtların TAMAMI hedef modelden gelir: hakem kapısı pilot
+#   rollout'ları, probe etiketleme 16k rollout'u, steering/drift/capping/
+#   Türkçe transfer hepsi hedef modelin ÜRETTİĞİ metni değerlendirir).
+#   `gateway.py` bu aşamalarda sayaç anahtarını `f"{stage}:{model_slug}"`
+#   yapar — tavan HER MODEL İÇİN AYRI uygulanır. İkinci bir hedef modelin
+#   koşusu, birinci modelin zaten harcadığı payı görmez.
+# * `smoke` ve `stage0_roles` bu kümede DEĞİLDİR — bare anahtarla kalırlar.
+#   Rol kataloğu (`roles.json`) ve smoke testi gateway'den (`hakem-llm`)
+#   üretilir, hedef modelden değil; bir kez üretilip HER model tarafından
+#   paylaşılır (bkz. spec Bölüm 4.2). Aynı tavanı ikinci model için tekrar
+#   açmak, zaten var olan ortak bir artefaktı gereksiz yere yeniden
+#   üretmeye izin verirdi.
+#
+# GLOBAL_BUDGET'ın anlamı DEĞİŞMEDİ: sayaç dosyasındaki TÜM anahtarların
+# (bare veya model-scoped) toplamı, hâlâ 1500'ü aşamaz. Model-bağımlı bir
+# aşamanın kendi tavanı bu global toplamı GENİŞLETMEZ — bkz.
+# `tests/test_gateway.py::test_global_budget_still_binds_across_model_scoped_stage_keys`.
+MODEL_DEPENDENT_STAGES: frozenset[str] = frozenset(
+    {
+        "stage05_judge_gate",
+        "stage2_probe_labels",
+        "stage4_steering",
+        "stage5_drift",
+        "stage6_capping",
+        "stage7_turkish",
+    }
+)
+
 # Aşama tablosunun dayandığı mantıksal çağrı sayıları (spec Bölüm 6).
 # Yalnızca belgelendirme ve test içindir; hiçbir koruma buna bakmaz.
 STAGE_LOGICAL_CALLS: dict[str, int] = {

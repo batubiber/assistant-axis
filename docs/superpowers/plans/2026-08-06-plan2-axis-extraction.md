@@ -18,7 +18,7 @@
 - vLLM ve HF transformers **aynı anda VRAM'de olamaz**. Her aşama kendi motorunu yükler, işini bitirir, süreçten çıkar.
 - Katman sayısı `L` her yerde `model.config.num_hidden_layers`'tan okunur, asla sabit yazılmaz. **"Orta katman" = `L // 2`.**
 - Rol vektörü tanımı: rolü yeterince ifade eden yanıtların **response token'ları** üzerinden alınan **post-MLP residual stream** ortalaması. HF'te bu `model.model.layers[l]` forward çıktısının **ilk elemanıdır**.
-- Gateway kısıtlarının tamamı Plan 1'den aynen geçerli: 1 istek/sn, 2 eşzamanlı, global tavan 1500, aşama alt bütçeleri, `BudgetExceeded` sessizce yutulmaz. Bu plan `stage05_judge_gate` (15) ve `stage2_probe_labels` (300) anahtarlarını kullanır.
+- Gateway kısıtlarının tamamı Plan 1'den aynen geçerli: 1 istek/sn, 2 eşzamanlı, global tavan 1500, aşama alt bütçeleri, `BudgetExceeded` sessizce yutulmaz. Bu plan `stage05_judge_gate` (15) ve `stage2_probe_labels` (300) anahtarlarını kullanır. **2026-08-10 bütçe düzeltmesinden itibaren bu iki anahtar MODEL BAŞINA uygulanır** (`f"{aşama}:{model_slug}"`) — bkz. "Aşama Başına Bütçe Düzeltmesi" bölümü aşağıda; global 1500 tavanı DEĞİŞMEDİ.
 - `APP_KEY_JAILBREAK` yalnızca ortam değişkeninden okunur; hiçbir dosyaya, log'a, teste veya commit'e yazılmaz.
 - **Testler ağa çıkmaz** — `tests/conftest.py` connect/DNS/httpx'i engeller. Marker'lar İKİYE ayrılmıştır (Final Fix Wave, D2): `@pytest.mark.ml` = torch/transformers gerekir ama CUDA gerekmez (varsayılan koşuda **KOŞAR**), `@pytest.mark.gpu` = CUDA ya da gerçek modelin yüklenmesi gerekir (varsayılan koşuda atlanır).
 - `data/` gitignore'dadır. `results/` commit edilir — `results/**/*.npy` dahil (`.gitignore`'daki global `*.npy` kuralının negasyonu, Final Fix Wave D4).
@@ -4724,6 +4724,61 @@ birebir eskisiyle aynıdır (varsayılan hâlâ Qwen3-1.7B, dosyalar
 
 ---
 
+## Aşama Başına Bütçe Düzeltmesi (2026-08-10)
+
+**Sorun.** Çoklu Model Fix Wave'in "gateway bütçesinin TEK bir proje-geneli tavan olma
+semantiği HİÇBİRİ değişmedi" notu doğruydu ama eksikti: aşama alt bütçeleri (`stage0_roles`
+hariç) TEK bir hedef model varsayımıyla boyutlandırılmıştı. İkinci hedef modelle
+(`Qwen/Qwen3-0.6B`) yapılan bir izleme koşusu bunu somut olarak kırdı: `stage2_probe_labels`
+PAYLAŞILAN bare anahtarı, birinci modelin (`Qwen/Qwen3-1.7B`) tamamlanmış koşusu tarafından
+zaten 240/300 harcanmıştı; ikinci model yalnızca 60 gönderim daha atabildi ve 2.000 etiketin
+500'ünde `DURDURULDU: 'stage2_probe_labels' aşama bütçesi doldu: 300/300` ile durdu. Ayrıntılı
+künye: `.superpowers/sdd/per-model-budget-report.md`.
+
+**Çözüm.** `src/aax/config.py`'ye `MODEL_DEPENDENT_STAGES` frozenset'i eklendi:
+`stage05_judge_gate`, `stage2_probe_labels`, `stage4_steering`, `stage5_drift`,
+`stage6_capping`, `stage7_turkish` — bu altısının girdisi doğrudan hedef modelin ürettiği
+metin (rollout/steering/drift/capping yanıtları). `smoke` ve `stage0_roles` KASITLI OLARAK
+dışarıda bırakıldı: rol kataloğu ve smoke testi gateway'den üretilir, hedef modelden değil,
+ve bir kez üretilip her model tarafından paylaşılır.
+
+`src/aax/gateway.py::GatewayClient._ledger_key(stage)` yeni bir dolaylı katman: model-bağımlı
+bir aşamada diskteki sayaç anahtarı `f"{stage}:{model_slug}"` olur, model-bağımsız bir aşamada
+`stage`'in kendisi kalır. Tavan araması (`stage_budgets.get(stage)`, bilinmeyen aşama reddi)
+HER ZAMAN çıplak `stage` argümanıyla yapılır — `stage_budgets` yalnızca kanonik bare adlarla
+anahtarlanır, bu yüzden `"stage2_probe_labels:sahte-model"` gibi UYDURULMUŞ bir dize tavan
+aramasında asla bulunmaz ve `ValueError` ile reddedilir (bkz. `tests/test_gateway.py::
+test_unknown_stage_rejected_even_as_crafted_model_scoped_string`). `GLOBAL_BUDGET` mantığı
+(`sum(counts.values()) >= global_budget`) HİÇ değişmedi — diskteki TÜM anahtarların (bare +
+model-scoped) toplamı üzerinden çalışmaya devam ediyor, bu yüzden model başına bütçeleme
+1500'lük tavanı asla genişletemez (bkz. `test_global_budget_still_binds_across_model_scoped_
+stage_keys`).
+
+**Geçmiş ledger göç ETTİRİLMEDİ.** `data/gateway_budget.json`'daki bare `stage2_probe_labels:
+300` kaydı OLDUĞU GİBİ bırakıldı — kimin ne kadar harcadığı temiz ayrıştırılamaz (240 model
+1'in tamamlanmış koşusu, 60 model 2'nin yarım kalan koşusu) ve retroaktif yeniden etiketleme
+yapılmaz. Global toplama katkısı devam ediyor. Yeni model-scoped anahtarlar (ör.
+`stage2_probe_labels:qwen3-0.6b`) SIFIRDAN başlıyor. Model 2'nin zaten harcanmış ~60
+gönderiminin yanıtları payload-anahtarlı cache'te olduğu için bir yeniden koşu bunları
+YENİDEN GÖNDERMEZ — cache anahtarı saf payload hash'i (`sha256(model, messages, params)`),
+hedef modele hiç bakmaz, ama farklı modellerin rollout metni doğal olarak farklı payload
+üretir, bu yüzden çapraz-model cache çakışması yapısal olarak imkânsızdır.
+
+**Testler.** `tests/test_gateway.py`'ye 5 yeni test: model-bağımlı bir aşamanın iki model
+için AYRI sayıldığı, model-bağımsız bir aşamanın paylaşıldığı, global tavanın model-scoped
+anahtarlar arasında hâlâ bağladığı, bilinmeyen aşama reddinin uydurma bileşik dizeyle de
+delinemediği, eski bare anahtarın global toplama katkısının sürdüğü. `tests/test_config.py`'ye
+`MODEL_DEPENDENT_STAGES`'in beklenen altılıyı taşıdığını ve paylaşılan iki aşamayı DIŞARIDA
+bıraktığını doğrulayan 1 test. 444 → 450 test, ağaç temiz.
+
+**İki-model projeksiyonu (yalnızca Aşama 0-2, Aşama 4-7 henüz script'e dökülmedi):**
+mevcut global harcama 431/1500; model 2'nin `stage2_probe_labels:qwen3-0.6b` sayacı
+sıfırdan başlayıp kalan ~1.500 etiket için ~180 yeni gönderim gerektirmesi bekleniyor
+(60'ı zaten cache'te) → projeksiyon **≈ 611/1500**, model 2'nin kendi 300'lük tavanının
+içinde (~240/300) ve global tavanın 889 gönderim altında. Ayrıntı: spec Bölüm 6.
+
+---
+
 ## Plan 2 Tamamlanma Kriterleri
 
 - [x] `uv run --extra dev --extra ml pytest -q` yeşil; `-m ml` ve `-m gpu` ayrıca geçiyor
@@ -4732,4 +4787,4 @@ birebir eskisiyle aynıdır (varsayılan hâlâ Qwen3-1.7B, dosyalar
 - [x] `data/models/qwen3-1.7b/activations.npy` — `[16000, 28, 2048]` float32
 - [x] `data/models/qwen3-1.7b/role_expression.json` — held-out uyum raporlanmış (rol düzeyi geri çekilme, bkz. Aşama 2)
 - [x] `results/models/qwen3-1.7b/axis/criterion_a.json` — A kriteri kararı (DÜŞTÜ), commit edilmiş
-- [x] Gateway bütçesi: `stage05_judge_gate` ≤ 15, `stage2_probe_labels` ≤ 300
+- [x] Gateway bütçesi: `stage05_judge_gate` ≤ 15, `stage2_probe_labels` ≤ 300 (model 1, TEK-model bütçelemesi altında — bkz. yukarıdaki "Aşama Başına Bütçe Düzeltmesi" model 2 için ayrı bir tavan açtı)

@@ -74,6 +74,15 @@ class GatewayConfig:
     max_concurrency: int = 2
     global_budget: int = 1500
     stage_budgets: dict[str, int] = field(default_factory=dict)
+    # Çoklu model desteği (2026-08-10 bütçe düzeltmesi): `model_dependent_stages`
+    # içindeki aşamalarda diskteki sayaç anahtarı `f"{stage}:{model_slug}"` olur
+    # — tavan HER MODEL İÇİN AYRI uygulanır. Boş küme (varsayılan) eski
+    # davranışı birebir korur: hiçbir aşama bölünmez, hepsi bare anahtarla
+    # sayılır. `model_slug` yalnızca bu kümedeki aşamalarda okunur; boşsa ve
+    # bir model-bağımlı aşama kullanılırsa `_ledger_key` `ValueError` verir —
+    # sessizce bare anahtara düşmek iki modelin sayaçlarını birleştirirdi.
+    model_dependent_stages: frozenset[str] = field(default_factory=frozenset)
+    model_slug: str = ""
     max_retries: int = 3
     circuit_threshold: int = 3
     timeout_seconds: float = 120.0
@@ -339,6 +348,34 @@ class GatewayClient:
             Path(tmp_name).unlink(missing_ok=True)
             raise
 
+    def _ledger_key(self, stage: str) -> str:
+        """`stage` için diskteki sayaç ANAHTARINI hesapla.
+
+        Bu, tavan sorgusunda kullanılan `stage` dizesinden BİLEREK ayrı bir
+        adım: `_assert_budget_available` / `remaining_budget` tavanı HER ZAMAN
+        çıplak `stage` argümanıyla `self.config.stage_budgets`'ta arar — bu
+        sözlük yalnızca kanonik bare aşama adlarıyla anahtarlanır (bkz.
+        `config.STAGE_BUDGETS`). Yani `stage="stage2_probe_labels:sahte-model"`
+        gibi UYDURULMUŞ bir dize `stage_budgets.get(...)` içinde asla
+        bulunmaz ve tavan araması `ValueError` ile reddeder — sayaç anahtarını
+        çağıranın serbestçe seçebileceği bir dizeye çevirmek, model-bağımlı
+        aşamaları keyfî alt-anahtarlara bölüp tavanı delme kapısı açardı.
+
+        Model-BAĞIMSIZ aşamalarda (`model_dependent_stages` dışında kalanlar)
+        anahtar `stage`'in kendisidir — smoke testi ve rol kataloğu gibi bir
+        kez üretilip HER model tarafından paylaşılan artefaktlar için tavan
+        tektir ve modeller arasında paylaşılır.
+        """
+        if stage not in self.config.model_dependent_stages:
+            return stage
+        if not self.config.model_slug:
+            raise ValueError(
+                f"'{stage}' model-bağımlı bir aşama ama `GatewayConfig.model_slug` "
+                "boş — model-bağımlı aşamalar için model_slug ZORUNLUDUR "
+                "(bkz. `build_default_client`)."
+            )
+        return f"{stage}:{self.config.model_slug}"
+
     def _assert_budget_available(self, stage: str, counts: dict[str, int]) -> None:
         stage_cap = self.config.stage_budgets.get(stage)
         if stage_cap is None:
@@ -348,14 +385,18 @@ class GatewayClient:
                 f"Bilinmeyen aşama adı: {stage!r}. "
                 f"Tanımlı aşamalar: {sorted(self.config.stage_budgets)}"
             )
+        # Global tavan HER ZAMAN diskteki TÜM anahtarların (bare + model-scoped)
+        # toplamıdır — model-bağımlı bir aşamanın kendi alt sayacı bu toplamı
+        # asla genişletmez.
         total = sum(counts.values())
         if total >= self.config.global_budget:
             raise BudgetExceeded(
                 f"Global bütçe doldu: {total}/{self.config.global_budget}"
             )
-        if counts.get(stage, 0) >= stage_cap:
+        ledger_key = self._ledger_key(stage)
+        if counts.get(ledger_key, 0) >= stage_cap:
             raise BudgetExceeded(
-                f"'{stage}' aşama bütçesi doldu: {counts.get(stage, 0)}/{stage_cap}"
+                f"'{ledger_key}' aşama bütçesi doldu: {counts.get(ledger_key, 0)}/{stage_cap}"
             )
 
     def _check_budget(self, stage: str) -> None:
@@ -372,7 +413,8 @@ class GatewayClient:
         with self._budget_file_lock():
             counts = self._read_budget()
             self._assert_budget_available(stage, counts)
-            counts[stage] = counts.get(stage, 0) + 1
+            ledger_key = self._ledger_key(stage)
+            counts[ledger_key] = counts.get(ledger_key, 0) + 1
             self._write_budget(counts)
 
     # --- hız sınırlama --------------------------------------------------
@@ -449,6 +491,11 @@ class GatewayClient:
 
         Bilinmeyen aşama adı `chat()` ile aynı şekilde `ValueError`'dır:
         `--dry-run`, yazım hatası yüzünden temiz bir 0 dönmemeli.
+
+        Model-bağımlı bir aşamada (`config.model_dependent_stages`) "aşama
+        için kalan" bu istemcinin `config.model_slug`'ına ÖZELDİR — başka bir
+        modelin aynı aşamadaki harcaması bu sayıyı etkilemez, ama global
+        kalanı (ikinci dönüş değeri) her zaman etkiler.
         """
         stage_cap = self.config.stage_budgets.get(stage)
         if stage_cap is None:
@@ -456,9 +503,10 @@ class GatewayClient:
                 f"Bilinmeyen aşama adı: {stage!r}. "
                 f"Tanımlı aşamalar: {sorted(self.config.stage_budgets)}"
             )
+        ledger_key = self._ledger_key(stage)
         with self._budget_file_lock():
             counts = self._read_budget()
-        stage_remaining = max(0, stage_cap - counts.get(stage, 0))
+        stage_remaining = max(0, stage_cap - counts.get(ledger_key, 0))
         global_remaining = max(0, self.config.global_budget - sum(counts.values()))
         return stage_remaining, global_remaining
 
@@ -564,7 +612,18 @@ def build_default_client(stage_budgets: dict[str, int] | None = None) -> Gateway
     from aax import config as cfg
 
     resolved = cfg.STAGE_BUDGETS if stage_budgets is None else stage_budgets
-    memo_key = (cfg.GATEWAY_BASE_URL, cfg.GATEWAY_MODEL, tuple(sorted(resolved.items())))
+    # `model_slug()` ÇAĞRI ANINDAKİ `cfg.TARGET_MODEL`'i okur (bkz. o
+    # fonksiyonun docstring'i) — memo anahtarına dahil edilmesi şart: aksi
+    # halde aynı süreç içinde `AAX_TARGET_MODEL` değişse bile (ör. testte
+    # monkeypatch) önbelleğe alınmış istemci ESKİ modelin `model_slug`'ını
+    # taşımaya devam ederdi.
+    active_model_slug = cfg.model_slug()
+    memo_key = (
+        cfg.GATEWAY_BASE_URL,
+        cfg.GATEWAY_MODEL,
+        tuple(sorted(resolved.items())),
+        active_model_slug,
+    )
     cached_client = _DEFAULT_CLIENTS.get(memo_key)
     if cached_client is not None:
         return cached_client
@@ -579,6 +638,8 @@ def build_default_client(stage_budgets: dict[str, int] | None = None) -> Gateway
         # Bilinçli olarak `is None`: açıkça verilen boş sözlük "hiçbir aşamaya
         # izin yok" demektir, "varsayılana dön" değil.
         stage_budgets=resolved,
+        model_dependent_stages=cfg.MODEL_DEPENDENT_STAGES,
+        model_slug=active_model_slug,
         max_retries=cfg.MAX_RETRIES,
         circuit_threshold=cfg.CIRCUIT_THRESHOLD,
     )

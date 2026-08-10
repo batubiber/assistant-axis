@@ -62,6 +62,24 @@ def test_stage_budget_table_matches_spec_bolum_6():
     assert sum(config.STAGE_BUDGETS.values()) == 1320
 
 
+def test_model_dependent_stages_matches_spec_bolum_6():
+    """`MODEL_DEPENDENT_STAGES` model-özel çalışan altı aşamayı taşımalı;
+    smoke testi ve rol kataloğu (`stage0_roles`) bu kümenin DIŞINDA kalmalı
+    — ikisi gateway'den üretilir, hedef modelden değil, ve bir kez üretilip
+    her model tarafından paylaşılır (bkz. spec Bölüm 4.2/6)."""
+    assert config.MODEL_DEPENDENT_STAGES == {
+        "stage05_judge_gate",
+        "stage2_probe_labels",
+        "stage4_steering",
+        "stage5_drift",
+        "stage6_capping",
+        "stage7_turkish",
+    }
+    assert config.MODEL_DEPENDENT_STAGES.issubset(config.STAGE_BUDGETS)
+    assert "smoke" not in config.MODEL_DEPENDENT_STAGES
+    assert "stage0_roles" not in config.MODEL_DEPENDENT_STAGES
+
+
 def test_api_key_raises_when_env_missing(monkeypatch):
     monkeypatch.delenv("APP_KEY_JAILBREAK", raising=False)
     with pytest.raises(RuntimeError, match="APP_KEY_JAILBREAK"):
