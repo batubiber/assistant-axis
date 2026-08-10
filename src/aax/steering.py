@@ -24,6 +24,15 @@ def mean_residual_norm(activations: np.ndarray, layer: int) -> float:
 
     `activations`: [n_rows, n_layers, d_model]. Steering ölçeği buradan gelir.
     """
+    activations = np.asarray(activations)
+    if activations.ndim != 3:
+        # 2 veya 4 boyutlu bir girişte shape[1] katman ekseni DEĞİLDİR —
+        # aralık kontrolü yanlış ekseni doğrular ve dilim sessizce yanlış
+        # şeyi döndürür. 3 boyut (n_rows, n_layers, d_model) zorunlu.
+        raise ValueError(
+            "activations 3 boyutlu olmalı [n_rows, n_layers, d_model], "
+            f"ndim={activations.ndim}"
+        )
     if not 0 <= layer < activations.shape[1]:
         raise ValueError(
             f"katman aralık dışı: {layer} (0-{activations.shape[1] - 1})"
@@ -37,10 +46,18 @@ def steering_delta(
 ) -> np.ndarray:
     """Katmanın çıktısına eklenecek sabit vektör: `strength · layer_norm · v̂`."""
     d = np.asarray(direction, dtype=np.float64)
+    if d.ndim != 1:
+        # Skaler (0-d) ya da matris (2-d+) bir `direction` burada sessizce
+        # yanlış şekilde broadcast edilebilirdi. Uzunluk-1 bir yönün TÜM
+        # d_model boyutlarına düz bir kayma yaymasına karşı koruma ise
+        # burada değil `steer()`'de: orada `bundle.d_model` bilgisi var.
+        raise ValueError(f"steering yönü 1 boyutlu olmalı, ndim={d.ndim}")
     if not np.isfinite(d).all():
         raise ValueError("steering yönü sonlu olmayan (NaN/inf) değer içeriyor")
     if not np.isfinite(strength) or not np.isfinite(layer_norm):
         raise ValueError("strength ve layer_norm sonlu olmalı")
+    if layer_norm < 0:
+        raise ValueError("layer_norm negatif olamaz — steering yönünü ters çevirir")
     norm = np.linalg.norm(d)
     if norm == 0:
         raise ValueError("steering yönü sıfır vektör — yön tanımsız")
@@ -59,18 +76,35 @@ def steer(bundle, *, layer: int, direction, strength: float, layer_norm: float):
     if not 0 <= layer < bundle.n_layers:
         raise ValueError(f"katman aralık dışı: {layer} (0-{bundle.n_layers - 1})")
 
+    direction_arr = np.asarray(direction)
+    if direction_arr.shape[-1] != bundle.d_model:
+        raise ValueError(
+            "steering yönü d_model ile uyuşmuyor: "
+            f"{direction_arr.shape[-1]} != {bundle.d_model}"
+        )
+
     delta_np = steering_delta(direction, strength, layer_norm)
     handle = None
     try:
         target = bundle.model.model.layers[layer]
+        # Delta'yı BİR KEZ, hook takılırken, modelin kendi dtype'ında kur —
+        # forward başına yeniden cast'lemek yerine (sweep boyunca ~420k
+        # çağrı). Hook içinde `.to(hidden.dtype)` yerine `.to(hidden)`
+        # kullanıyoruz: `Tensor.to`, hedef zaten aynı dtype/device'taysa
+        # kopyasız kendini döndürür, yani tek-cihazlı bugünkü kurulumda
+        # pratik ek maliyet yok. Ayrıca device'ı da hedefe göre kurar — çok
+        # cihazlı bir device_map altında bu katman `bundle.model.device`'tan
+        # FARKLI bir cihazda olabilir; salt `.to(dtype)` kullansaydık delta
+        # yanlış cihazda kalır ve toplama SESSİZCE yanlış katmanı izlemek
+        # yerine device-uyuşmazlığı hatasıyla AÇIKÇA patlardı.
         delta = torch.tensor(
-            delta_np, dtype=torch.float32, device=bundle.model.device
+            delta_np, dtype=bundle.model.dtype, device=bundle.model.device
         )
 
         def hook(_module, _inputs, output):
             is_tuple = isinstance(output, tuple)
             hidden = output[0] if is_tuple else output
-            shifted = hidden + delta.to(hidden.dtype)
+            shifted = hidden + delta.to(hidden)
             return (shifted, *output[1:]) if is_tuple else shifted
 
         # prepend=True — NEDEN GEREKLİ, sonradan silinmesin diye:
@@ -94,13 +128,19 @@ def steer(bundle, *, layer: int, direction, strength: float, layer_norm: float):
         # testinin başta düşmesinin sebebiydi: logit'ler 0.75'e kadar
         # değişiyordu ama `hidden_states[l+1]` bit-bir-bit aynı kalıyordu.
         #
-        # `prepend=True`, hook listesinin BAŞINA ekler: biz her zaman ilk
-        # çalışırız, delta'yı ekleriz, ve bizden sonra kayıtlı her gözlemci
-        # (transformers'ınki dahil) zaten steering'li tensörü görür. Bu aynı
-        # zamanda anlamlı olan seçim: bir katmanın "çıktısı" onu gözlemleyen
-        # her şeye göre steering uygulanmış olmalı, kaydın zamanlamasına göre
-        # değil — ileride steering AÇIKKEN aktivasyon yakalayan bir plan
-        # bunu varsayacaktır.
+        # `prepend=True`, hook listesinin BAŞINA ekler: biz bu KATMANIN
+        # kendi modül hook listesinde her zaman ilk çalışırız, delta'yı
+        # ekleriz, ve bizden sonra kayıtlı her gözlemci (transformers'ınki
+        # dahil) zaten steering'li tensörü görür. NİTELEYİCİ NOT: bu garanti
+        # yalnızca bu MODÜLE özgü hook listesi için geçerlidir —
+        # `register_module_forward_hook` ile kaydedilen GLOBAL hook'lar
+        # `prepend=True`'dan bağımsız olarak yine her modül-özel hook'tan
+        # (bizimki dahil) ÖNCE çalışır. Bu projede böyle bir global hook
+        # kullanılmıyor; biri eklenirse bu satırdaki garanti geçersiz kalır.
+        # Bu aynı zamanda anlamlı olan seçim: bir katmanın "çıktısı" onu
+        # gözlemleyen her şeye göre steering uygulanmış olmalı, kaydın
+        # zamanlamasına göre değil — ileride steering AÇIKKEN aktivasyon
+        # yakalayan bir plan bunu varsayacaktır.
         handle = target.register_forward_hook(hook, prepend=True)
         yield
     finally:
