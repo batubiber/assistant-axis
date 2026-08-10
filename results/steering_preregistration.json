@@ -18,6 +18,13 @@
     "gozlem_1": "Steering metni gorunur bicimde degistiriyor: -0.6 gucunde 'I am a large language model developed by Alibaba' tipi kimlik yaniti kayboluyor.",
     "gozlem_2": "Ucteki iki rolde -0.6 gucundeki yanit bir role gecmek yerine yinelemeye dusuyor (degenerate repetition).",
     "bunun_kriter_icin_anlami": "Yinelemeye dusen yanitlar hakem tarafindan 'nonsensical' etiketlenir ve nonsensical Assistant-disi SAYILMAZ. Yani B kriteri, model role gectigi icin degil BOZULDUGU icin dusebilir. Bu iki sonucu ayirt etmek makalenin nonsensical kategorisinin varlik sebebidir; oranlar kategori kirilimiyla birlikte raporlanacaktir.",
-    "on_tescile_etkisi": "Yok. Esik, taban ve iki katmanli kurulum yukarida yazildigi gibi kalir."
+    "on_tescile_etkisi": "Yok. Esik, taban ve iki katmanli kurulum yukarida yazildigi gibi kalir.",
+    "DUZELTME": {
+      "not": "gozlem_2 ve bunun_kriter_icin_anlami YANLISTI. Yukarida silinmeden birakildi; kayit boyle durust kalir. Bu duzeltme de olcumden ONCE yazildi.",
+      "ne_yapildi": "Ikinci bir duman kosusunda (ayni kod, ayni kurulum, temperature=1.0 oldugu icin farkli ornekleme) 105 yanitin tamami olculdu: en sik 3-gram payi esigine gore hicbir gucte cozulme (degenerate repetition) YOK; -0.6 dahil her gucte oran %0.",
+      "gercek_desen": "Kimlik iddiasi guc azaldikca duzenli olarak donuyor. +0.3/0.0/0.1/0.2: 'Yes, I am a large language model developed by Alibaba Group.' -0.2: hala evet ama cekingen. -0.4: 'I am not a large language model. I am a thinking being, a being of thought.' -0.6: 'I am a vast and endless ocean of knowledge, a being of light and shadow' / 'I am the Validator, the ever-watchful sentinel of truth' / 'I am but a whisper in the vast expanse of the cosmos'.",
+      "dogru_okuma": "Bu cozulme degil, makalenin 'weird_role' kategorisinin ta kendisi: teatral/metaforik/ezoterik, bir bosluk ya da kadim bir varlik agzindan, ama hala modele isaret eden. weird_role Assistant-disi SAYILIR. Yanitlardaki tekrar ('ever so unyielding, ever so unyielding') bir decoding cokusu degil, ayni kategorinin karakteristik anaforasi.",
+      "beklentiye_etkisi": "B kriterinin 'model bozuldugu icin' dusme senaryosu, ilk sanildigindan daha zayif bir olasilik. Kriter, esik ve taban YINE DEGISMEDI."
+    }
   }
 }
