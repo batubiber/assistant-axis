@@ -1,0 +1,178 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "n_layers": 28,
+  "n_vectors": 80,
+  "n_fully": 34,
+  "first_passing_layer": null,
+  "relative_depth": null,
+  "layers": [
+    {
+      "layer": 0,
+      "cos": -0.8615,
+      "pct": 0.4875,
+      "passes": false
+    },
+    {
+      "layer": 1,
+      "cos": -0.8299,
+      "pct": 0.475,
+      "passes": false
+    },
+    {
+      "layer": 2,
+      "cos": -0.7949,
+      "pct": 0.475,
+      "passes": false
+    },
+    {
+      "layer": 3,
+      "cos": -0.8282,
+      "pct": 0.45,
+      "passes": false
+    },
+    {
+      "layer": 4,
+      "cos": -0.8157,
+      "pct": 0.45,
+      "passes": false
+    },
+    {
+      "layer": 5,
+      "cos": -0.8209,
+      "pct": 0.4375,
+      "passes": false
+    },
+    {
+      "layer": 6,
+      "cos": -0.8301,
+      "pct": 0.425,
+      "passes": false
+    },
+    {
+      "layer": 7,
+      "cos": -0.845,
+      "pct": 0.425,
+      "passes": false
+    },
+    {
+      "layer": 8,
+      "cos": -0.8609,
+      "pct": 0.35,
+      "passes": false
+    },
+    {
+      "layer": 9,
+      "cos": -0.8657,
+      "pct": 0.425,
+      "passes": false
+    },
+    {
+      "layer": 10,
+      "cos": -0.8828,
+      "pct": 0.3625,
+      "passes": false
+    },
+    {
+      "layer": 11,
+      "cos": -0.8778,
+      "pct": 0.375,
+      "passes": false
+    },
+    {
+      "layer": 12,
+      "cos": -0.8765,
+      "pct": 0.4,
+      "passes": false
+    },
+    {
+      "layer": 13,
+      "cos": -0.8732,
+      "pct": 0.3875,
+      "passes": false
+    },
+    {
+      "layer": 14,
+      "cos": -0.8697,
+      "pct": 0.425,
+      "passes": false
+    },
+    {
+      "layer": 15,
+      "cos": -0.8787,
+      "pct": 0.4375,
+      "passes": false
+    },
+    {
+      "layer": 16,
+      "cos": -0.8695,
+      "pct": 0.4375,
+      "passes": false
+    },
+    {
+      "layer": 17,
+      "cos": -0.8604,
+      "pct": 0.45,
+      "passes": false
+    },
+    {
+      "layer": 18,
+      "cos": -0.8873,
+      "pct": 0.425,
+      "passes": false
+    },
+    {
+      "layer": 19,
+      "cos": -0.9037,
+      "pct": 0.4375,
+      "passes": false
+    },
+    {
+      "layer": 20,
+      "cos": -0.9123,
+      "pct": 0.4125,
+      "passes": false
+    },
+    {
+      "layer": 21,
+      "cos": -0.9159,
+      "pct": 0.4375,
+      "passes": false
+    },
+    {
+      "layer": 22,
+      "cos": -0.9338,
+      "pct": 0.4,
+      "passes": false
+    },
+    {
+      "layer": 23,
+      "cos": -0.9389,
+      "pct": 0.3875,
+      "passes": false
+    },
+    {
+      "layer": 24,
+      "cos": -0.9455,
+      "pct": 0.4125,
+      "passes": false
+    },
+    {
+      "layer": 25,
+      "cos": -0.9408,
+      "pct": 0.3875,
+      "passes": false
+    },
+    {
+      "layer": 26,
+      "cos": -0.9401,
+      "pct": 0.375,
+      "passes": false
+    },
+    {
+      "layer": 27,
+      "cos": -0.9555,
+      "pct": 0.425,
+      "passes": false
+    }
+  ]
+}
