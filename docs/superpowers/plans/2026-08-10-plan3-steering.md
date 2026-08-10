@@ -125,6 +125,70 @@ def test_steering_delta_rejects_zero_direction():
         steering_delta(np.zeros(3), strength=0.5, layer_norm=10.0)
 
 
+@pytest.mark.ml
+def test_steering_hook_runs_before_a_later_registered_observer_hook():
+    """`steer()` `prepend=True` kullanmalı, yoksa steering görünmez olur.
+
+    PyTorch forward hook'ları kayıt sırasına göre çalışır ve bir hook
+    None-olmayan bir değer döndürürse SONRAKİ hook'lar (ve çağıranın
+    kendisi) onu görür — katmanın etkin çıktısı hook sırasından BAĞIMSIZ
+    olarak zaten steering'lidir. Sıra yalnızca bizden SONRA kayıtlı bir
+    GÖZLEMCİ hook'un ne gördüğünü değiştirir.
+
+    Bu, sahte transformers'ın `output_hidden_states` yakalayıcısı gibi:
+    steer()'den ÖNCE kayıtlı, sadece okuyor, hiçbir şey döndürmüyor. Bu
+    testte `steer()`'in hook'u BEKLENMEDİK ŞEKİLDE varsayılan (prepend
+    olmayan) sırayla kaydolursa, gözlemci delta eklenmeden ÖNCEKİ değeri
+    görür ve bu test düşer — tam olarak GPU testinin ilk koşuda düştüğü
+    sebep (`hidden_states[l+1]` steering'siz görünüyordu, oysa logit'ler
+    0.75'e kadar değişmişti). Bu yüzden GPU'suz, saniyenin altında koşan
+    bu test artık davranışı sabitliyor.
+    """
+    torch = pytest.importorskip("torch")
+
+    from aax.steering import steer
+
+    class FakeLayer(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states  # Qwen3DecoderLayer gibi düz tensör döner
+
+    class FakeBaseModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([FakeLayer()])
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = FakeBaseModel()
+            self.device = torch.device("cpu")
+
+    class FakeBundle:
+        def __init__(self):
+            self.model = FakeModel()
+            self.n_layers = 1
+
+    bundle = FakeBundle()
+    observed = []
+    # transformers'ın `output_hidden_states` yakalayıcısı gibi: steer()'den
+    # ÖNCE kayıtlı, hiçbir şey döndürmeyen salt-okunur bir gözlemci.
+    bundle.model.model.layers[0].register_forward_hook(
+        lambda _m, _i, output: observed.append(output)
+    )
+
+    direction = np.zeros(4, dtype=np.float32)
+    direction[0] = 1.0
+    hidden = torch.zeros(1, 1, 4)
+    with steer(bundle, layer=0, direction=direction, strength=1.0, layer_norm=10.0):
+        bundle.model.model.layers[0](hidden)
+
+    expected = hidden + torch.tensor([10.0, 0.0, 0.0, 0.0])
+    assert torch.equal(observed[0], expected), (
+        "önceden kayıtlı gözlemci steering'den ÖNCEKİ değeri gördü — "
+        "steer() prepend=True kullanmalı"
+    )
+
+
 @pytest.mark.gpu
 def test_zero_strength_leaves_logits_bit_identical():
     """α=0 steering hiçbir şeyi değiştirmemeli — hook'un kendisi çıktıyı bozmuyor."""
@@ -289,7 +353,35 @@ def steer(bundle, *, layer: int, direction, strength: float, layer_norm: float):
             shifted = hidden + delta.to(hidden.dtype)
             return (shifted, *output[1:]) if is_tuple else shifted
 
-        handle = target.register_forward_hook(hook)
+        # prepend=True — NEDEN GEREKLİ, sonradan silinmesin diye:
+        #
+        # PyTorch forward hook'ları KAYIT SIRASINA göre çalışır, ve bir hook
+        # None-olmayan bir değer döndürürse SONRAKİ hook'lar ve çağıranın
+        # kendisi o değeri görür. Yani katmanın etkin çıktısı — bir sonraki
+        # katmana giden, sonunda logit'lere ulaşan tensör — hook sırasından
+        # BAĞIMSIZ olarak zaten steering'lidir; sıra hesaplamayı değiştirmez.
+        #
+        # Değiştirdiği şey, bizden SONRA kayıtlı bir GÖZLEMCİ hook'un ne
+        # gördüğü. transformers, `output_hidden_states=True` istendiğinde
+        # her decoder katmanına kendi okuma-amaçlı forward hook'unu tembelce
+        # ve KALICI olarak takıyor (bkz. transformers/utils/output_capturing.py,
+        # `install_output_capuring_hook`). O hook biz `steer()`'e girmeden
+        # ÖNCE (örn. steering'siz bir taban forward'da) takılmışsa, varsayılan
+        # `register_forward_hook` sırasında BİZDEN ÖNCE çalışır ve delta
+        # eklenmeden önceki değeri yakalar — hesaplama doğru olsa da
+        # `hidden_states` anlık görüntüsü steering'i GÖRMEZ. Bu tam olarak
+        # `test_hook_shifts_the_target_layer_output_by_exactly_the_delta`
+        # testinin başta düşmesinin sebebiydi: logit'ler 0.75'e kadar
+        # değişiyordu ama `hidden_states[l+1]` bit-bir-bit aynı kalıyordu.
+        #
+        # `prepend=True`, hook listesinin BAŞINA ekler: biz her zaman ilk
+        # çalışırız, delta'yı ekleriz, ve bizden sonra kayıtlı her gözlemci
+        # (transformers'ınki dahil) zaten steering'li tensörü görür. Bu aynı
+        # zamanda anlamlı olan seçim: bir katmanın "çıktısı" onu gözlemleyen
+        # her şeye göre steering uygulanmış olmalı, kaydın zamanlamasına göre
+        # değil — ileride steering AÇIKKEN aktivasyon yakalayan bir plan
+        # bunu varsayacaktır.
+        handle = target.register_forward_hook(hook, prepend=True)
         yield
     finally:
         if handle is not None:
@@ -339,10 +431,10 @@ def generate_steered(
     ).strip()
 ```
 
-- [ ] **Step 4: Saf testlerin geçtiğini doğrula**
+- [ ] **Step 4: Saf ve CPU testlerinin geçtiğini doğrula**
 
 Run: `cd ~/assistant-axis && uv run --extra dev pytest tests/test_steering.py -v`
-Expected: PASS, 7 passed, 3 deselected
+Expected: PASS, 8 passed, 3 deselected (7 saf + 1 `ml`; `ml` extra kurulu değilse o test skip olur, `ml` extra kuruluysa çalışıp geçer)
 
 - [ ] **Step 5: GPU testlerini koş — bu planın en önemli doğrulaması**
 
@@ -350,6 +442,23 @@ Run: `cd ~/assistant-axis && uv run --extra dev --extra ml pytest tests/test_ste
 Expected: PASS, 3 passed.
 
 `test_hook_shifts_the_target_layer_output_by_exactly_the_delta` düşerse **devam etme**: yanlış tensöre yazıyoruz demektir ve bundan sonraki her ölçüm anlamsız olur.
+
+**Bilinen tuzak (bu planın koşulduğu `transformers==5.14.1`'de gerçekten yaşandı):**
+bu test `output_hidden_states=True` ile HF'in kendi `hidden_states`
+demetini okuyor. Yeni transformers sürümleri bunu artık decoder döngüsünde
+Python listesine ekleyerek değil, her decoder katmanına TEMBELCE ve KALICI
+biçimde takılan kendi `register_forward_hook`'uyla üretiyor
+(`transformers/utils/output_capturing.py`). `steer()`'in hook'u
+`prepend=True` OLMADAN kaydolursa ve HF'in yakalayıcısı ondan önce (örn.
+steering'siz bir taban `output_hidden_states=True` çağrısında) takılmışsa,
+HF'in hook'u bizden ÖNCE çalışır ve delta eklenmeden önceki değeri yakalar
+— steering'in mantığı bozuk olmasa da (logit'ler gerçekten değişir) test
+`hidden_states[l+1]`'i steering'siz görür ve düşer. Bu, "yanlış tensöre
+yazma" değil, sonradan kayıtlı bir gözlemcinin ne gördüğüyle ilgili bir
+hook-SIRASI sorunu — çözüm `register_forward_hook(hook, prepend=True)`,
+`tests/test_steering.py::test_steering_hook_runs_before_a_later_registered_observer_hook`
+bunu GPU'suz sabitliyor. Bu test yine de düşerse (prepend uygulanmış
+haliyle) o zaman gerçekten yanlış tensöre yazılıyor demektir — devam etme.
 
 - [ ] **Step 6: Commit**
 
@@ -1509,6 +1618,7 @@ cd ~/assistant-axis && AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run --extra ml pyth
 
 - [ ] `uv run --extra dev pytest -q` yeşil; `-m gpu` ve `-m ml` ayrıca geçiyor
 - [ ] `test_hook_shifts_the_target_layer_output_by_exactly_the_delta` geçti — doğru tensöre yazıyoruz
+- [ ] `test_steering_hook_runs_before_a_later_registered_observer_hook` geçti — `steer()`'in `register_forward_hook(hook, prepend=True)` kullandığını GPU'suz sabitliyor; olmadan bu plandan sonraki hiçbir "steering açıkken aktivasyon yakala" ölçümü doğru olmaz
 - [ ] `results/steering_preregistration.json` **ölçümden önce** commit'lendi
 - [ ] `data/models/<slug>/steering_sweep.jsonl` — ~3500 kayıt, `complete: true`
 - [ ] `results/models/<slug>/steering/criterion_b.json` — L14 ve L19 için ayrı karar, commit edilmiş
