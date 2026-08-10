@@ -56,6 +56,8 @@ def test_module_is_registered_in_sys_modules():
 def _patch_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(ltp, "LABELS_PATH", tmp_path / "probe_labels.json")
     monkeypatch.setattr(ltp, "OUT_PATH", tmp_path / "role_expression.json")
+    monkeypatch.setattr(ltp, "ROLLOUTS_PATH", tmp_path / "rollouts.jsonl")
+    monkeypatch.setattr(ltp, "ROLLOUTS_META_PATH", tmp_path / "rollouts_meta.json")
     monkeypatch.setattr(ltp.config, "DATA_DIR", tmp_path)
 
 

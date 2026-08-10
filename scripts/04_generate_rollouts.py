@@ -40,11 +40,11 @@ from aax import config
 from aax.prompts import build_default_specs, build_role_specs, load_role_catalog, to_chat_messages
 from aax.rollouts import rollout_record, write_rollouts, write_rollouts_meta
 
-OUT_PATH = config.DATA_DIR / "rollouts.jsonl"
+OUT_PATH = config.model_data_dir() / "rollouts.jsonl"
 # `rollouts.jsonl`'ın künyesi: `limit`/`n`/`run_id`. Aşama 0'ın
 # `roles.json` zarfıyla aynı işi görür — bir PİLOT artefaktının kanonik
 # sanılmasını yapısal olarak imkânsız kılar (bkz. `aax.rollouts`).
-META_PATH = config.DATA_DIR / "rollouts_meta.json"
+META_PATH = config.model_data_dir() / "rollouts_meta.json"
 
 
 def stride_sample(specs: list, n: int) -> list:

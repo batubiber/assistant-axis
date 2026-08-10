@@ -20,7 +20,7 @@ from aax.model import load_hf_model
 from aax.prompts import build_role_specs, load_role_catalog, to_chat_messages
 from aax.rollouts import rollout_record
 
-OUT_PATH = config.DATA_DIR / "pilot_rollouts.jsonl"
+OUT_PATH = config.model_data_dir() / "pilot_rollouts.jsonl"
 
 # `scripts/03_judge_gate.py::MIN_LABELLED` ile AYNI sayı — kapının
 # açılabilmesi için gereken asgari elle etiketlenmiş satır. Burada bir UYARI
@@ -94,7 +94,7 @@ def main() -> int:
     print()
     if empty:
         print(f"UYARI: {empty} boş yanıt atlandı — kapıya {len(records)} örnek gidiyor")
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     with OUT_PATH.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")

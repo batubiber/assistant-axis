@@ -35,14 +35,14 @@ from aax.model import free_vram_mib, load_hf_model
 from aax.prompts import RolloutSpec, to_chat_messages
 from aax.rollouts import load_rollouts_meta, read_rollouts, rollouts_run_id
 
-ACTS_PATH = config.DATA_DIR / "activations.npy"
-INDEX_PATH = config.DATA_DIR / "activations_index.json"
+ACTS_PATH = config.model_data_dir() / "activations.npy"
+INDEX_PATH = config.model_data_dir() / "activations_index.json"
 # Kısmi koşunun işareti. `activations_index.json` YALNIZCA geçiş eksiksiz
 # bittiğinde yazılır; bu dosya ise "matriste ilk k satır gerçek, gerisi
 # sıfır" der ve `--start-row`'un dayanağıdır.
-PARTIAL_PATH = config.DATA_DIR / "activations_partial.json"
-ROLLOUTS_PATH = config.DATA_DIR / "rollouts.jsonl"
-ROLLOUTS_META_PATH = config.DATA_DIR / "rollouts_meta.json"
+PARTIAL_PATH = config.model_data_dir() / "activations_partial.json"
+ROLLOUTS_PATH = config.model_data_dir() / "rollouts.jsonl"
+ROLLOUTS_META_PATH = config.model_data_dir() / "rollouts_meta.json"
 
 
 def compute_run_id(records: list[dict]) -> str:

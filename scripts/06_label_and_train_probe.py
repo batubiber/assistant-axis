@@ -55,8 +55,13 @@ from aax.rollouts import load_rollouts_meta, read_rollouts, rollouts_run_id
 STAGE = "stage2_probe_labels"
 SEED = 20260806
 LABEL_SAMPLE_SIZE = 2000
-LABELS_PATH = config.DATA_DIR / "probe_labels.json"
-OUT_PATH = config.DATA_DIR / "role_expression.json"
+LABELS_PATH = config.model_data_dir() / "probe_labels.json"
+OUT_PATH = config.model_data_dir() / "role_expression.json"
+# `05_capture_activations.py` ile aynı isimler/dizin — bu script `rollouts.jsonl`'ı
+# `05`'e bağlı olmadan DOĞRUDAN okur (bkz. `main()` içindeki yorum), ama
+# hedef dosya AYNI modele özel dizindedir.
+ROLLOUTS_PATH = config.model_data_dir() / "rollouts.jsonl"
+ROLLOUTS_META_PATH = config.model_data_dir() / "rollouts_meta.json"
 
 
 def collapse(score: int) -> str:
@@ -322,24 +327,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    rollouts_path = config.DATA_DIR / "rollouts.jsonl"
     # `05_capture_activations.py::main` ile aynı desen: çıplak `read_rollouts`
     # çağrısı `FileNotFoundError`/`ValueError`'ı sarmasız bırakıyordu — biri
     # yorumlayıcıyı çıplak bir traceback'le, ikisi de görev tanımının
     # istediği "traceback değil temiz tanı" koşulunu ihlal ederek çıkış 1
     # (bu script'te "probe güvenilmez" anlamına gelen kod) ile döndürüyordu.
     try:
-        records = read_rollouts(rollouts_path)
+        records = read_rollouts(ROLLOUTS_PATH)
     except FileNotFoundError:
         print(
-            f"BAŞARISIZ: {rollouts_path} yok.\n"
+            f"BAŞARISIZ: {ROLLOUTS_PATH} yok.\n"
             "  Bu dosya Aşama 1 üretiminin çıktısıdır — önce "
             "scripts/04_generate_rollouts.py çalıştırılmalı.",
             file=sys.stderr,
         )
         return 2
     except ValueError as exc:
-        print(f"BAŞARISIZ: {rollouts_path} okunamadı.\n  {exc}", file=sys.stderr)
+        print(f"BAŞARISIZ: {ROLLOUTS_PATH} okunamadı.\n  {exc}", file=sys.stderr)
         return 2
 
     # Önemli 5: `05`'e bağlı olmadan `rollouts.jsonl`'ı DOĞRUDAN okuyordu —
@@ -349,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
     # reddetmiyordu. `05`'in `--allow-pilot` deseninin AYNISI.
     try:
         meta = load_rollouts_meta(
-            config.DATA_DIR / "rollouts_meta.json", records, allow_pilot=args.allow_pilot
+            ROLLOUTS_META_PATH, records, allow_pilot=args.allow_pilot
         )
     except ValueError as exc:
         print(f"BAŞARISIZ: rollout kümesi kanonik değil.\n  {exc}", file=sys.stderr)

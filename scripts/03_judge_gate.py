@@ -55,11 +55,14 @@ THRESHOLD = 0.75
 # 3 satırda tesadüfen tutan bir uyum "%100" diye raporlanır ve BLOKLAYICI kapı
 # açılır. Boş satırlar sessizce atlandığı için tek koruma "en az bir tane"ydi.
 MIN_LABELLED = 40
-PILOT_PATH = config.DATA_DIR / "pilot_rollouts.jsonl"
+# `roles.json` model BAĞIMSIZ (gateway'den üretilir, hedef modelden değil) —
+# bkz. spec Bölüm 4.2. Diğer dördü bu pilot koşunun ÜRETTİĞİ modele özel
+# veridir ve modele göre ayrı dizinde durur.
 ROLES_PATH = config.DATA_DIR / "roles.json"
-LABELS_PATH = config.DATA_DIR / "judge_gate_labels.csv"
-MACHINE_PATH = config.DATA_DIR / "judge_gate_machine.json"
-RESULT_PATH = config.DATA_DIR / "judge_gate.json"
+PILOT_PATH = config.model_data_dir() / "pilot_rollouts.jsonl"
+LABELS_PATH = config.model_data_dir() / "judge_gate_labels.csv"
+MACHINE_PATH = config.model_data_dir() / "judge_gate_machine.json"
+RESULT_PATH = config.model_data_dir() / "judge_gate.json"
 
 
 def collapse_to_category(score: int) -> str:

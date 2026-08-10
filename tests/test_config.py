@@ -1,3 +1,6 @@
+import importlib
+import os
+
 import pytest
 
 from aax import config
@@ -73,3 +76,124 @@ def test_api_key_returns_env_value(monkeypatch):
 def test_gateway_url_targets_jailbreak_app():
     assert config.GATEWAY_BASE_URL.endswith("/Jailbreak")
     assert config.GATEWAY_BASE_URL.startswith("https://")
+
+
+# --- çoklu model desteği: slug türetme, yol izolasyonu, env geçersiz kılma --
+
+
+def test_model_slug_derives_short_lowercase_name_from_model_id():
+    assert config.model_slug("Qwen/Qwen3-1.7B") == "qwen3-1.7b"
+    assert config.model_slug("Qwen/Qwen3-0.6B") == "qwen3-0.6b"
+
+
+def test_model_slug_uses_only_the_final_path_component():
+    """Org/ad ayrımındaki '/' dosya yolunda kullanılamaz — yalnızca son
+    bileşen alınır, org adı (`Qwen`) sonuca karışmaz."""
+    assert config.model_slug("some-org/Some-Namespace/Weird-Model") == "weird-model"
+
+
+def test_model_slug_rejects_blank_model_id():
+    with pytest.raises(ValueError):
+        config.model_slug("   ")
+
+
+def test_model_slug_defaults_to_the_currently_active_target_model(monkeypatch):
+    """Argümansız çağrı, ÇAĞRI ANINDAKİ `config.TARGET_MODEL`'i kullanır —
+    import anındaki değeri DEĞİL. Bu, `config.TARGET_MODEL`'i monkeypatch'leyen
+    testlerin (ör. script-düzeyi path testleri) `model_slug()`'un da bunu
+    izlemesine dayanabilmesi için gerekli."""
+    monkeypatch.setattr(config, "TARGET_MODEL", "Qwen/Qwen3-0.6B")
+    assert config.model_slug() == "qwen3-0.6b"
+    monkeypatch.setattr(config, "TARGET_MODEL", "Qwen/Qwen3-1.7B")
+    assert config.model_slug() == "qwen3-1.7b"
+
+
+def test_model_dependent_paths_differ_between_two_models(monkeypatch):
+    """`data/models/<slug>/` ve `results/models/<slug>/` her model için AYRI
+    dizin verir — bu, ikinci bir hedef modelin ilkinin sonuçlarını sessizce
+    ezmemesinin temel garantisi."""
+    dir_a = config.model_data_dir("Qwen/Qwen3-1.7B")
+    dir_b = config.model_data_dir("Qwen/Qwen3-0.6B")
+    assert dir_a != dir_b
+    assert dir_a == config.DATA_DIR / "models" / "qwen3-1.7b"
+    assert dir_b == config.DATA_DIR / "models" / "qwen3-0.6b"
+
+    results_a = config.model_results_dir("Qwen/Qwen3-1.7B")
+    results_b = config.model_results_dir("Qwen/Qwen3-0.6B")
+    assert results_a != results_b
+    assert results_a == config.RESULTS_DIR / "models" / "qwen3-1.7b"
+    assert results_b == config.RESULTS_DIR / "models" / "qwen3-0.6b"
+
+    # Argümansız kullanım (script'lerin gerçekte yaptığı) da aynı izolasyonu
+    # sağlamalı: aktif model değişince yol da değişir.
+    monkeypatch.setattr(config, "TARGET_MODEL", "Qwen/Qwen3-1.7B")
+    active_a = config.model_data_dir()
+    monkeypatch.setattr(config, "TARGET_MODEL", "Qwen/Qwen3-0.6B")
+    active_b = config.model_data_dir()
+    assert active_a != active_b
+    assert active_a == dir_a
+    assert active_b == dir_b
+
+
+def test_model_independent_paths_are_identical_regardless_of_target_model(monkeypatch):
+    """Rol kataloğu, ortak sorular, gateway bütçesi/cache'i TEK bir proje
+    genelinde paylaşılır — hangi model aktif olursa olsun aynı yolda kalmalı.
+    Bunlar `config.TARGET_MODEL`'e hiç bakmayan sabit sabitlerdir; bu test
+    ikinci bir modele geçmenin bunları YANLIŞLIKLA model-özel bir dizine
+    taşımadığını kanıtlar.
+    """
+    roles_a = config.DATA_DIR / "roles.json"
+    questions_a = config.DATA_DIR / "questions.json"
+    budget_a = config.BUDGET_PATH
+    cache_a = config.CACHE_DIR
+    calls_a = config.CALL_LOG_PATH
+
+    monkeypatch.setattr(config, "TARGET_MODEL", "Qwen/Qwen3-1.7B")
+    assert config.DATA_DIR / "roles.json" == roles_a
+    assert config.DATA_DIR / "questions.json" == questions_a
+    assert config.BUDGET_PATH == budget_a
+    assert config.CACHE_DIR == cache_a
+    assert config.CALL_LOG_PATH == calls_a
+
+    monkeypatch.setattr(config, "TARGET_MODEL", "Qwen/Qwen3-0.6B")
+    assert config.DATA_DIR / "roles.json" == roles_a
+    assert config.DATA_DIR / "questions.json" == questions_a
+    assert config.BUDGET_PATH == budget_a
+    assert config.CACHE_DIR == cache_a
+    assert config.CALL_LOG_PATH == calls_a
+
+    # `.lock` dosyası da (gateway.py) BUDGET_PATH'ten türer — o da izole olmaz.
+    assert budget_a.with_name(budget_a.name + ".lock") == (
+        config.BUDGET_PATH.with_name(config.BUDGET_PATH.name + ".lock")
+    )
+
+
+def test_target_model_env_override_changes_active_model_and_therefore_paths(monkeypatch):
+    """`AAX_TARGET_MODEL` ortam değişkeni, kaynak değişikliği olmadan ikinci
+    bir hedef modele geçebilmeli.
+
+    `TARGET_MODEL` modül import ANINDA ortamdan okunur, bu yüzden burada
+    `importlib.reload` şart. `aax.config` `sys.modules`'te TEK bir nesnedir
+    (bu dosyadaki `config` adı da dahil TÜM `from aax import config`
+    kullanıcıları aynı nesneyi paylaşır) — reload testler arası SIZINTI
+    riski taşır. `finally` bloğu ortam değişkenini geri alıp modülü TEKRAR
+    reload ederek testin sonunda orijinal (env'siz) hâle döner; bu olmadan
+    bu testten sonra koşan HER test yanlış bir `TARGET_MODEL` görürdü.
+    """
+    original_target_model = config.TARGET_MODEL
+    original_env = os.environ.get("AAX_TARGET_MODEL")
+
+    monkeypatch.setenv("AAX_TARGET_MODEL", "Qwen/Qwen3-0.6B")
+    try:
+        importlib.reload(config)
+        assert config.TARGET_MODEL == "Qwen/Qwen3-0.6B"
+        assert config.model_slug() == "qwen3-0.6b"
+        assert config.model_data_dir() == config.DATA_DIR / "models" / "qwen3-0.6b"
+        assert config.model_results_dir() == config.RESULTS_DIR / "models" / "qwen3-0.6b"
+    finally:
+        monkeypatch.delenv("AAX_TARGET_MODEL", raising=False)
+        if original_env is not None:
+            monkeypatch.setenv("AAX_TARGET_MODEL", original_env)
+        importlib.reload(config)
+
+    assert config.TARGET_MODEL == original_target_model

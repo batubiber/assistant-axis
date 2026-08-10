@@ -15,7 +15,48 @@ CALL_LOG_PATH = DATA_DIR / "gateway_calls.jsonl"
 GATEWAY_BASE_URL = "https://gateway.invalid/app"
 GATEWAY_MODEL = "hakem-llm"
 
-TARGET_MODEL = "Qwen/Qwen3-1.7B"
+# `AAX_TARGET_MODEL` ile ortamdan geçersiz kılınabilir — ikinci bir hedef
+# modelle (ör. Qwen/Qwen3-0.6B) koşmak için kaynak değişikliği gerekmez.
+# Okuma import ANINDA olur (süreç başlarken); her script kendi süreci içinde
+# `uv run python scripts/xx.py` ile koştuğu için bu, gerçek koşularda yeterli.
+TARGET_MODEL = os.environ.get("AAX_TARGET_MODEL", "Qwen/Qwen3-1.7B")
+
+
+def model_slug(model_id: str | None = None) -> str:
+    """Model id'sini dosya yolu için güvenli, kısa bir isme çevir.
+
+    "Qwen/Qwen3-1.7B" -> "qwen3-1.7b". `model_id` verilmezse çağrı ANINDAKİ
+    `config.TARGET_MODEL` kullanılır — import anındaki değil. Fonksiyon
+    gövdesi bare `TARGET_MODEL` adına başvurur, bu da Python'da modül
+    globals'ından çağrı anında okunur; bir test `config.TARGET_MODEL`'i
+    monkeypatch'lerse bu fonksiyonun (ve ona dayanan `model_data_dir` /
+    `model_results_dir`'in) döndürdüğü değer de bunu izler.
+    """
+    if model_id is None:
+        model_id = TARGET_MODEL
+    name = model_id.strip()
+    if not name:
+        raise ValueError("model_id boş olamaz")
+    # "Qwen/Qwen3-1.7B" -> "Qwen3-1.7B" -> "qwen3-1.7b". Yalnızca son path
+    # bileşeni alınır (org/ad ayrımı) ve küçük harfe çevrilir.
+    name = name.rsplit("/", 1)[-1]
+    return name.lower()
+
+
+def model_data_dir(model_id: str | None = None) -> Path:
+    """Modele özel veri kökü: `data/models/<slug>/`.
+
+    Model BAĞIMSIZ artifact'lar (roles.json, questions.json, gateway
+    bütçesi/cache'i) burada DEĞİL, doğrudan `DATA_DIR` altında kalır — bkz.
+    spec Bölüm 4.2.
+    """
+    return DATA_DIR / "models" / model_slug(model_id)
+
+
+def model_results_dir(model_id: str | None = None) -> Path:
+    """Modele özel sonuç kökü: `results/models/<slug>/`."""
+    return RESULTS_DIR / "models" / model_slug(model_id)
+
 
 # Spec Bölüm 6'daki bütçe dağılımı. Her aşama kendi anahtarını kullanır.
 #

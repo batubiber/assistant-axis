@@ -4674,12 +4674,62 @@ olarak yeni davranışı miras aldı — ayrıca bir kod değişikliği gerekmed
 
 ---
 
+## Çoklu Model Fix Wave (2026-08-10)
+
+Ön kaydedilmiş bir izleme deneyi (Qwen3-0.6B) aynı pipeline'ı Qwen3-1.7B'nin
+sonuçlarını sessizce ezmeden koşabilmeli. Aşağıdaki değişiklikler bunu sağlar.
+Ayrıntılı gerekçe ve künye: `.superpowers/sdd/multimodel-report.md`.
+
+- **`src/aax/config.py`** — `TARGET_MODEL` artık `AAX_TARGET_MODEL` ortam
+  değişkeniyle kaynak değişikliği yapmadan geçersiz kılınabilir (varsayılan
+  aynı: `"Qwen/Qwen3-1.7B"`). Yeni `model_slug()` / `model_data_dir()` /
+  `model_results_dir()` fonksiyonları eklendi — bkz. spec Bölüm 4.2.
+- **Model BAĞIMLI artefaktlar** (`scripts/02`…`07`'nin ürettiği pilot/judge-gate/
+  rollout/aktivasyon/probe/eksen dosyaları) artık `data/models/<slug>/` ve
+  `results/models/<slug>/axis/` altında yazılıyor — `<slug>` aktif
+  `config.TARGET_MODEL`'den türetilir (`model_slug()`). Model BAĞIMSIZ
+  artefaktlar (`data/roles.json`, `data/questions.json`, gateway bütçesi/cache'i)
+  KASITLI OLARAK `config.DATA_DIR`'de kalıyor — bunlar gateway'den üretilir,
+  hedef modelden değil.
+- **Mevcut 1.7B artefaktları taşındı** (`data/*` → `data/models/qwen3-1.7b/*`,
+  `results/axis/` → `results/models/qwen3-1.7b/axis/`). `data/activations.npy`
+  (3.67 GB) aynı dosya sistemi içinde atomik `rename` ile taşındı, kopyalanıp
+  silinmedi. Taşımadan sonra doğrulandı: dizi hâlâ `(16000, 28, 2048)` şeklinde
+  yükleniyor, `activations_index.json`'ın `run_id`'si `rollouts_meta.json`'la
+  hâlâ eşleşiyor, `criterion_a.json` aynı kayıtlı hükmü (`passed: false`,
+  `run_id: c9b2b55f5a11403c`) taşıyor.
+- Kriter A'nın mantığı, `--min-role-vectors` tabanı, `--role-level-fallback`
+  kuralı, `07`'nin bayatlık/kapsama kontrolleri, gateway bütçesinin TEK bir
+  proje-geneli tavan olma semantiği — HİÇBİRİ değişmedi.
+- Yeni testler: `tests/test_config.py` — slug türetme, env geçersiz kılma
+  (`importlib.reload` ile), iki model arasında yol farkı, model bağımsız
+  yolların model değişse de aynı kalması. `tests/test_extract_axis.py` ve
+  `tests/test_label_and_train_probe.py`'nin `_patch_paths` yardımcıları
+  yeni `ACTS_PATH`/`INDEX_PATH` (07) ve `ROLLOUTS_PATH`/`ROLLOUTS_META_PATH`
+  (06) modül sabitlerini de patch'liyor — script'lerdeki inline
+  `config.DATA_DIR / "..."` hesapları modül düzeyi sabitlere taşındığı için.
+
+**İkinci bir hedef modelle koşmak için operatör komutu** (örnek: Qwen3-0.6B):
+
+```
+AAX_TARGET_MODEL="Qwen/Qwen3-0.6B" uv run --extra ml python scripts/02_pilot_rollouts.py
+AAX_TARGET_MODEL="Qwen/Qwen3-0.6B" uv run python scripts/03_judge_gate.py --machine
+# ... (aynı `AAX_TARGET_MODEL` ile Aşama 1-3 boyunca)
+```
+
+Kaynak değişikliği gerekmez; her script kendi süreci içinde ortam
+değişkenini import anında okur. `AAX_TARGET_MODEL` VERİLMEZSE davranış
+birebir eskisiyle aynıdır (varsayılan hâlâ Qwen3-1.7B, dosyalar
+`data/models/qwen3-1.7b/` ve `results/models/qwen3-1.7b/axis/` altında).
+
+---
+
 ## Plan 2 Tamamlanma Kriterleri
 
-- [ ] `uv run --extra dev --extra ml pytest -q` yeşil; `-m ml` ve `-m gpu` ayrıca geçiyor
-- [ ] `data/judge_gate.json` — `passed: true`, uyum ≥ %75, `n` ≥ 40
-- [ ] `data/rollouts.jsonl` + `data/rollouts_meta.json` — ~16.000 kayıt, `limit: null`
-- [ ] `data/activations.npy` — `[~16000, L, d_model]` float32
-- [ ] `data/role_expression.json` — held-out uyum raporlanmış
-- [ ] `results/axis/criterion_a.json` — A kriteri kararı, commit edilmiş
-- [ ] Gateway bütçesi: `stage05_judge_gate` ≤ 15, `stage2_probe_labels` ≤ 300
+- [x] `uv run --extra dev --extra ml pytest -q` yeşil; `-m ml` ve `-m gpu` ayrıca geçiyor
+- [x] `data/models/qwen3-1.7b/judge_gate.json` — uyum %77.8 (eşik %75), `n` ≥ 40
+- [x] `data/models/qwen3-1.7b/rollouts.jsonl` + `rollouts_meta.json` — 16.000 kayıt, `limit: null`
+- [x] `data/models/qwen3-1.7b/activations.npy` — `[16000, 28, 2048]` float32
+- [x] `data/models/qwen3-1.7b/role_expression.json` — held-out uyum raporlanmış (rol düzeyi geri çekilme, bkz. Aşama 2)
+- [x] `results/models/qwen3-1.7b/axis/criterion_a.json` — A kriteri kararı (DÜŞTÜ), commit edilmiş
+- [x] Gateway bütçesi: `stage05_judge_gate` ≤ 15, `stage2_probe_labels` ≤ 300
