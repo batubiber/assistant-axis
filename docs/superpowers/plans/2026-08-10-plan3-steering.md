@@ -2845,6 +2845,7 @@ normal `import` ile içe aktarılamaz; `importlib` ile dosya yolundan yüklenir
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -2947,12 +2948,29 @@ def _write_sweep(path: Path, records: list[dict]) -> None:
     )
 
 
-def _write_meta(path: Path, *, planned: int, attempted: int, complete: bool) -> None:
+def _write_meta(
+    path: Path, *, planned: int, attempted: int, complete: bool, axis_run_id: str | None = None
+) -> None:
+    """`axis_run_id` varsayılan `None` — gerçek `08_steering_sweep.py` meta'sı
+    bu alanı HER ZAMAN yazar (bkz. `_meta_payload`), ama F1'den ÖNCEKİ
+    testlerin çoğu bununla ilgilenmiyor; `None` tutarlı bir varsayılan (aynı
+    testte iki kez yazılsa bile aynı değeri üretir, sahte bir uyuşmazlık
+    doğurmaz)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps({"planned": planned, "attempted": attempted, "complete": complete}),
+        json.dumps({
+            "planned": planned, "attempted": attempted, "complete": complete,
+            "axis_run_id": axis_run_id,
+        }),
         encoding="utf-8",
     )
+
+
+def _sweep_sha256(path: Path) -> str:
+    """Testin sweep dosyası için `_run`'ın hesaplayacağı sha256'nın AYNISI —
+    F1 testlerinin, script'in kendi mantığını TEKRARLAMADAN, "gerçek" parmak
+    izini üretebilmesi için."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _make_records(layer: int, strengths: list[float], n_roles: int, n_questions: int) -> list[dict]:
@@ -3240,12 +3258,22 @@ def test_resume_skips_already_completed_groups_and_reuses_saved_labels(
     yüklenir ve o GRUP hakeme HİÇ tekrar sorulmaz."""
     data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
     records = _make_records(14, [0.0, -0.6], n_roles=2, n_questions=2)
-    _write_sweep(data_dir / "steering_sweep.jsonl", records)
-    _write_meta(data_dir / "steering_sweep_meta.json", planned=8, attempted=8, complete=True)
+    sweep_path = data_dir / "steering_sweep.jsonl"
+    _write_sweep(sweep_path, records)
+    _write_meta(
+        data_dir / "steering_sweep_meta.json", planned=8, attempted=8, complete=True,
+        axis_run_id="axis-resume",
+    )
+    # F1: elle yazılan durumun parmak izi GERÇEK sweep'inkiyle uyuşmalı,
+    # yoksa `_run` bunu bayat sayıp atar (bu testin amacı bu DEĞİL — o,
+    # aşağıdaki F1 testlerinde ayrıca sabitleniyor).
     ev.save_group_labels(
         data_dir / "steering_labels.json",
         {(14, -0.6): {0: "assistant", 1: "assistant", 2: "assistant", 3: "assistant"}},
         {(14, -0.6): set()},
+        sweep_sha256=_sweep_sha256(sweep_path),
+        axis_run_id="axis-resume",
+        record_counts={(14, -0.6): 4, (14, 0.0): 4},
     )
     client = FakeClient(default_label="human_role")
     monkeypatch.setattr(ev, "build_default_client", lambda: client)
@@ -3290,10 +3318,21 @@ def test_corrupt_labels_file_is_reported_cleanly_not_silently_discarded(
 
 
 def test_missing_meta_file_exits_two(tmp_path, monkeypatch, capsys):
+    """F6 (Fix Round 1): kardeşi (`test_meta_says_incomplete_exits_two_
+    with_counts`) `build_default_client`'ı monkeypatch'leyip `client.calls
+    == 0` doğruluyordu, bu test doğrulamıyordu — meta guard'ı yanlışlıkla
+    izin veren bir `return` ile değiştirmek (guard'ın kendisi yerine) 27
+    testi de geçiriyordu, çünkü kontrol akışı `build_default_client`'a
+    düşüyor, o da anahtar tanımsız olduğu için AYRI bir çıkış-2 üretiyordu.
+    Burada `build_default_client` GERÇEKTEN ÇALIŞAN bir `FakeClient`
+    döndürüyor — guard kaldırılırsa client.calls artık 0 KALMAZ (sweep
+    normal işlenir), bu da mutasyonu YAKALAR."""
     data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
     records = _make_records(14, [0.0, -0.6], n_roles=1, n_questions=1)
     _write_sweep(data_dir / "steering_sweep.jsonl", records)
     # meta dosyası KASITLI olarak hiç yazılmadı.
+    client = FakeClient()
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
 
     exit_code = ev.main([])
 
@@ -3301,6 +3340,9 @@ def test_missing_meta_file_exits_two(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "BAŞARISIZ" in err
     assert "Traceback" not in err
+    assert "sweep meta'sı okunamadı" in err, "meta'ya ÖZGÜ teşhis — başka bir çıkış-2 yolu DEĞİL"
+    assert "steering_sweep_meta.json" in err
+    assert client.calls == 0, "meta eksikse hakem hiç çağrılmamalı (build_default_client'a düşülmemeli)"
 
 
 def test_meta_says_incomplete_exits_two_with_counts(tmp_path, monkeypatch, capsys):
@@ -3468,6 +3510,7 @@ def test_full_happy_path_writes_all_artifacts_with_correct_verdicts(tmp_path, mo
         (results_dir / "steering" / "criterion_b.json").read_text(encoding="utf-8")
     )
     assert criterion_payload["layers"]["14"]["passed"] is True
+    assert criterion_payload["labelled_by_group"] == {"14|0.0": 6, "14|-0.6": 6}
     assert criterion_payload["unlabelled_by_group"] == {"14|0.0": 0, "14|-0.6": 0}
     assert "incomplete_sweep" not in criterion_payload
     assert "PAYDA" in criterion_payload["note"]
@@ -3501,6 +3544,400 @@ def test_two_layers_get_independent_verdicts(tmp_path, monkeypatch):
     )
     assert criterion_payload["layers"]["14"]["passed"] is True
     assert criterion_payload["layers"]["19"]["passed"] is False
+
+
+# --- F1 (Fix Round 1): steering_labels.json'ın üretildiği sweep'e bağlanması,
+# bkz. `.superpowers/sdd/p3-task-5-fix1-brief.md`. `axis_run_id` TEK BAŞINA
+# yetmez (aktivasyon indeksinden gelir, sweep'in kendisinden değil — aynı
+# eksenle YENİDEN üretilen bir sweep aynı `axis_run_id`'yi taşır ama
+# `do_sample=True, temperature=1.0` yüzünden TÜM yanıtlar yeni metindir);
+# asıl doğrulama sweep'in KENDİ baytlarının sha256'sı.
+# -----------------------------------------------------------------------
+
+
+def test_stale_labels_from_a_regenerated_sweep_are_discarded_and_rejudged(
+    tmp_path, monkeypatch, capsys
+):
+    """08'in ARŞİVLEYİP BAŞTAN yazdığı bir sweep AYNI `axis_run_id`'yi taşır
+    ama TÜM yanıtlar YENİ metindir. `sweep_sha256` bunu yakalar — aynı hücre
+    sayıları, aynı `axis_run_id`, ama FARKLI baytlar."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records_v1 = _make_records(14, [0.0, -0.6], n_roles=2, n_questions=1)
+    sweep_path = data_dir / "steering_sweep.jsonl"
+    _write_sweep(sweep_path, records_v1)
+    _write_meta(
+        data_dir / "steering_sweep_meta.json", planned=4, attempted=4, complete=True,
+        axis_run_id="axis-same",
+    )
+    client_1 = FakeClient(default_label="assistant")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client_1)
+    first_exit = ev.main([])
+    assert first_exit in (0, 1)
+    assert client_1.calls > 0
+    labels_path = data_dir / "steering_labels.json"
+    assert labels_path.exists()
+
+    # Sweep ARŞİVLENİP BAŞTAN yazıldı: AYNI axis_run_id (meta DEĞİŞMEDİ),
+    # AYNI hücre sayıları, ama do_sample=True yüzünden TAMAMEN farklı metin.
+    records_v2 = [dict(r, answer=r["answer"] + " (yeniden üretildi)") for r in records_v1]
+    _write_sweep(sweep_path, records_v2)
+
+    client_2 = FakeClient(default_label="assistant")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client_2)
+
+    second_exit = ev.main([])
+
+    assert second_exit in (0, 1)
+    err = capsys.readouterr().err
+    assert "UYARI" in err
+    assert "SWEEP DEĞİŞMİŞ" in err
+    assert client_2.calls > 0, "durum atıldıysa hakem YENİDEN sorulmalı — 0 çağrı KABUL EDİLEMEZ"
+    assert (data_dir / "steering_labels.json.stale").exists(), "eski dosya SİLİNMEDİ, kenara alındı"
+    new_payload = json.loads(labels_path.read_text(encoding="utf-8"))
+    assert new_payload["sweep_sha256"] == _sweep_sha256(sweep_path)
+
+
+def test_matching_sweep_fingerprint_reuses_saved_labels_without_recalling_the_judge(
+    tmp_path, monkeypatch, capsys
+):
+    """Sweep DEĞİŞMEDEN aynı komut TEKRAR çalıştırılırsa parmak izi eşleşir,
+    durum KULLANILIR, hakem HİÇ çağrılmaz."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=2, n_questions=1)
+    sweep_path = data_dir / "steering_sweep.jsonl"
+    _write_sweep(sweep_path, records)
+    _write_meta(
+        data_dir / "steering_sweep_meta.json", planned=4, attempted=4, complete=True,
+        axis_run_id="axis-reuse",
+    )
+    client_1 = FakeClient(default_label="assistant")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client_1)
+    first_exit = ev.main([])
+    assert first_exit in (0, 1)
+    assert client_1.calls > 0
+
+    client_2 = FakeClient(default_label="assistant")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client_2)
+    second_exit = ev.main([])
+
+    assert second_exit == first_exit
+    assert client_2.calls == 0, "parmak izi eşleşiyor — hakem TEKRAR sorulmamalı"
+    err = capsys.readouterr().err
+    assert "UYARI: ESKİ ETİKETLER" not in err
+    assert not (data_dir / "steering_labels.json.stale").exists()
+
+
+def test_labels_discarded_when_cell_record_count_changed(tmp_path, monkeypatch, capsys):
+    """`sweep_sha256`/`axis_run_id` doğru olsa bile `record_counts` sweep'in
+    GERÇEK hücre sayılarıyla uyuşmuyorsa durum yine ATILIR — `record_counts`
+    sha256'dan BAĞIMSIZ, ikinci bir savunma katmanı (madde 4'ün gerekçesi:
+    `steering_labels.json` sweep DEĞİŞMEDEN de elle/başka bir yoldan
+    bozulmuş olabilir)."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=2, n_questions=1)  # hücre başına 2 kayıt
+    sweep_path = data_dir / "steering_sweep.jsonl"
+    _write_sweep(sweep_path, records)
+    _write_meta(
+        data_dir / "steering_sweep_meta.json", planned=4, attempted=4, complete=True,
+        axis_run_id="axis-count",
+    )
+    (data_dir / "steering_labels.json").write_text(json.dumps({
+        "labels": {"14|0.0": {"0": "assistant", "1": "assistant"}},
+        "unlabelled_positions": {},
+        "sweep_sha256": _sweep_sha256(sweep_path),
+        "axis_run_id": "axis-count",
+        "record_counts": {"14|0.0": 999, "14|-0.6": 2},  # 14|0.0 YANLIŞ: gerçeği 2
+    }), encoding="utf-8")
+    client = FakeClient(default_label="assistant")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code in (0, 1)
+    err = capsys.readouterr().err
+    assert "UYARI" in err
+    assert "HÜCRE KAYIT SAYILARI UYUŞMUYOR" in err
+    assert client.calls > 0, "kayıt sayısı uyuşmazlığında durum atılmalı, hakem tekrar sorulmalı"
+
+
+def test_old_schema_labels_file_is_discarded_and_rejudged(tmp_path, monkeypatch, capsys):
+    """Parmak izi alanlarını HİÇ taşımayan bir `steering_labels.json` (bu
+    fix'ten ÖNCEKİ şema) güvenilmez sayılır — durum atılır, hakem yeniden
+    sorulur."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=2, n_questions=1)
+    sweep_path = data_dir / "steering_sweep.jsonl"
+    _write_sweep(sweep_path, records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=4, attempted=4, complete=True)
+    # Bu fix'ten ÖNCEKİ şema: yalnızca "labels"/"unlabelled_positions" — hiç
+    # parmak izi alanı yok.
+    (data_dir / "steering_labels.json").write_text(json.dumps({
+        "labels": {"14|0.0": {"0": "assistant", "1": "assistant"}},
+        "unlabelled_positions": {},
+    }), encoding="utf-8")
+    client = FakeClient(default_label="assistant")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code in (0, 1)
+    err = capsys.readouterr().err
+    assert "UYARI" in err
+    assert "ESKİ ŞEMA" in err
+    assert client.calls > 0, "eski şema atıldıysa TÜM hücreler yeniden sorulmalı"
+    new_payload = json.loads((data_dir / "steering_labels.json").read_text(encoding="utf-8"))
+    assert new_payload["sweep_sha256"] == _sweep_sha256(sweep_path)
+
+
+def test_stray_out_of_range_position_is_clipped_from_the_rate(tmp_path, monkeypatch):
+    """F1 madde 4: fingerprint EŞLEŞSE bile (sha256/axis_run_id/record_counts
+    hepsi doğru) bir hücrenin etiketleri `range(len(items_all))` DIŞINDA bir
+    pozisyon barındırıyorsa, bu pozisyon orana KARIŞMAMALI. `record_counts`
+    yalnızca hücre başına TOPLAM sayıyı doğrular — kaç AYRI POZİSYONUN
+    kayıtlı olduğunu değil; bu yüzden bu, sha256/record_counts
+    doğrulamasından BAĞIMSIZ bir savunma katmanı."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=2, n_questions=1)  # hücre başına 2 kayıt
+    sweep_path = data_dir / "steering_sweep.jsonl"
+    _write_sweep(sweep_path, records)
+    _write_meta(
+        data_dir / "steering_sweep_meta.json", planned=4, attempted=4, complete=True,
+        axis_run_id="axis-clip",
+    )
+    # (14, 0.0) hücresinin GERÇEK pozisyonları 0-1; 99 SIZMIŞ (bayat) bir
+    # pozisyon — fingerprint'i BOZMAZ (record_counts yalnızca "bu hücrede 2
+    # kayıt var" der, KAÇ POZİSYON kayıtlı olduğunu doğrulamaz).
+    ev.save_group_labels(
+        data_dir / "steering_labels.json",
+        {
+            (14, 0.0): {0: "assistant", 1: "assistant", 99: "human_role"},
+            (14, -0.6): {0: "human_role", 1: "human_role"},
+        },
+        {(14, 0.0): set(), (14, -0.6): set()},
+        sweep_sha256=_sweep_sha256(sweep_path),
+        axis_run_id="axis-clip",
+        record_counts={(14, 0.0): 2, (14, -0.6): 2},
+    )
+    client = FakeClient()  # her iki hücre de zaten "tamam" — hiç çağrılmamalı
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert client.calls == 0, "kapsam (0,1) zaten dolu — sızmış pozisyon 99 YOKMUŞ gibi ele alınmalı"
+    rate_payload = json.loads(
+        (results_dir / "steering" / "rate_by_strength.json").read_text(encoding="utf-8")
+    )
+    # Kırpma YOKSA: 0.0 hücresinin oranı 1/3 olurdu (99'daki "human_role"
+    # dahil). Kırpma VARSA: tam 0.0 (yalnızca pozisyon 0 ve 1, ikisi de
+    # "assistant").
+    assert rate_payload["14"]["0.0"] == pytest.approx(0.0)
+    assert rate_payload["14"]["-0.6"] == pytest.approx(1.0)
+
+    criterion_payload = json.loads(
+        (results_dir / "steering" / "criterion_b.json").read_text(encoding="utf-8")
+    )
+    assert criterion_payload["labelled_by_group"]["14|0.0"] == 2, "payda 3 DEĞİL, kırpılmış 2 olmalı"
+    assert criterion_payload["layers"]["14"]["passed"] is True
+    assert exit_code == 0
+
+
+# --- F2 (Fix Round 1): bütçe ön kontrolü resume'dan ÖNCE koşuyordu ----------
+
+
+def test_budget_precheck_uses_pending_positions_not_total_after_resume(
+    tmp_path, monkeypatch, capsys
+):
+    """Bütçe ön kontrolü artık diskte HAZIR olan pozisyonları düşüyor —
+    resume'dan sonra kalan bütçe TOPLAM plandan küçük olsa bile koşu
+    BAŞLAMALI (yalnızca BEKLEYEN pozisyonlar bütçeye sığdığı sürece).
+    Eskiden `planned` TÜM gruplar üzerinden hesaplanıyordu ve
+    `load_group_labels`'tan ÖNCE koşuyordu — diskte hazır olan hiçbir şey
+    (maliyeti 0 olan cache isabetleri dahil) düşülmüyordu."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=10, n_questions=1)  # hücre başına 10 öğe
+    sweep_path = data_dir / "steering_sweep.jsonl"
+    _write_sweep(sweep_path, records)
+    _write_meta(
+        data_dir / "steering_sweep_meta.json", planned=20, attempted=20, complete=True,
+        axis_run_id="axis-budget",
+    )
+    # (14, -0.6) grubu TAMAMEN diskten hazır — bu, bütçe hesabına HİÇ girmemeli.
+    ev.save_group_labels(
+        data_dir / "steering_labels.json",
+        {(14, -0.6): {i: "assistant" for i in range(10)}},
+        {(14, -0.6): set()},
+        sweep_sha256=_sweep_sha256(sweep_path),
+        axis_run_id="axis-budget",
+        record_counts={(14, -0.6): 10, (14, 0.0): 10},
+    )
+    # TOPLAM plan 2 batch (her hücre 1 batch, batch_size=10); BEKLEYEN plan
+    # yalnızca 1 batch ((14, 0.0) grubu). stage_remaining=1 TOPLAM'a sığmaz
+    # ama BEKLEYEN'e sığar.
+    client = FakeClient(default_label="assistant", stage_remaining=1, global_remaining=1000)
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code in (0, 1), "kalan bütçe BEKLEYEN plana sığdığı için koşu başlamalı"
+    out = capsys.readouterr().out
+    assert "toplam planlanan çağrı (üst sınır): 2" in out
+    assert "bekleyen (bütçe kontrolü buna göre): 1" in out
+    assert client.calls == 1
+
+
+# --- F3 (Fix Round 1): criterion_b.json hücre başına PAYDAYI yazmıyordu ----
+
+
+def test_criterion_b_records_the_denominator_per_group(tmp_path, monkeypatch):
+    """Aynı orana (1.000) sahip iki FARKLI büyüklükteki hücre
+    `rate_by_strength.json`'da bayt bayt AYNI görünür — `criterion_b.json`
+    artık her hücrenin PAYDASINI ('labelled_by_group') AYRICA yazıyor,
+    böylece '2 öğeden 1.000' ile '5 öğeden 1.000' artefaktın kendisinden
+    AYIRT edilebiliyor."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = (
+        _make_records(14, [0.0, -0.6], n_roles=2, n_questions=1)  # hücre başına 2 öğe
+        + _make_records(19, [0.0, -0.6], n_roles=5, n_questions=1)  # hücre başına 5 öğe
+    )
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=14, attempted=14, complete=True)
+    client = FakeClient(
+        label_rule=lambda block: "human_role" if "s-0.6" in block else "assistant"
+    )
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code == 0
+    rate_payload = json.loads(
+        (results_dir / "steering" / "rate_by_strength.json").read_text(encoding="utf-8")
+    )
+    # İKİ katmanın -0.6 oranı da BİREBİR aynı — 1.000. Bu dosyadan tek
+    # başına 2'ye karşı 5 öğe AYIRT EDİLEMEZ.
+    assert rate_payload["14"]["-0.6"] == pytest.approx(1.0)
+    assert rate_payload["19"]["-0.6"] == pytest.approx(1.0)
+
+    criterion_payload = json.loads(
+        (results_dir / "steering" / "criterion_b.json").read_text(encoding="utf-8")
+    )
+    assert criterion_payload["labelled_by_group"]["14|-0.6"] == 2
+    assert criterion_payload["labelled_by_group"]["19|-0.6"] == 5
+    assert "labelled_by_group" in criterion_payload["note"]
+
+
+# --- F4 (Fix Round 1): hakem gönderimlerinin --batch-size'da parçalandığı --
+# hiçbir testle sabitlenmemişti -------------------------------------------
+
+
+def test_judge_sends_are_split_according_to_batch_size(tmp_path, monkeypatch):
+    """25 öğelik bir hücre, varsayılan --batch-size (10) ile hakeme
+    [10, 10, 5] boyutlarında AYRI çağrılar olarak gönderilmeli — tek bir dev
+    çağrı olarak DEĞİL. `pending`'i `args.batch_size` yerine
+    `max(len(pending), 1)` adımıyla dilimleyen bir mutasyon bu testten ÖNCE
+    27 testin hepsini geçiyordu (hiçbiri 10 öğeden büyük bir hücre
+    kullanmıyordu)."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = (
+        _make_records(14, [-0.6], n_roles=25, n_questions=1)  # 25 öğe
+        + _make_records(14, [0.0], n_roles=3, n_questions=1)  # 3 öğe (taban)
+    )
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=28, attempted=28, complete=True)
+    client = FakeClient(default_label="assistant")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code in (0, 1)
+    # sorted(groups) -> [(14, -0.6), (14, 0.0)]: önce 25 öğelik hücre
+    # [10, 10, 5]'e bölünür, sonra 3 öğelik hücre TEK bir [3] çağrısı olur.
+    assert client.sizes_seen == [10, 10, 5, 3]
+
+
+def test_explicit_batch_size_flag_changes_the_actual_send_sizes(tmp_path, monkeypatch):
+    """--batch-size YALNIZCA plan sayısını DEĞİL, hakeme GERÇEKTEN
+    gönderilen parça boyutlarını da değiştirmeli."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = (
+        _make_records(14, [-0.6], n_roles=20, n_questions=1)  # 20 öğe
+        + _make_records(14, [0.0], n_roles=1, n_questions=1)  # 1 öğe (taban)
+    )
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=21, attempted=21, complete=True)
+    client = FakeClient(default_label="assistant")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main(["--batch-size", "7"])
+
+    assert exit_code in (0, 1)
+    assert client.sizes_seen == [7, 7, 6, 1]
+
+
+# --- F5 (Fix Round 1): karar üretemeyen koşu karar artefaktlarını EZİYORDU --
+
+
+def test_zero_record_sweep_does_not_overwrite_existing_decision_artifact(
+    tmp_path, monkeypatch, capsys
+):
+    """Karar üretemeyen bir koşu (burada: sıfır kayıtlı sweep) mevcut
+    `criterion_b.json`'ı artık EZMİYOR. Yazım bloğu eskiden KOŞULSUZDU ve
+    `overall_exit_code`'dan ÖNCE çalışıyordu — script'in kendi
+    konvansiyonunun (TÜM diğer çıkış-2 yolları yazımlardan ÖNCE döner) TEK
+    istisnasıydı."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    sweep_path = data_dir / "steering_sweep.jsonl"
+    sweep_path.parent.mkdir(parents=True, exist_ok=True)
+    sweep_path.write_text("", encoding="utf-8")  # sıfır kayıt
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=0, attempted=0, complete=True)
+    steering_dir = results_dir / "steering"
+    steering_dir.mkdir(parents=True, exist_ok=True)
+    previous_payload = {"layers": {"14": {"passed": True}}, "labelled_by_group": {"14|0.0": 250}}
+    (steering_dir / "criterion_b.json").write_text(
+        json.dumps(previous_payload), encoding="utf-8"
+    )
+    client = FakeClient()
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code == 2
+    after_payload = json.loads((steering_dir / "criterion_b.json").read_text(encoding="utf-8"))
+    assert after_payload == previous_payload, "boş sweep önceki GERÇEK kararı EZMEMELİ"
+    assert client.calls == 0
+
+
+# --- F8 (Fix Round 1): atomik yazımı hiçbir test sabitlemiyordu ------------
+
+
+def test_atomic_write_failure_leaves_existing_labels_file_untouched(tmp_path, monkeypatch):
+    """Task 4'teki `test_meta_write_failure_leaves_existing_file_untouched`
+    (`tests/test_steering_sweep.py`) ile AYNI desen: `save_group_labels`'ın
+    ATOMİK yazımı (tempfile + `os.replace`) `os.replace` ORTASINDA patlarsa
+    var olan `steering_labels.json` DEĞİŞMEDEN kalmalı ve `.tmp` artığı
+    sürünmemeli. Bu bloğu düz bir `path.write_text(...)` ile değiştiren bir
+    mutasyon bu testten ÖNCE 27 testin hepsini geçiyordu — gösterilen emsal
+    (`tests/test_label_and_train_probe.py:1118-1119`) yalnızca artık `.tmp`
+    kalmamasını sabitliyordu, o da AYNI mutasyonu geçiyordu."""
+    path = tmp_path / "steering_labels.json"
+    path.write_text("ONCEKI-ICERIK", encoding="utf-8")
+
+    def boom_replace(*_args, **_kwargs):
+        raise RuntimeError("bilerek — os.replace ortasında patladı")
+
+    monkeypatch.setattr(ev.os, "replace", boom_replace)
+
+    with pytest.raises(RuntimeError):
+        ev.save_group_labels(
+            path,
+            {(14, 0.0): {0: "assistant"}},
+            {(14, 0.0): set()},
+            sweep_sha256="deadbeef",
+            axis_run_id="axis-1",
+            record_counts={(14, 0.0): 1},
+        )
+
+    assert path.read_text(encoding="utf-8") == "ONCEKI-ICERIK"
+    assert [p.name for p in tmp_path.iterdir()] == ["steering_labels.json"]
 ```
 
 - [ ] **Step 3: Test'lerin başarısız olduğunu doğrula**
@@ -3578,10 +4015,28 @@ Boş karar kümesi artık "GEÇTİ" sayılmaz (madde E3): `all([])` Python'da
 `True`'dur — hiç katman değerlendirilmemişken bunu 0 (GEÇTİ) döndürmek,
 tanımsız veriden "GEÇTİ" basan bir hatanın (bu projede daha önce bir kez
 görülen sınıf) aynısı olurdu. `overall_exit_code({})` artık 2 döner.
+
+Etiket dosyasının sweep'e bağlanması (2026-08-10 Fix Round 1; bkz.
+`.superpowers/sdd/p3-task-5-fix1-brief.md`, madde F1): `steering_labels.json`
+artık sweep'in KİMLİĞİNİ üç ayrı alanla taşır — `sweep_sha256` (dosya
+baytlarının sha256'sı), `axis_run_id` (meta'dan, köken kaydı — TEK BAŞINA
+YETMEZ: aktivasyon indeksinden gelir, sweep'in KENDİSİNDEN değil; aynı
+eksenle YENİDEN üretilen bir sweep aynı `axis_run_id`'yi taşır ama üretim
+`do_sample=True, temperature=1.0` olduğu için TÜM yanıtlar yeni metindir) ve
+`record_counts` (hücre başına kayıt sayısı). Yükleme anında üçü de
+DOĞRULANIR; herhangi biri uyuşmuyorsa (ya da dosya bu üç alanı hiç
+taşımıyorsa — eski şema) yüklenen durum KULLANILMAZ: dosya `.stale`
+uzantısıyla kenara alınır (sessizce SİLİNMEZ), stderr'e büyük harfli bir
+UYARI basılır, ve koşu SIFIRDAN başlar. `_group_done` artık SAYIYA değil
+KAPSAMA bakar (`set(labels) | set(unlabelled) >= set(range(total))`) ve
+oranın hesaplandığı `labels_by_group`/`unlabelled_by_group` o hücrenin
+`range(len(items_all))` aralığına KIRPILIR — bayat/sızmış bir pozisyon
+diskte kalsa bile orana giremez.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -3660,16 +4115,33 @@ def _parse_group_key(text: str) -> tuple[int, float]:
     return int(layer_text), float(strength_text)
 
 
+# F1 (Fix Round 1): `steering_labels.json` artık sweep'in KİMLİĞİNİ taşır —
+# `_MISSING`, "bu alan JSON'da hiç yoktu" ile "bu alanın değeri `None`'dı"
+# ayrımını yapabilmek için ayrı bir sentinel (payload.get(key, None) ikisini
+# de `None` yapardı; eski şema tespiti bu ayrıma dayanır).
+_MISSING = object()
+
+
 def save_group_labels(
     path: str | Path,
     group_state: dict[tuple[int, float], dict[int, str]],
     unlabelled_state: dict[tuple[int, float], set[int]],
+    *,
+    sweep_sha256: str,
+    axis_run_id,
+    record_counts: dict[tuple[int, float], int],
 ) -> None:
     """`steering_labels.json`'ı ATOMİK yaz — `06_label_and_train_probe.py::
     save_labels`'ın AYNI deseni (tempfile + `os.replace`). Çağıran taraf bunu
     HER hakem batch'inden sonra çağırır: bir çökme/kesinti en fazla BİR
     batch'lik işi kaybettirir, o ana kadar toplanan etiketlerin TAMAMINI
-    değil. Yazım ortasında kesilme dosyayı KIRPMAZ."""
+    değil. Yazım ortasında kesilme dosyayı KIRPMAZ.
+
+    F1: `sweep_sha256`/`axis_run_id`/`record_counts` dosyaya birlikte
+    gömülür — bunlar `load_group_labels`'ın bir SONRAKİ koşuda bu durumun
+    HANGİ sweep'e ait olduğunu doğrulayabilmesi için gereken parmak izi.
+    `axis_run_id` TEK BAŞINA yetmez (aktivasyon indeksinden gelir, sweep'in
+    kendisinden değil); asıl doğrulama `sweep_sha256`'dır."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -3680,6 +4152,11 @@ def save_group_labels(
         "unlabelled_positions": {
             _group_key(key): sorted(positions)
             for key, positions in unlabelled_state.items()
+        },
+        "sweep_sha256": sweep_sha256,
+        "axis_run_id": axis_run_id,
+        "record_counts": {
+            _group_key(key): count for key, count in record_counts.items()
         },
     }
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -3694,21 +4171,33 @@ def save_group_labels(
         raise
 
 
-def load_group_labels(
-    path: str | Path,
-) -> tuple[dict[tuple[int, float], dict[int, str]], dict[tuple[int, float], set[int]]]:
+def load_group_labels(path: str | Path) -> tuple[
+    dict[tuple[int, float], dict[int, str]],
+    dict[tuple[int, float], set[int]],
+    dict | None,
+]:
     """Var olan `steering_labels.json`'ı yükle — bu, artımlı kalıcılığın OKUMA
     ucudur (06'nın `load_existing_labels`'ıyla AYNI rol): önceki bir koşu
     kesintiye uğradıysa tamamlanmış hücreler/konumlar TEKRAR hakeme
-    SORULMAZ. Dosya yoksa (ilk koşu) boş döner.
+    SORULMAZ. Dosya yoksa (ilk koşu) `(({}, {}, None)` döner — `None`
+    üçüncü öğe, "karşılaştırılacak bir parmak izi yok" anlamına gelir.
 
     Dosya VARSA ama ayrıştırılamıyorsa ya da beklenen `labels` anahtarını
     taşımıyorsa istisna SARMALANMADAN çağırana yükselir — sessizce sıfırdan
     başlamak, zaten ÖDENMİŞ etiketleri sessizce silip aynı öğeleri yeniden
-    ücretlendirmek demektir (06 ile aynı gerekçe)."""
+    ücretlendirmek demektir (06 ile aynı gerekçe). Bu, F1'in parmak izi
+    UYUŞMAZLIĞINDAN (bozuk değil, YANLIŞ sweep'e ait) AYRI bir durumdur —
+    o, çağıran tarafından `_fingerprint_mismatch_reason` ile ayrıca ele
+    alınır, burada değil.
+
+    Dönüşün üçüncü öğesi (`fingerprint`) dosyadaki ham `sweep_sha256`/
+    `axis_run_id`/`record_counts` alanlarını taşır; bir alan JSON'da hiç
+    yoksa (eski şema) değeri `_MISSING` olur — `None` ile KARIŞTIRILMAZ,
+    çünkü `axis_run_id`'nin GERÇEK değeri de `None` olabilir (meta'da hiç
+    yazılmamışsa)."""
     path = Path(path)
     if not path.exists():
-        return {}, {}
+        return {}, {}, None
     payload = json.loads(path.read_text(encoding="utf-8"))
     labels_raw = payload["labels"]
     unlabelled_raw = payload.get("unlabelled_positions", {})
@@ -3719,7 +4208,62 @@ def load_group_labels(
     unlabelled_state = {
         _parse_group_key(key): set(positions) for key, positions in unlabelled_raw.items()
     }
-    return group_state, unlabelled_state
+    raw_counts = payload.get("record_counts", _MISSING)
+    record_counts = (
+        {_parse_group_key(k): v for k, v in raw_counts.items()}
+        if raw_counts is not _MISSING
+        else _MISSING
+    )
+    fingerprint = {
+        "sweep_sha256": payload.get("sweep_sha256", _MISSING),
+        "axis_run_id": payload.get("axis_run_id", _MISSING),
+        "record_counts": record_counts,
+    }
+    return group_state, unlabelled_state, fingerprint
+
+
+def _fingerprint_mismatch_reason(
+    fingerprint: dict | None,
+    *,
+    sweep_sha256: str,
+    axis_run_id,
+    record_counts: dict[tuple[int, float], int],
+) -> str | None:
+    """`fingerprint` (bkz. `load_group_labels`) gerçek sweep'in parmak
+    izleriyle UYUŞUYOR mu? Uyuşuyorsa (ya da karşılaştırılacak bir dosya
+    hiç yoksa) `None`, uyuşmuyorsa NEDENİNİ açıklayan büyük harfli bir Türkçe
+    metin döner — çağıran bunu hem stderr'e UYARI olarak basar hem de
+    kararına (durumu at, sıfırdan başla) temel yapar.
+
+    Sıra ÖNEMLİ değil ama OKUNABİLİR olsun diye: önce eski şema, sonra
+    sweep'in kendi baytları (en güçlü kanıt), sonra köken kaydı, en son
+    hücre kayıt sayıları (ikinci bir savunma katmanı — bkz. F1 madde 4:
+    `sweep_sha256` eşleşse bile `steering_labels.json` elle/başka bir
+    yoldan bozulmuş olabilir)."""
+    if fingerprint is None:
+        return None
+    missing = [
+        name
+        for name in ("sweep_sha256", "axis_run_id", "record_counts")
+        if fingerprint[name] is _MISSING
+    ]
+    if missing:
+        return f"ESKİ ŞEMA — parmak izi alanları hiç yok: {', '.join(missing)}"
+    if fingerprint["sweep_sha256"] != sweep_sha256:
+        return (
+            "SWEEP DEĞİŞMİŞ — sweep_sha256 uyuşmuyor "
+            f"(dosyada {fingerprint['sweep_sha256']!r}, gerçek dosyada {sweep_sha256!r}); "
+            "steering_sweep.jsonl yeniden üretilmiş olabilir (do_sample=True — "
+            "aynı axis_run_id ALTINDA bile yanıtlar TAMAMEN yeni metindir)"
+        )
+    if fingerprint["axis_run_id"] != axis_run_id:
+        return (
+            "AXIS_RUN_ID UYUŞMUYOR — "
+            f"dosyada {fingerprint['axis_run_id']!r}, meta'da {axis_run_id!r}"
+        )
+    if fingerprint["record_counts"] != record_counts:
+        return "HÜCRE KAYIT SAYILARI UYUŞMUYOR — sweep'in içeriği değişmiş"
+    return None
 
 
 # --- böl-ve-kurtar: bozuk bir hakem batch'i koşuyu düşürmesin ---------------
@@ -3881,9 +4425,21 @@ def _run(argv: list[str] | None) -> int:
             file=sys.stderr,
         )
 
+    # F1: sweep'in KENDİ BAYTLARININ sha256'sı — parmak izinin en güçlü
+    # parçası. Dosya ~1.7 MB, maliyet ihmal edilebilir. Baytlar bir kez
+    # okunur; hem hash hem satır ayrıştırması AYNI `sweep_bytes`'tan gelir
+    # (dosyayı iki kez okumaktan kaçınmak için).
+    sweep_bytes = sweep_path.read_bytes()
+    sweep_sha256 = hashlib.sha256(sweep_bytes).hexdigest()
+    # F1: `axis_run_id` aktivasyon indeksinden gelir (bkz.
+    # `08_steering_sweep.py:200`, `index.get("run_id")`) — sweep'in KENDİSİNDEN
+    # değil. TEK BAŞINA köken kaydıdır, sweep'i yeniden üretmek bunu
+    # DEĞİŞTİRMEZ; asıl doğrulama `sweep_sha256`'dır.
+    axis_run_id = meta.get("axis_run_id")
+
     records = []
     for number, line in enumerate(
-        sweep_path.read_text(encoding="utf-8").splitlines(), start=1
+        sweep_bytes.decode("utf-8").splitlines(), start=1
     ):
         if not line.strip():
             continue
@@ -3894,37 +4450,22 @@ def _run(argv: list[str] | None) -> int:
             return 2
 
     groups = group_by_layer_strength(records)
-    # "üst sınır": böl-ve-kurtar hücre başına EK gönderim harcayabilir (bkz.
-    # `_classify_batch`) — E4'ün +10 payı bunun için. Bu sayı retry/bölünme
-    # OLMADAN gereken minimum çağrıdır, gerçek harcamanın kesin üst sınırı
-    # DEĞİLDİR.
-    planned = sum((len(v) + args.batch_size - 1) // args.batch_size for v in groups.values())
-
-    try:
-        client = build_default_client()
-    except RuntimeError as exc:
-        print(f"BAŞARISIZ: gateway istemcisi kurulamadı.\n  {exc}", file=sys.stderr)
-        return 2
-
-    stage_left, global_left = client.remaining_budget(STAGE)
-    print(f"Grup sayısı: {len(groups)}   planlanan çağrı (üst sınır): {planned}")
-    print(f"Aşama kalan: {stage_left}   global kalan: {global_left}")
-    if args.dry_run:
-        if planned > stage_left or planned > global_left:
-            print("HATA: plan kalan bütçeye sığmıyor.", file=sys.stderr)
-            return 2
-        return 0
-    if planned > stage_left or planned > global_left:
-        print("BAŞARISIZ: plan kalan bütçeye sığmıyor — koşu başlatılmadı.", file=sys.stderr)
-        return 2
+    # F1: hücre başına kayıt sayısı — parmak izinin üçüncü ve son parçası
+    # (bkz. `_fingerprint_mismatch_reason`'ın madde 4 gerekçesi: sha256
+    # eşleşse bile `steering_labels.json` ayrıca bozulmuş/elle değiştirilmiş
+    # olabilir; bu ikinci, bağımsız bir savunma katmanıdır).
+    record_counts = {key: len(v) for key, v in groups.items()}
 
     labels_path = D / "steering_labels.json"
-    # Artımlı kalıcılığın OKUMA ucu: önceki bir koşudan kalma etiketler
-    # varsa yükle — bu hücreler/konumlar aşağıdaki döngüde TEKRAR
-    # sorulmayacak. Dosya bozuksa (sıfırdan başlamak önceden ÖDENMİŞ
-    # etiketleri sessizce silmek demektir) BAŞARISIZ olunur.
+    # F2: OKUMA ucu artık bütçe kapısının ÜSTÜNDE — diskte zaten hazır
+    # (ve maliyeti 0 olan) hücreler/konumlar `planned` hesabına HİÇ
+    # girmemeli, aksi hâlde her resume denemesi tüm sweep'in bütçesini
+    # yeniden istermiş gibi davranıp gereksiz yere BAŞARISIZ olur (bkz.
+    # fix1 brief, madde F2). Dosya bozuksa (sıfırdan başlamak önceden
+    # ÖDENMİŞ etiketleri sessizce silmek demektir) BAŞARISIZ olunur — bu,
+    # F1'in parmak izi UYUŞMAZLIĞINDAN (aşağıda) AYRI bir durum.
     try:
-        group_state, unlabelled_state = load_group_labels(labels_path)
+        group_state, unlabelled_state, fingerprint = load_group_labels(labels_path)
     except (ValueError, KeyError) as exc:
         print(
             f"BAŞARISIZ: {labels_path} bozuk — önceki koşudan kalma etiketler "
@@ -3936,10 +4477,79 @@ def _run(argv: list[str] | None) -> int:
         )
         return 2
 
-    def _group_done(key: tuple[int, float]) -> bool:
+    # F1: yükleme zamanı doğrulama — parmak izlerinden HERHANGİ biri
+    # uyuşmuyorsa (ya da dosya bunları hiç taşımıyorsa — eski şema) yüklenen
+    # durum KULLANILMAZ. Eski dosya sessizce SİLİNMEZ, `.stale` uzantısıyla
+    # kenara alınır; koşu sıfırdan başlar (BAŞARISIZ DEĞİL — bu kurtarılabilir
+    # bir durum, yalnızca ekstra hakem çağrısına mal olur).
+    mismatch_reason = _fingerprint_mismatch_reason(
+        fingerprint,
+        sweep_sha256=sweep_sha256,
+        axis_run_id=axis_run_id,
+        record_counts=record_counts,
+    )
+    if mismatch_reason is not None:
+        stale_path = labels_path.with_name(labels_path.name + ".stale")
+        labels_path.replace(stale_path)
+        print(
+            "UYARI: ESKİ ETİKETLER SWEEP İLE UYUŞMUYOR — durum atıldı, "
+            "SIFIRDAN BAŞLANACAK.\n"
+            f"  Sebep: {mismatch_reason}\n"
+            f"  Eski dosya SİLİNMEDİ, {stale_path}'e taşındı.",
+            file=sys.stderr,
+        )
+        group_state, unlabelled_state = {}, {}
+
+    def _pending_positions(key: tuple[int, float]) -> list[int]:
         total = len(groups[key])
-        done = len(group_state.get(key, {})) + len(unlabelled_state.get(key, set()))
-        return done >= total
+        done = set(group_state.get(key, {})) | set(unlabelled_state.get(key, set()))
+        return [pos for pos in range(total) if pos not in done]
+
+    # F2: `planned` artık YALNIZCA bekleyen (henüz etiketlenmemiş/
+    # etiketlenemez damgalanmamış) pozisyonlar üzerinden hesaplanır — diskte
+    # hazır olan hiçbir şey bütçe kapısına girmez. "üst sınır": böl-ve-kurtar
+    # hücre başına EK gönderim harcayabilir (bkz. `_classify_batch`) — E4'ün
+    # +10 payı bunun için. Bu sayı retry/bölünme OLMADAN gereken minimum
+    # çağrıdır, gerçek harcamanın kesin üst sınırı DEĞİLDİR.
+    planned = sum(
+        (len(_pending_positions(key)) + args.batch_size - 1) // args.batch_size
+        for key in groups
+    )
+    # Yalnızca EKRANDA göstermek için: resume'suz (tüm sweep) toplam plan —
+    # operatör bekleyenle toplam arasındaki farktan ne kadarının diskten
+    # geldiğini görebilsin.
+    total_planned = sum(
+        (len(v) + args.batch_size - 1) // args.batch_size for v in groups.values()
+    )
+
+    try:
+        client = build_default_client()
+    except RuntimeError as exc:
+        print(f"BAŞARISIZ: gateway istemcisi kurulamadı.\n  {exc}", file=sys.stderr)
+        return 2
+
+    stage_left, global_left = client.remaining_budget(STAGE)
+    print(f"Grup sayısı: {len(groups)}   toplam planlanan çağrı (üst sınır): {total_planned}"
+          f"   bekleyen (bütçe kontrolü buna göre): {planned}")
+    print(f"Aşama kalan: {stage_left}   global kalan: {global_left}")
+    if args.dry_run:
+        if planned > stage_left or planned > global_left:
+            print("HATA: plan kalan bütçeye sığmıyor.", file=sys.stderr)
+            return 2
+        return 0
+    if planned > stage_left or planned > global_left:
+        print("BAŞARISIZ: plan kalan bütçeye sığmıyor — koşu başlatılmadı.", file=sys.stderr)
+        return 2
+
+    def _group_done(key: tuple[int, float]) -> bool:
+        # F1 madde 3: SAYIYA değil KAPSAMA bak — `>=` bir SAYI karşılaştırması
+        # olduğunda, yanlış hücreye ait (ama sayıca yeterli) bayat etiketler
+        # o hücreyi de "tamam" ilan edebilirdi. Küme karşılaştırması bunu
+        # ÖNLER: yalnızca gerçekten `range(total)`'ın HER pozisyonu
+        # kapsanmışsa `True` döner.
+        total = len(groups[key])
+        covered = set(group_state.get(key, {})) | set(unlabelled_state.get(key, set()))
+        return covered >= set(range(total))
 
     already_done = sum(1 for key in groups if _group_done(key))
     if already_done:
@@ -3954,10 +4564,7 @@ def _run(argv: list[str] | None) -> int:
             items_all = [(r["question"], r["answer"]) for r in groups[key]]
             group_state.setdefault(key, {})
             unlabelled_state.setdefault(key, set())
-            pending = [
-                pos for pos in range(len(items_all))
-                if pos not in group_state[key] and pos not in unlabelled_state[key]
-            ]
+            pending = _pending_positions(key)
             for start in range(0, len(pending), args.batch_size):
                 chunk_positions = pending[start : start + args.batch_size]
                 chunk_items = [items_all[pos] for pos in chunk_positions]
@@ -3969,8 +4576,15 @@ def _run(argv: list[str] | None) -> int:
                 batches_split_total += split
                 # Artımlı kalıcılığın YAZMA ucu: HER hakem batch'inden sonra
                 # diske yaz — bir çökme/kesinti bu yüzden en fazla BİR
-                # batch'lik (<=`args.batch_size` öğe) işi kaybettirir.
-                save_group_labels(labels_path, group_state, unlabelled_state)
+                # batch'lik (<=`args.batch_size` öğe) işi kaybettirir. F1:
+                # her yazımda GÜNCEL parmak izi de gömülür (sabit — sweep
+                # koşu boyunca değişmez), böylece bir sonraki koşu bu
+                # dosyanın HANGİ sweep'e ait olduğunu doğrulayabilir.
+                save_group_labels(
+                    labels_path, group_state, unlabelled_state,
+                    sweep_sha256=sweep_sha256, axis_run_id=axis_run_id,
+                    record_counts=record_counts,
+                )
             done_now = sum(1 for k in groups if _group_done(k))
             print(f"\r  {done_now}/{len(groups)} grup", end="", flush=True)
     except (BudgetExceeded, CircuitOpen, BudgetCorrupted) as exc:
@@ -3995,11 +4609,28 @@ def _run(argv: list[str] | None) -> int:
 
     print()
 
-    labels_by_group: dict[tuple[int, float], list[str]] = {
-        key: list(group_state.get(key, {}).values()) for key in groups
-    }
-    unlabelled_by_group: dict[tuple[int, float], int] = {
-        key: len(unlabelled_state.get(key, set())) for key in groups
+    # F1 madde 4: KIRPMA — `group_state`/`unlabelled_state` fingerprint
+    # eşleşse bile (ya da eski bir koşudan kalan bir hücrede) `range(total)`
+    # DIŞINDA bir pozisyon barındırabilir; bu döngü o pozisyonları oranın
+    # PAYDASINA hiç sokmadan eler. `0 <= pos < total` — pozisyonlar hep
+    # `range(len(items_all))`'dan geldiği için negatif olmaz, ama savunma
+    # yine de açıkça yazılır.
+    labels_by_group: dict[tuple[int, float], list[str]] = {}
+    unlabelled_by_group: dict[tuple[int, float], int] = {}
+    for key in groups:
+        total = len(groups[key])
+        labels_by_group[key] = [
+            label for pos, label in group_state.get(key, {}).items() if 0 <= pos < total
+        ]
+        unlabelled_by_group[key] = sum(
+            1 for pos in unlabelled_state.get(key, set()) if 0 <= pos < total
+        )
+    # F3: hücre başına PAYDA — kaç öğenin oranı hesaplamaya girdiği (kırpmadan
+    # SONRAKİ gerçek sayı). `criterion_b.json`'a yazılmadan bu alan olmadan,
+    # 250 öğeden gelen bir oran ile 4 öğeden gelen bir oran artefaktta bayt
+    # bayt AYNI görünürdü.
+    labelled_by_group: dict[tuple[int, float], int] = {
+        key: len(labels_by_group[key]) for key in groups
     }
     total_unlabelled = sum(unlabelled_by_group.values())
     if total_unlabelled:
@@ -4013,35 +4644,47 @@ def _run(argv: list[str] | None) -> int:
     rates = rates_by_layer(labels_by_group)
     verdicts = evaluate_all_layers(rates)
 
-    out_dir = config.model_results_dir() / "steering"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "rate_by_strength.json").write_text(json.dumps(
-        {str(l): {str(s): r for s, r in by.items()} for l, by in rates.items()},
-        ensure_ascii=False, indent=2), encoding="utf-8")
+    # F5: karar artefaktları yalnızca EN AZ BİR katman fiilen
+    # değerlendirildiyse yazılır. Sıfır kayıtlı bir sweep (ya da hiçbir
+    # katmanın değerlendirilemediği başka bir durum) `verdicts`'i boş
+    # bırakır; bu artık önceki GERÇEK `criterion_b.json`'ı EZMEZ — script'in
+    # kendi konvansiyonuyla (TÜM diğer çıkış-2 yolları yazımlardan ÖNCE
+    # döner) tutarlı hâle gelir.
+    if verdicts:
+        out_dir = config.model_results_dir() / "steering"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "rate_by_strength.json").write_text(json.dumps(
+            {str(l): {str(s): r for s, r in by.items()} for l, by in rates.items()},
+            ensure_ascii=False, indent=2), encoding="utf-8")
 
-    criterion_payload: dict = {
-        "model": config.TARGET_MODEL,
-        "layers": {str(l): v for l, v in verdicts.items()},
-        "unlabelled_by_group": {
-            _group_key(key): unlabelled_by_group[key] for key in sorted(groups)
-        },
-        "note": (
-            "Kriter KATMAN BAŞINA değerlendirildi. Eşik ve taban ön-tescildeki "
-            "hâliyle sabit: en negatif güçteki Assistant-dışı oran, 0.0 "
-            "gücündeki orandan en az 25 puan yüksek olmalı. PAYDA: her "
-            "hücrenin oranı yalnızca hakemin ETİKETLEYEBİLDİĞİ öğeler "
-            "üzerinden hesaplanır — hakemin (tek tek sorulsa bile) "
-            "ayrıştıramadığı öğeler o hücrenin paydasından DÜŞER; kaç öğenin "
-            "düştüğü 'unlabelled_by_group'ta hücre başına kayıtlıdır."
-        ),
-    }
-    if incomplete_sweep:
-        criterion_payload["incomplete_sweep"] = True
-        criterion_payload["sweep_attempted"] = meta["attempted"]
-        criterion_payload["sweep_planned"] = meta["planned"]
-    (out_dir / "criterion_b.json").write_text(
-        json.dumps(criterion_payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+        criterion_payload: dict = {
+            "model": config.TARGET_MODEL,
+            "layers": {str(l): v for l, v in verdicts.items()},
+            "labelled_by_group": {
+                _group_key(key): labelled_by_group[key] for key in sorted(groups)
+            },
+            "unlabelled_by_group": {
+                _group_key(key): unlabelled_by_group[key] for key in sorted(groups)
+            },
+            "note": (
+                "Kriter KATMAN BAŞINA değerlendirildi. Eşik ve taban "
+                "ön-tescildeki hâliyle sabit: en negatif güçteki "
+                "Assistant-dışı oran, 0.0 gücündeki orandan en az 25 puan "
+                "yüksek olmalı. PAYDA: her hücrenin oranı yalnızca hakemin "
+                "ETİKETLEYEBİLDİĞİ öğeler üzerinden hesaplanır; bu payda "
+                "hücre başına 'labelled_by_group' alanında AÇIKÇA "
+                "kayıtlıdır — hakemin (tek tek sorulsa bile) "
+                "ayrıştıramadığı öğeler paydadan DÜŞER, kaç öğenin düştüğü "
+                "'unlabelled_by_group'ta hücre başına kayıtlıdır."
+            ),
+        }
+        if incomplete_sweep:
+            criterion_payload["incomplete_sweep"] = True
+            criterion_payload["sweep_attempted"] = meta["attempted"]
+            criterion_payload["sweep_planned"] = meta["planned"]
+        (out_dir / "criterion_b.json").write_text(
+            json.dumps(criterion_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     print()
     for layer in sorted(verdicts):
@@ -4099,9 +4742,11 @@ if __name__ == "__main__":
 - [ ] **Step 5: Testlerin geçtiğini doğrula**
 
 Run: `cd ~/assistant-axis && uv run --extra dev pytest tests/test_evaluate_steering.py -v`
-Expected: PASS, 27 passed (E5/E6 düzeltmesi: brief'in "7 passed" beklentisi
-yalnızca Adım 2'nin ilk kod bloğu içindi; supplement E1-E3'ün eklediği 20
-test dahil gerçek sayı 27'dir).
+Expected (Fix Round 1 SONRASI — bkz. aşağıdaki "Fix Round 1 düzeltmesi"): PASS,
+**38 passed**. (E5/E6 düzeltmesi, Task 5 ilk teslimi: brief'in "7 passed"
+beklentisi yalnızca Adım 2'nin ilk kod bloğu içindi; supplement E1-E3'ün
+eklediği 20 test dahil gerçek sayı 27'ydi. Fix Round 1, F1/F2/F3/F4/F5/F8
+için 11 yeni test ekledi: 27 + 11 = 38.)
 
 - [ ] **Step 6: Tam paketin yeşil olduğunu doğrula**
 
@@ -4110,13 +4755,16 @@ Expected: PASS.
 
 **E5 düzeltmesi:** brief'in "Plan 2 sonundaki 466 test + bu planın 46 testi =
 512 (3'ü gpu işaretli)" beklentisi Task 4'ün dayanıklılık düzeltme turundan
-(Fix Round 1/2) SONRA bayatladı. Ölçülen gerçek sayı (Task 5 tamamlandığında):
-toplam **582 test** (`pytest --collect-only`), varsayılan koşuda (`-m "not
-gpu"`, `pyproject.toml`'daki `addopts`) **9'u gpu işaretli test elenir** →
-**573 passed, 9 deselected**. `-m gpu` 9 testi, `-m ml` (bir kısmı `gpu` ile
-örtüşmeyen) 6 testi ayrıca koşar/toplar — GPU'suz ortamda ikisi de yalnızca
-*collect* edilebildiği doğrulandı (gerçek GPU koşusu bu Task'ın kapsamı
-dışında, operatörün elinde).
+(Fix Round 1/2) SONRA bayatladı. Ölçülen gerçek sayı (Task 5 ilk teslimi
+tamamlandığında): toplam **582 test** (`pytest --collect-only`), varsayılan
+koşuda (`-m "not gpu"`, `pyproject.toml`'daki `addopts`) **9'u gpu işaretli
+test elenir** → **573 passed, 9 deselected**. `-m gpu` 9 testi, `-m ml` (bir
+kısmı `gpu` ile örtüşmeyen) 6 testi ayrıca koşar/toplar — GPU'suz ortamda
+ikisi de yalnızca *collect* edilebildiği doğrulandı (gerçek GPU koşusu bu
+Task'ın kapsamı dışında, operatörün elinde). **Fix Round 1 SONRASI** (bkz.
+aşağıdaki not): toplam **593 test**, **584 passed, 9 deselected** — `-m gpu`
+(9) ve `-m ml` (6) DEĞİŞMEDİ, artan 11 test hepsi `tests/test_evaluate_
+steering.py`'de ve hiçbiri `gpu`/`ml` işaretli değil.
 
 - [ ] **Step 7: Commit**
 
@@ -4145,6 +4793,68 @@ tablosuyla birebir eşleşmesini sabitleyen test) `stage4_steering: 210` ve
 toplam `1320`'yi hardcode ediyordu; bu iki sayı da (`360`, `1470`)
 güncellendi — aksi hâlde E4'ün yaptığı, açıkça izin verilen tek satırlık
 config.py değişikliği kendi test paketini kırmış olurdu.
+
+**Fix Round 1 düzeltmesi (bkz. `.superpowers/sdd/p3-task-5-fix1-brief.md` /
+`.superpowers/sdd/p3-task-5-report.md`, "Fix Round 1"):** altı mercekli
+çekişmeli bir review 1 Important + 7 Minor bulgu doğruladı; hepsi bu turda
+kapatıldı. Yukarıdaki kod blokları (Adım 2 ve Adım 4) ve test sayıları
+(Adım 5/6) ARTIK bu turun SONUCUNU yansıtıyor. Özet:
+
+- **F1 (Important) — `steering_labels.json`'ın üretildiği sweep'e hiçbir
+  bağı yoktu.** `axis_run_id` TEK BAŞINA yetmez (aktivasyon indeksinden
+  gelir, sweep'in kendisinden değil; aynı eksenle YENİDEN üretilen bir
+  sweep aynı `axis_run_id`'yi taşır ama `do_sample=True, temperature=1.0`
+  yüzünden TÜM yanıtlar yeni metindir). `steering_labels.json` artık üç
+  parmak izi taşır: `sweep_sha256` (dosya baytlarının sha256'sı),
+  `axis_run_id` (köken kaydı) ve `record_counts` (hücre başına kayıt
+  sayısı). Yükleme anında üçü de doğrulanır; uyuşmazlıkta durum atılır
+  (`.stale`'e kenara alınır, sessizce SİLİNMEZ), stderr'e büyük harfli bir
+  UYARI basılır, koşu sıfırdan başlar. `_group_done` artık SAYIYA değil
+  KAPSAMA bakıyor (`set(labels) | set(unlabelled) >= set(range(total))`);
+  `labels_by_group`/`unlabelled_by_group` o hücrenin `range(len(items_
+  all))` aralığına KIRPILIYOR.
+- **F2 — bütçe ön kontrolü resume'dan ÖNCE koşuyordu.** `load_group_labels`
+  artık bütçe kapısının ÜSTÜNDE; `planned` yalnızca BEKLEYEN pozisyonlar
+  üzerinden hesaplanıyor. Ekrandaki plan satırı hem toplamı hem bekleyeni
+  gösteriyor.
+- **F3 — `criterion_b.json` paydayı yazmıyordu.** `labelled_by_group` alanı
+  eklendi (hücre başına payda); `note` bunu açıkça tanımlıyor.
+- **F4 — `--batch-size` bölünmesini hiçbir test sabitlemiyordu.** 25 öğelik
+  bir hücrenin `[10, 10, 5]`'e bölündüğünü ve `--batch-size`'ın gönderime
+  fiilen yansıdığını doğrulayan iki test eklendi (kod DEĞİŞMEDİ — yalnızca
+  test kapsamı eksikti).
+- **F5 — karar üretemeyen koşu karar artefaktlarını EZİYORDU.** Yazım
+  bloğu artık boş olmayan `verdicts` koşuluna bağlı.
+- **F6 — `test_missing_meta_file_exits_two` ayırt etmiyordu.** Artık
+  `build_default_client`'ı ÇALIŞAN bir `FakeClient` ile monkeypatch'liyor
+  ve `client.calls == 0` + meta'ya özgü bir mesaj parçasını doğruluyor.
+- **F7 (benim eksiğim, E4'ün ardından) — `config.py`'nin yorum tablosu ve
+  `STAGE_LOGICAL_CALLS` E4 öncesi sayılarda kalmıştı.**
+  `STAGE_LOGICAL_CALLS["stage4_steering"]` 175'ten **350**'ye, yorum
+  tablosundaki TOPLAM satırı `1.082/238/1.320`'den **`1.257/213/1.470`**'e
+  güncellendi. `GLOBAL_BUDGET` 1500 KALDI. `tests/test_config.py::
+  test_stage_budget_table_matches_spec_bolum_6` de (`stage4_steering: 175`
+  → `350`, toplam `1082` → `1257`) güncellendi.
+- **F8 — atomik yazımı hiçbir test sabitlemiyordu.** Task 4'teki
+  `test_meta_write_failure_leaves_existing_file_untouched`'ın muadili
+  eklendi: `os.replace` ORTASINDA patlarsa var olan `steering_labels.json`
+  DEĞİŞMEDEN kalıyor.
+
+`tests/test_evaluate_steering.py` 27'den **38 teste** çıktı (11 yeni: F1×5,
+F2×1, F3×1, F4×2, F5×1, F8×1). Tam paket 582'den **593 teste** çıktı,
+varsayılan koşuda **584 passed, 9 deselected** (gpu=9, ml=6 DEĞİŞMEDİ).
+Dokunulan dosyalar: `scripts/09_evaluate_steering.py`,
+`tests/test_evaluate_steering.py`, `src/aax/config.py`,
+`tests/test_config.py`, bu plan dokümanının Task 5 bölümü. F1, F4, F6, F8
+için reviewer'ların tarif ettiği mutasyonlar fiilen uygulanıp testlerin
+düştüğü gösterildi, geri alındı (bkz. `p3-task-5-report.md`, "Fix Round 1").
+
+```bash
+git add scripts/09_evaluate_steering.py tests/test_evaluate_steering.py \
+        src/aax/config.py tests/test_config.py \
+        docs/superpowers/plans/2026-08-10-plan3-steering.md
+git commit -m "fix: Aşama 4 değerlendirmesi — sweep parmak izi, bütçe sırası, payda alanı"
+```
 
 - [ ] **Step 8: OPERATÖR ADIMI — B kriteri kararı**
 

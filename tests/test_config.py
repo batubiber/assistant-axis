@@ -43,7 +43,10 @@ def test_stage_budget_table_matches_spec_bolum_6():
         "stage0_roles": 120,
         "stage05_judge_gate": 5,
         "stage2_probe_labels": 250,
-        "stage4_steering": 175,
+        # 2026-08-10 Fix Round 1 (bkz. p3-task-5-fix1-brief.md, madde F7):
+        # 175 tek katmanlık bir sweep'in kalıntısıydı; STAGE_BUDGETS zaten
+        # 360'a yükseltilmişti (E4) ama bu sözlük senkronsuz kalmıştı.
+        "stage4_steering": 350,
         "stage5_drift": 320,
         "stage6_capping": 150,
         "stage7_turkish": 60,
@@ -61,7 +64,7 @@ def test_stage_budget_table_matches_spec_bolum_6():
         "stage6_capping": 180,
         "stage7_turkish": 75,
     }
-    assert sum(config.STAGE_LOGICAL_CALLS.values()) == 1082
+    assert sum(config.STAGE_LOGICAL_CALLS.values()) == 1257
     assert sum(config.STAGE_BUDGETS.values()) == 1470
 
 

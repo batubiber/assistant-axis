@@ -76,11 +76,21 @@ def model_results_dir(model_id: str | None = None) -> Path:
 # | stage0_roles       |       120 |  25 |   145 |
 # | stage05_judge_gate |         5 |  10 |    15 |
 # | stage2_probe_labels|       250 |  50 |   300 |
-# | stage4_steering    |       175 |  35 |   210 |
+# | stage4_steering    |       350 |  10 |   360 |
 # | stage5_drift       |       320 |  65 |   385 |
 # | stage6_capping     |       150 |  30 |   180 |
 # | stage7_turkish     |        60 |  15 |    75 |
-# | TOPLAM             |     1.082 | 238 | 1.320 |
+# | TOPLAM             |     1.257 | 213 | 1.470 |
+#
+# `stage4_steering` satırı 2026-08-10 düzeltmesiyle (bkz.
+# `.superpowers/sdd/p3-task-5-fix1-brief.md`, madde F7) güncellendi: eski
+# 175/35/210 tek katmanlık bir sweep'in sayılarıydı. Gerçek plan iki katman
+# (L14, L19) × 7 güç = 14 grup, grup başına 250 öğe (50 rol × 5 introspektif
+# soru), `batch_size=10` ile grup başına 25 çağrı → 14 × 25 = 350 mantıksal
+# çağrı, +10 böl-ve-kurtar payı = 360 bütçe (bkz. `STAGE_BUDGETS` altındaki
+# E4 yorumu — o zaten 360'tı; burada güncellenen yalnızca bu YORUM
+# TABLOSU ve aşağıdaki `STAGE_LOGICAL_CALLS`, ikisi de E4'ten SONRA bayat
+# kalmıştı).
 #
 # Toplam GLOBAL_BUDGET'ın (1500) altında kalmak ZORUNDA — tavan kullanıcının
 # onayladığı sayıdır ve yükseltilmez. Bir aşama sığmıyorsa batch küçültülür.
@@ -135,12 +145,19 @@ MODEL_DEPENDENT_STAGES: frozenset[str] = frozenset(
 
 # Aşama tablosunun dayandığı mantıksal çağrı sayıları (spec Bölüm 6).
 # Yalnızca belgelendirme ve test içindir; hiçbir koruma buna bakmaz.
+#
+# `stage4_steering` 2026-08-10 düzeltmesiyle (bkz.
+# `.superpowers/sdd/p3-task-5-fix1-brief.md`, madde F7) 175'ten 350'ye
+# güncellendi — yukarıdaki yorum tablosuyla AYNI gerekçe: eski sayı tek
+# katmanlık bir sweep'in kalıntısıydı, `STAGE_BUDGETS["stage4_steering"]`
+# (360) E4'te zaten doğru sayıya yükseltilmişti ama bu sözlük SENKRONSUZ
+# kalmıştı.
 STAGE_LOGICAL_CALLS: dict[str, int] = {
     "smoke": 2,
     "stage0_roles": 120,
     "stage05_judge_gate": 5,
     "stage2_probe_labels": 250,
-    "stage4_steering": 175,
+    "stage4_steering": 350,
     "stage5_drift": 320,
     "stage6_capping": 150,
     "stage7_turkish": 60,
