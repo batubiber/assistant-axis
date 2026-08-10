@@ -2808,11 +2808,43 @@ git add results/steering_preregistration.json
 git commit -m "results: B kriteri ön-tescili (ölçüm görülmeden)"
 ```
 
+Not (Task 5 uygulaması sırasında eklendi): commit'lenen dosya, ölçümden hâlâ
+önce, bir `DUZELTME` alt-alanıyla genişletildi — iki duman koşusu (105
+üretim, karar verisi DEĞİL) sırasında yapılan bir ilk yanlış okuma
+("`degenerate repetition`") kayıtlı bırakılıp DÜZELTİLDİ ("bu `weird_role`
+kategorisinin ta kendisi"). Eşik/taban/iki katmanlı kurulum DEĞİŞMEDİ — bkz.
+dosyanın kendisi.
+
 - [ ] **Step 2: Failing test'leri yaz**
+
+**Kontrolör eklentisi (bkz. `.superpowers/sdd/p3-task-5-supplement.md`,
+madde E1-E3):** brief'in bu adımda verdiği 7 test yalnızca sözleşmenin en
+temel şeklini sabitliyordu. Supplement E1 (böl-ve-kurtar + artımlı
+kalıcılık), E2 (yarım kalmış sweep koruması) ve E3 (boş karar kümesi artık
+GEÇTİ sayılmaz) koddan ÖNCE gelen ek gereksinimler getirdi; aşağıdaki test
+dosyası shipping koddaki HALİYLE birebir — 7 verilen test + 20 ek test = 27
+test.
 
 `tests/test_evaluate_steering.py`:
 
 ```python
+"""`scripts/09_evaluate_steering.py` testleri.
+
+İlk 7 test brief'in Adım 2'sinden BİREBİR — bu script'in Task 5 sözleşmesinin
+en temel şekli. Geri kalanı supplement'in (`.superpowers/sdd/
+p3-task-5-supplement.md`) E1-E3 maddelerini kapsar: böl-ve-kurtar (06'nın
+`_label_batch` deseninin persona sınıflandırmasındaki karşılığı), yarım kalmış
+bir sweep'ten karar üretilmemesi, ve boş bir karar kümesinin artık "GEÇTİ"
+sayılmaması.
+
+Ağa çıkmaz: gerçek `GatewayClient`'a hiç dokunulmaz, `build_default_client`
+her testte monkeypatch'lenir (`tests/conftest.py` zaten soketleri kapatıyor,
+bu ikinci bir savunma katmanı). Script dosya adı bir rakamla başladığı için
+normal `import` ile içe aktarılamaz; `importlib` ile dosya yolundan yüklenir
+(bkz. `tests/test_label_and_train_probe.py`, `tests/test_steering_sweep.py`).
+"""
+from __future__ import annotations
+
 import importlib.util
 import json
 import sys
@@ -2884,6 +2916,591 @@ def test_missing_sweep_file_exits_two_with_a_diagnostic(tmp_path, monkeypatch, c
     err = capsys.readouterr().err
     assert "BAŞARISIZ" in err
     assert "Traceback" not in err
+
+
+# --- E3: boş bir karar kümesi artık "GEÇTİ" (0) sayılmaz --------------------
+#
+# `all([])` Python'da `True`'dur — bu projede daha önce görülen "tanımsız
+# veriden GEÇTİ basmak" hatasının aynı sınıfı.
+
+
+def test_overall_exit_code_is_two_for_empty_verdicts():
+    assert ev.overall_exit_code({}) == 2
+
+
+# --- ortak test yardımcıları -------------------------------------------------
+
+
+def _patch_paths(monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    results_dir = tmp_path / "results"
+    monkeypatch.setattr(ev.config, "model_data_dir", lambda: data_dir)
+    monkeypatch.setattr(ev.config, "model_results_dir", lambda: results_dir)
+    return data_dir, results_dir
+
+
+def _write_sweep(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_meta(path: Path, *, planned: int, attempted: int, complete: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"planned": planned, "attempted": attempted, "complete": complete}),
+        encoding="utf-8",
+    )
+
+
+def _make_records(layer: int, strengths: list[float], n_roles: int, n_questions: int) -> list[dict]:
+    records = []
+    for s in strengths:
+        for r in range(n_roles):
+            for q in range(n_questions):
+                records.append({
+                    "layer": layer,
+                    "strength": s,
+                    "role": f"role{r}",
+                    "question": f"question{q}",
+                    "answer": f"answer L{layer} s{s} r{r} q{q}",
+                })
+    return records
+
+
+class FakeClient:
+    """Ağsız sahte hakem istemcisi.
+
+    `default_label`: içerik ne olursa olsun döndürülecek sabit persona
+    kategorisi. `label_rule`: verilirse her `[ITEM ...]` bloğu İÇİN AYRI
+    çağrılır (`block: str -> kategori`) — gruplar arasında FARKLI oranlar
+    üretmek için (ör. güce göre etiket değişsin). `poison_marker`: içeriğinde
+    bu alt dize geçen HERHANGİ bir batch/yarı/tekil istek `JudgeParseError`
+    fırlatır — hakemin belirli bir öğeyi hiçbir boyutta ayrıştıramamasının
+    sahtesi. `exceptions`: sırayla `.chat()` çağrılarının ÖNÜNE geçip
+    fırlatılır.
+    """
+
+    def __init__(
+        self,
+        *,
+        default_label: str = "assistant",
+        label_rule=None,
+        poison_marker: str | None = None,
+        exceptions: list | None = None,
+        stage_remaining: int = 10_000,
+        global_remaining: int = 10_000,
+    ) -> None:
+        self.default_label = default_label
+        self.label_rule = label_rule
+        self.poison_marker = poison_marker
+        self._exceptions = list(exceptions or [])
+        self._stage_remaining = stage_remaining
+        self._global_remaining = global_remaining
+        self.calls = 0
+        self.sends_made = 0
+        self.sizes_seen: list[int] = []
+
+    def would_call(self, messages, *, temperature=0.0, max_tokens=1024):
+        return True
+
+    def remaining_budget(self, stage):
+        return self._stage_remaining, self._global_remaining
+
+    def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+        self.calls += 1
+        self.sends_made += 1
+        if self._exceptions:
+            raise self._exceptions.pop(0)
+        content = messages[0]["content"]
+        if self.poison_marker and self.poison_marker in content:
+            raise ev.JudgeParseError("hakem ayrıştıramadı: uzunluk uyuşmazlığı")
+        blocks = content.split("[ITEM ")[1:]
+        self.sizes_seen.append(len(blocks))
+        if self.label_rule is not None:
+            labels = [self.label_rule(block) for block in blocks]
+        else:
+            labels = [self.default_label] * len(blocks)
+        return json.dumps(labels)
+
+
+class RaisesOnNthCallClient:
+    """N'inci `.chat()` çağrısında verilen istisnayı fırlatan, öncesi/sonrası
+    normal çalışan sahte istemci — bir grup TAMAMEN etiketlendikten SONRA
+    bir sonraki grubun patlaması senaryosunu üretmek içindir."""
+
+    def __init__(self, exc: Exception, *, n: int = 2, default_label: str = "assistant") -> None:
+        self._exc = exc
+        self._n = n
+        self.default_label = default_label
+        self.calls = 0
+        self.sends_made = 0
+
+    def remaining_budget(self, stage):
+        return 10_000, 10_000
+
+    def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+        self.calls += 1
+        self.sends_made += 1
+        if self.calls == self._n:
+            raise self._exc
+        content = messages[0]["content"]
+        n_items = content.count("[ITEM ")
+        return json.dumps([self.default_label] * n_items)
+
+
+# --- E1: böl-ve-kurtar (`_classify_batch`) — 06'nın `_label_batch`'iyle -----
+# AYNI desen -------------------------------------------------------------
+
+
+def test_classify_batch_recovers_from_a_bad_batch_via_split():
+    class FailsWholeBatchOnlyClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.sizes_seen: list[int] = []
+
+        def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+            self.calls += 1
+            content = messages[0]["content"]
+            n_items = content.count("[ITEM ")
+            self.sizes_seen.append(n_items)
+            if n_items == 10:
+                raise ev.JudgeParseError("uzunluk uyuşmazlığı: 11 != 10")
+            return json.dumps(["assistant"] * n_items)
+
+    client = FailsWholeBatchOnlyClient()
+    positions = list(range(10))
+    items = [(f"soru {i}", f"cevap {i}") for i in positions]
+
+    labels, unlabelled, split = ev._classify_batch(
+        client, positions=positions, items=items, stage=ev.STAGE
+    )
+
+    assert unlabelled == []
+    assert labels == {p: "assistant" for p in positions}
+    assert split == 1
+    # 1 (tüm batch, başarısız) + 2 (yarılar, ikisi de başarılı) = 3 gönderim.
+    assert client.calls == 3
+    assert client.sizes_seen == [10, 5, 5]
+
+
+def test_classify_batch_worst_case_cost_is_bounded_at_thirteen_sends_for_ten_items():
+    class AlwaysFailsClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+            self.calls += 1
+            raise ev.JudgeParseError("hep bozuk")
+
+    client = AlwaysFailsClient()
+    positions = list(range(10))
+    items = [(f"soru {i}", f"cevap {i}") for i in positions]
+
+    labels, unlabelled, split = ev._classify_batch(
+        client, positions=positions, items=items, stage=ev.STAGE
+    )
+
+    assert labels == {}
+    assert sorted(unlabelled) == positions
+    assert split == 1
+    assert client.calls == 13
+
+
+def test_classify_batch_size_one_half_is_not_retried_with_an_identical_payload():
+    class AlwaysFailsClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+            self.calls += 1
+            raise ev.JudgeParseError("hep bozuk")
+
+    client = AlwaysFailsClient()
+    labels, unlabelled, split = ev._classify_batch(
+        client, positions=[0, 1], items=[("s0", "c0"), ("s1", "c1")], stage=ev.STAGE
+    )
+
+    assert labels == {}
+    assert sorted(unlabelled) == [0, 1]
+    assert split == 1
+    # 1 (tüm batch) + 2 (yarılar, İKİSİ de zaten tekil) = 3 — YİNELENEN
+    # tekil deneme YOK.
+    assert client.calls == 3
+
+
+def test_item_that_fails_even_alone_is_recorded_unlabelled_and_run_continues(
+    tmp_path, monkeypatch, capsys
+):
+    """Bir öğe (batch -> yarı -> tekil) her boyutta başarısız olsa bile koşu
+    DÜŞMEZ: 'etiketlenemedi' sayılır, koşu devam eder, sayı artefakta
+    yazılır (E1)."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=2, n_questions=2)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=8, attempted=8, complete=True)
+    # (14, 0.0) grubunun İLK öğesinin cevabı ASLA ayrıştırılamayan "zehirli" öğe.
+    poison_marker = records[0]["answer"]
+    client = FakeClient(default_label="assistant", poison_marker=poison_marker)
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code == 1  # kriter DEĞERLENDİRİLDİ (rate her iki grupta da 0.0 — düştü)
+    err = capsys.readouterr().err
+    assert "UYARI" in err
+    assert "toplam 1 öğe" in err
+
+    labels_payload = json.loads((data_dir / "steering_labels.json").read_text(encoding="utf-8"))
+    assert "0" not in labels_payload["labels"]["14|0.0"], "zehirli öğenin konumu (0) etiketlenemedi"
+    assert set(labels_payload["labels"]["14|0.0"].values()) == {"assistant"}
+    assert len(labels_payload["labels"]["14|0.0"]) == 3
+    assert labels_payload["unlabelled_positions"]["14|0.0"] == [0]
+    assert set(labels_payload["labels"]["14|-0.6"].values()) == {"assistant"}
+
+    criterion_payload = json.loads(
+        (results_dir / "steering" / "criterion_b.json").read_text(encoding="utf-8")
+    )
+    assert criterion_payload["unlabelled_by_group"]["14|0.0"] == 1
+    assert criterion_payload["unlabelled_by_group"]["14|-0.6"] == 0
+
+
+def test_entirely_unlabelled_cell_exits_two_not_traceback(tmp_path, monkeypatch, capsys):
+    """Bir hücrenin TÜM öğeleri etiketlenemezse (`non_assistant_rate` boş
+    listede zaten `ValueError` atar) bu temiz bir 2'ye dönüşmeli, traceback'e
+    değil (E1)."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=1, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=2, attempted=2, complete=True)
+    # -0.6 grubunun TEK öğesi her zaman zehirli; 0.0 grubu temiz kalır.
+    client = FakeClient(default_label="assistant", poison_marker="s-0.6")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "Traceback" not in err
+
+
+def test_labels_file_left_behind_by_an_interrupted_run_is_valid_json(
+    tmp_path, monkeypatch, capsys
+):
+    """Kesintiye uğrayan bir koşu (`BudgetExceeded`) o ana kadarki
+    ilerlemeyi GEÇERLİ JSON olarak diske bırakmalı (E1)."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=2, n_questions=2)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=8, attempted=8, complete=True)
+    # sorted(groups) -> [(14, -0.6), (14, 0.0)]: ilk grup (-0.6) TAMAMLANIR,
+    # ikinci grubun (0.0) TEK batch'i BudgetExceeded ile patlar.
+    client = RaisesOnNthCallClient(ev.BudgetExceeded("'stage4_steering' bütçesi doldu"), n=2)
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "DURDURULDU" in err
+    assert "kalıcı olarak" in err
+
+    labels_path = data_dir / "steering_labels.json"
+    assert labels_path.exists()
+    payload = json.loads(labels_path.read_text(encoding="utf-8"))  # geçerli JSON olmalı
+    assert len(payload["labels"]["14|-0.6"]) == 4
+    assert "14|0.0" not in payload["labels"] or payload["labels"]["14|0.0"] == {}
+    assert not (results_dir / "steering" / "criterion_b.json").exists()
+
+
+def test_gateway_error_stops_cleanly_after_persisting_progress(tmp_path, monkeypatch, capsys):
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=2, n_questions=2)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=8, attempted=8, complete=True)
+    client = RaisesOnNthCallClient(ev.GatewayError("HTTP 500"), n=2)
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "kalıcı olarak" in err
+    assert (data_dir / "steering_labels.json").exists()
+
+
+def test_resume_skips_already_completed_groups_and_reuses_saved_labels(
+    tmp_path, monkeypatch, capsys
+):
+    """Önceki (kesintiye uğramış) bir koşudan kalma etiketler diskten
+    yüklenir ve o GRUP hakeme HİÇ tekrar sorulmaz."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=2, n_questions=2)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=8, attempted=8, complete=True)
+    ev.save_group_labels(
+        data_dir / "steering_labels.json",
+        {(14, -0.6): {0: "assistant", 1: "assistant", 2: "assistant", 3: "assistant"}},
+        {(14, -0.6): set()},
+    )
+    client = FakeClient(default_label="human_role")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code in (0, 1)
+    out = capsys.readouterr().out
+    assert "1/2 grup diskten yüklendi" in out
+    # yalnızca (14, 0.0) grubu için (4 öğe, batch_size=10) TEK bir gönderim.
+    assert client.calls == 1
+
+    labels_payload = json.loads((data_dir / "steering_labels.json").read_text(encoding="utf-8"))
+    assert labels_payload["labels"]["14|-0.6"] == {
+        "0": "assistant", "1": "assistant", "2": "assistant", "3": "assistant"
+    }
+    assert set(labels_payload["labels"]["14|0.0"].values()) == {"human_role"}
+
+
+def test_corrupt_labels_file_is_reported_cleanly_not_silently_discarded(
+    tmp_path, monkeypatch, capsys
+):
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=1, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=2, attempted=2, complete=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "steering_labels.json").write_text("{bozuk json", encoding="utf-8")
+    client = FakeClient()
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "bozuk" in err
+    assert client.calls == 0, "bozuk etiket dosyası tespit edildiyse istek atılmamalı"
+
+
+# --- E2: yarım kalmış bir sweep'ten B kriteri kararı ÜRETİLMEMELİ ------------
+
+
+def test_missing_meta_file_exits_two(tmp_path, monkeypatch, capsys):
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=1, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    # meta dosyası KASITLI olarak hiç yazılmadı.
+
+    exit_code = ev.main([])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "Traceback" not in err
+
+
+def test_meta_says_incomplete_exits_two_with_counts(tmp_path, monkeypatch, capsys):
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=1, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=100, attempted=40, complete=False)
+    client = FakeClient()
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "40" in err and "100" in err
+    assert "--allow-incomplete" in err
+    assert client.calls == 0, "eksik sweep tespit edildiyse hakem hiç çağrılmamalı"
+
+
+def test_allow_incomplete_flag_evaluates_and_marks_artifact(tmp_path, monkeypatch, capsys):
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=3, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=100, attempted=6, complete=False)
+    client = FakeClient(default_label="human_role")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main(["--allow-incomplete"])
+
+    assert exit_code == 1  # taban == uzak oran (ikisi de human_role) -> düştü, ama DEĞERLENDİRİLDİ
+    err = capsys.readouterr().err
+    assert "UYARI" in err
+    assert "KISMİ SWEEP" in err
+
+    criterion_path = results_dir / "steering" / "criterion_b.json"
+    assert criterion_path.exists()
+    payload = json.loads(criterion_path.read_text(encoding="utf-8"))
+    assert payload["incomplete_sweep"] is True
+    assert payload["sweep_attempted"] == 6
+    assert payload["sweep_planned"] == 100
+
+
+def test_complete_sweep_does_not_mark_the_artifact_as_incomplete(tmp_path, monkeypatch):
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=3, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=6, attempted=6, complete=True)
+    client = FakeClient(default_label="human_role")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    ev.main([])
+
+    payload = json.loads(
+        (results_dir / "steering" / "criterion_b.json").read_text(encoding="utf-8")
+    )
+    assert "incomplete_sweep" not in payload
+
+
+# --- bütçe / gateway kurulumu ------------------------------------------------
+
+
+def test_main_missing_api_key_produces_diagnostic(tmp_path, monkeypatch, capsys):
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=1, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=2, attempted=2, complete=True)
+
+    def raise_missing_key():
+        raise RuntimeError(
+            "APP_KEY_JAILBREAK ortam değişkeni tanımlı değil. "
+            "Dağıtım ortamınızın .env dosyasından alıp kabuğunuzda export edin."
+        )
+
+    monkeypatch.setattr(ev, "build_default_client", raise_missing_key)
+
+    exit_code = ev.main([])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "gateway istemcisi kurulamadı" in err
+
+
+def test_dry_run_reports_plan_and_exits_zero_when_under_budget(tmp_path, monkeypatch, capsys):
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=5, n_questions=2)  # 10 öğe/grup
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=20, attempted=20, complete=True)
+    client = FakeClient(stage_remaining=100, global_remaining=1000)
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main(["--dry-run"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Grup sayısı: 2" in out
+    assert client.calls == 0, "--dry-run tek bir hakem çağrısı bile atmamalı"
+
+
+def test_dry_run_fails_when_plan_exceeds_remaining_budget(tmp_path, monkeypatch, capsys):
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=5, n_questions=2)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=20, attempted=20, complete=True)
+    client = FakeClient(stage_remaining=1, global_remaining=1000)
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main(["--dry-run"])
+
+    assert exit_code == 2
+    assert "HATA" in capsys.readouterr().err
+
+
+def test_real_run_fails_closed_when_plan_exceeds_remaining_budget_without_spending(
+    tmp_path, monkeypatch, capsys
+):
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=5, n_questions=2)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=20, attempted=20, complete=True)
+    client = FakeClient(stage_remaining=1, global_remaining=1000)
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "sığmıyor" in err
+    assert client.calls == 0
+
+
+# --- uçtan uca mutlu yol: üç artefakt de doğru şemayla yazılır --------------
+
+
+def test_full_happy_path_writes_all_artifacts_with_correct_verdicts(tmp_path, monkeypatch):
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=3, n_questions=2)  # 6 öğe/grup
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=12, attempted=12, complete=True)
+    client = FakeClient(
+        label_rule=lambda block: "human_role" if "s-0.6" in block else "assistant"
+    )
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code == 0
+
+    labels_payload = json.loads(
+        (data_dir / "steering_labels.json").read_text(encoding="utf-8")
+    )
+    assert set(labels_payload["labels"]) == {"14|0.0", "14|-0.6"}
+    assert len(labels_payload["labels"]["14|0.0"]) == 6
+    assert len(labels_payload["labels"]["14|-0.6"]) == 6
+
+    rate_payload = json.loads(
+        (results_dir / "steering" / "rate_by_strength.json").read_text(encoding="utf-8")
+    )
+    assert rate_payload["14"]["0.0"] == pytest.approx(0.0)
+    assert rate_payload["14"]["-0.6"] == pytest.approx(1.0)
+
+    criterion_payload = json.loads(
+        (results_dir / "steering" / "criterion_b.json").read_text(encoding="utf-8")
+    )
+    assert criterion_payload["layers"]["14"]["passed"] is True
+    assert criterion_payload["unlabelled_by_group"] == {"14|0.0": 0, "14|-0.6": 0}
+    assert "incomplete_sweep" not in criterion_payload
+    assert "PAYDA" in criterion_payload["note"]
+
+
+def test_two_layers_get_independent_verdicts(tmp_path, monkeypatch):
+    """B kriteri KATMAN BAŞINA değerlendirilir: bir katman geçebilir,
+    diğeri aynı koşuda düşebilir."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = (
+        _make_records(14, [0.0, -0.6], n_roles=3, n_questions=2)
+        + _make_records(19, [0.0, -0.6], n_roles=3, n_questions=2)
+    )
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=24, attempted=24, complete=True)
+
+    def label_rule(block: str) -> str:
+        # L14: -0.6'da tamamen role geçer (geçer). L19: hiç geçmez (düşer).
+        if "L14" in block and "s-0.6" in block:
+            return "human_role"
+        return "assistant"
+
+    client = FakeClient(label_rule=label_rule)
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code == 1  # en az bir katman düştü
+    criterion_payload = json.loads(
+        (results_dir / "steering" / "criterion_b.json").read_text(encoding="utf-8")
+    )
+    assert criterion_payload["layers"]["14"]["passed"] is True
+    assert criterion_payload["layers"]["19"]["passed"] is False
 ```
 
 - [ ] **Step 3: Test'lerin başarısız olduğunu doğrula**
@@ -2893,6 +3510,18 @@ Expected: FAIL — script yok
 
 - [ ] **Step 4: `scripts/09_evaluate_steering.py` yaz**
 
+**Kontrolör eklentisi (bkz. supplement E1/E2/E4):** brief'in bu adımda verdiği
+kod, `classify_personas`'ın `JudgeParseError`'ını (E1) ve yarım kalmış bir
+sweep'i (E2) ele almıyordu. Aşağıdaki, bu iki maddeyi de içeren, shipping
+koddur — `06_label_and_train_probe.py`'nin böl-ve-kurtar + artımlı kalıcılık
+deseninin (`_label_batch`/`save_labels`/`load_existing_labels`) persona
+sınıflandırmasındaki karşılığı: `_classify_batch`/`save_group_labels`/
+`load_group_labels`. Etiket dosyası (`steering_labels.json`) artık DÜZ bir
+liste değil, hücre İÇİ KONUMA göre indekslenir (bir öğe etiketlenemediğinde
+konumu sözlükte hiç yer almaz — 06'nın satır-numarası deseninin aynısı,
+sonraki öğelerin kaymasını önler) ve HER hakem batch'inden sonra atomik
+yazılır, yalnızca koşu sonunda değil.
+
 ```python
 #!/usr/bin/env python3
 """Aşama 4 değerlendirmesi — persona sınıflandırması ve B kriteri.
@@ -2901,17 +3530,62 @@ Sweep'in her (katman, güç) grubu hakemle sınıflandırılır, Assistant-dış
 oran hesaplanır, B kriteri KATMAN BAŞINA ayrı değerlendirilir.
 
 Çıkış kodu: 0 = her katmanda geçti · 1 = en az bir katmanda düştü
-(değerlendirilmiş bir sonuç) · 2 = koşu karar üretemedi.
+(değerlendirilmiş bir sonuç) · 2 = koşu karar üretemedi (çökme, eksik/bozuk
+girdi, bütçe yetersizliği, yarım kalmış bir sweep, ya da hiç grup
+değerlendirilememesi — hiçbiri "B KRİTERİ DÜŞTÜ" DEĞİLDİR).
 
 Kullanım:
     uv run python scripts/09_evaluate_steering.py --dry-run
     uv run --extra ml python scripts/09_evaluate_steering.py
+
+Dayanıklılık (2026-08-10 düzeltmesi; bkz.
+`.superpowers/sdd/p3-task-5-supplement.md`, madde E1): `classify_personas`
+uzunluk uyuşmazlığında `JudgeParseError` fırlatır — bu KASITLI ve doğru,
+modülün işi kurtarma değil. Kurtarma bu script'in işi. `06_label_and_train_
+probe.py`'nin ("Etiketleme geçişi DAYANIKLIDIR" paragrafı, commit 44dd90e)
+AYNI deseni burada da uygulanıyor:
+
+  - `data/models/<slug>/steering_labels.json` her hakem BATCH'inden sonra
+    ATOMİK yazılıyor (tempfile + `os.replace`) — bir kesinti en fazla BİR
+    batch'lik (<=`--batch-size` öğe) işi kaybettirir, koşunun tamamını değil.
+    Bir sonraki koşu bu dosyayı okuyup zaten tamamlanmış (katman, güç)
+    hücrelerini/konumlarını TEKRAR sormaz.
+  - Bir hakem batch'i `JudgeParseError` verirse `_classify_batch` onu
+    yarılara, gerekirse tekil öğelere böler (`_label_batch`'in AYNI
+    deseni — bkz. o fonksiyonun docstring'i: bölme neden basit bir
+    retry'dan farklı ve neden işe yarar: `GatewayClient._cache_key` payload'ın
+    sha256'sıdır, daha AZ öğe içeren bir yarı FARKLI bir payload'dur).
+  - Tek başına bile ayrıştırılamayan bir öğe koşuyu ÖLDÜRMEZ: "etiketlenemedi"
+    sayılır, o hücrenin etiket listesinden (ve dolayısıyla oranın PAYDASINDAN)
+    düşer, koşu devam eder. Kaç öğenin hangi hücrede etiketlenemediği
+    `criterion_b.json`'a `unlabelled_by_group` alanıyla yazılır ve toplamı
+    stderr'e UYARI olarak basılır — oranın kaç öğeden hesaplandığı artefaktın
+    kendisinden görülebilir olmalı.
+  - Bir hücrenin TÜM öğeleri etiketlenemezse (`non_assistant_rate` boş
+    listede zaten `ValueError` atar) bu durum `main()`'in dış sarmalayıcısı
+    tarafından temiz bir Türkçe teşhis + çıkış kodu 2'ye çevrilir — çıplak bir
+    traceback ya da (daha kötüsü) çıkış kodu 1 ("B KRİTERİ DÜŞTÜ" anlamına
+    gelirdi) DEĞİL.
+
+Yarım kalmış sweep koruması (madde E2): `08_steering_sweep.py`'nin yazdığı
+`steering_sweep_meta.json` okunur; `complete: false` ise (sweep bir çökme/
+Ctrl-C/OOM ile kesildiyse) B kriteri kararı VARSAYILAN olarak ÜRETİLMEZ — bu
+eksik veriden yanlış bir bilimsel sonuç ("GEÇTİ"/"DÜŞTÜ") yayınlamak olurdu.
+Operatör bunu bilerek `--allow-incomplete` ile geçebilir; o zaman
+`criterion_b.json` kendi içinde `incomplete_sweep: true` ile işaretlenir.
+
+Boş karar kümesi artık "GEÇTİ" sayılmaz (madde E3): `all([])` Python'da
+`True`'dur — hiç katman değerlendirilmemişken bunu 0 (GEÇTİ) döndürmek,
+tanımsız veriden "GEÇTİ" basan bir hatanın (bu projede daha önce bir kez
+görülen sınıf) aynısı olurdu. `overall_exit_code({})` artık 2 döner.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -2928,6 +3602,9 @@ from aax.persona_judge import classify_personas
 from aax.susceptibility import evaluate_criterion_b, non_assistant_rate
 
 STAGE = "stage4_steering"
+
+
+# --- saf yardımcılar: gruplama, oran, karar --------------------------------
 
 
 def group_by_layer_strength(records: list[dict]) -> dict[tuple[int, float], list[dict]]:
@@ -2951,7 +3628,197 @@ def evaluate_all_layers(rates: dict[int, dict[float, float]]) -> dict[int, dict]
 
 
 def overall_exit_code(verdicts: dict[int, dict]) -> int:
+    """0 = her katman geçti · 1 = en az biri düştü · 2 = hiç katman yok.
+
+    E3: `all([])` Python'da `True`'dur — boş `verdicts` (hiçbir katman
+    değerlendirilmedi) sessizce 0 ("HER KATMANDA GEÇTİ") dönerdi. Bu, bu
+    projede daha önce görülen "tanımsız veriden GEÇTİ basmak" hatasının
+    aynı sınıfı; boş girdi artık AYRI bir kod (2, "karar üretilemedi") alır.
+    """
+    if not verdicts:
+        return 2
     return 0 if all(v["passed"] for v in verdicts.values()) else 1
+
+
+# --- etiket dosyası: konum bazlı, artımlı, atomik kalıcılık -----------------
+#
+# `steering_labels.json` bir (katman, güç) hücresinin İÇİNDEKİ konuma (grup
+# sırasındaki 0-tabanlı indeks — arayüz sözleşmesindeki "index") göre
+# indekslenir, DÜZ bir liste DEĞİL: bir öğe etiketlenemediğinde konumu
+# sözlükte hiç YER ALMAZ (06'nın satır-numarası deseninin aynısı). Düz bir
+# liste kullanılsaydı, ortadan bir öğe düştüğünde SONRAKİ öğelerin konumu
+# kayardı — hangi orijinal öğenin hangi etikete karşılık geldiği belirsizleşirdi.
+
+
+def _group_key(key: tuple[int, float]) -> str:
+    layer, strength = key
+    return f"{layer}|{strength}"
+
+
+def _parse_group_key(text: str) -> tuple[int, float]:
+    layer_text, _, strength_text = text.partition("|")
+    return int(layer_text), float(strength_text)
+
+
+def save_group_labels(
+    path: str | Path,
+    group_state: dict[tuple[int, float], dict[int, str]],
+    unlabelled_state: dict[tuple[int, float], set[int]],
+) -> None:
+    """`steering_labels.json`'ı ATOMİK yaz — `06_label_and_train_probe.py::
+    save_labels`'ın AYNI deseni (tempfile + `os.replace`). Çağıran taraf bunu
+    HER hakem batch'inden sonra çağırır: bir çökme/kesinti en fazla BİR
+    batch'lik işi kaybettirir, o ana kadar toplanan etiketlerin TAMAMINI
+    değil. Yazım ortasında kesilme dosyayı KIRPMAZ."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "labels": {
+            _group_key(key): {str(pos): label for pos, label in sorted(positions.items())}
+            for key, positions in group_state.items()
+        },
+        "unlabelled_positions": {
+            _group_key(key): sorted(positions)
+            for key, positions in unlabelled_state.items()
+        },
+    }
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def load_group_labels(
+    path: str | Path,
+) -> tuple[dict[tuple[int, float], dict[int, str]], dict[tuple[int, float], set[int]]]:
+    """Var olan `steering_labels.json`'ı yükle — bu, artımlı kalıcılığın OKUMA
+    ucudur (06'nın `load_existing_labels`'ıyla AYNI rol): önceki bir koşu
+    kesintiye uğradıysa tamamlanmış hücreler/konumlar TEKRAR hakeme
+    SORULMAZ. Dosya yoksa (ilk koşu) boş döner.
+
+    Dosya VARSA ama ayrıştırılamıyorsa ya da beklenen `labels` anahtarını
+    taşımıyorsa istisna SARMALANMADAN çağırana yükselir — sessizce sıfırdan
+    başlamak, zaten ÖDENMİŞ etiketleri sessizce silip aynı öğeleri yeniden
+    ücretlendirmek demektir (06 ile aynı gerekçe)."""
+    path = Path(path)
+    if not path.exists():
+        return {}, {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    labels_raw = payload["labels"]
+    unlabelled_raw = payload.get("unlabelled_positions", {})
+    group_state = {
+        _parse_group_key(key): {int(pos): label for pos, label in positions.items()}
+        for key, positions in labels_raw.items()
+    }
+    unlabelled_state = {
+        _parse_group_key(key): set(positions) for key, positions in unlabelled_raw.items()
+    }
+    return group_state, unlabelled_state
+
+
+# --- böl-ve-kurtar: bozuk bir hakem batch'i koşuyu düşürmesin ---------------
+
+
+def _classify_batch(
+    client,
+    *,
+    positions: list[int],
+    items: list[tuple[str, str]],
+    stage: str,
+) -> tuple[dict[int, str], list[int], int]:
+    """Bir hakem batch'ini persona sınıflandır; `JudgeParseError` fırlarsa
+    böl-ve-tekrar-dene ile KURTAR — `06_label_and_train_probe.py::
+    _label_batch` ile AYNI desen (bkz. supplement madde E1: bu tasarımı
+    KOPYALA, yeni bir tasarım uydurma).
+
+    Bölme TAM İKİ seviyelidir: batch -> yarılar -> tekil öğeler (bir yarı da
+    başarısız olursa TEKRAR yarılanmaz, doğrudan tekil öğelere iner). N
+    öğelik bir batch'in tam kurtarması en kötü durumda 1 (tüm batch) + 2
+    (yarılar) + N (tüm tekil öğeler) gönderime mal olur — N=10 için 13.
+
+    ÖNEMLİ — bölme yalnızca bir RETRY DEĞİLDİR: `GatewayClient._cache_key`
+    payload'ın (mesajlar + sıcaklık + max_tokens) sha256'sıdır; daha AZ öğe
+    içeren bir yarı/tekil öğe `persona_judge._build_prompt`'un ürettiği
+    FARKLI bir metin demektir, dolayısıyla FARKLI bir cache anahtarı.
+    `temperature=0` olduğu için AYNI payload'ı tekrar göndermek (basit bir
+    retry) zehirlenmiş cache'teki AYNI bozuk yanıtı geri getirirdi; payload'ı
+    DEĞİŞTİRMEK hakemi GERÇEKTEN yeniden sorar.
+
+    `BudgetExceeded`/`CircuitOpen`/`BudgetCorrupted`/`GatewayError` burada
+    YAKALANMAZ — bilerek: bunlar koşuyu durdurması GEREKEN fatal
+    durumlardır ve çağırana (`_run`) olduğu gibi yükselirler. Yalnızca
+    `JudgeParseError` (hakemin şekli bozuk bir yanıt vermesi) burada
+    KAPSANIR.
+
+    Dönüş: `(konum -> etiket sözlüğü, etiketlenemeyen konumlar, bölündü mü)`.
+    `bölündü mü` 1 ise bu batch en az bir kez bölünmek ZORUNDA kaldı
+    (yalnızca raporlama içindir).
+    """
+    try:
+        labels = classify_personas(client, items, stage=stage, batch_size=len(items))
+        return dict(zip(positions, labels)), [], 0
+    except JudgeParseError:
+        pass
+
+    if len(positions) <= 1:
+        # Zaten tekil öğe — daha fazla bölünemez, doğrudan etiketlenemeyen.
+        return {}, list(positions), 0
+
+    mid = len(positions) // 2
+    halves = [(positions[:mid], items[:mid]), (positions[mid:], items[mid:])]
+    labels_out: dict[int, str] = {}
+    unlabelled: list[int] = []
+    for half_positions, half_items in halves:
+        try:
+            half_labels = classify_personas(
+                client, half_items, stage=stage, batch_size=len(half_items)
+            )
+            labels_out.update(zip(half_positions, half_labels))
+            continue
+        except JudgeParseError:
+            pass
+        if len(half_positions) == 1:
+            # Yarı zaten tek öğeydi — tekrar tek öğe olarak denemek AYNI
+            # payload'ı (dolayısıyla AYNI cache anahtarını) üretirdi, bu
+            # yüzden gereksiz ikinci gönderim ATLANIR.
+            unlabelled.append(half_positions[0])
+            continue
+        for pos, item in zip(half_positions, half_items):
+            try:
+                single = classify_personas(client, [item], stage=stage, batch_size=1)
+                labels_out[pos] = single[0]
+            except JudgeParseError:
+                unlabelled.append(pos)
+    return labels_out, unlabelled, 1
+
+
+# --- sweep meta doğrulaması: yarım kalmış bir koşudan karar üretilmesin ------
+
+
+def read_sweep_meta(meta_path: str | Path) -> dict:
+    """`steering_sweep_meta.json`'ı oku ve gerekli alanların varlığını
+    doğrula. Sorun varsa okunabilir bir Türkçe mesajla `ValueError` fırlatır
+    (çağıran bunu `main()`'in genel sarmalayıcısına DEĞİL, kendi özel
+    BAŞARISIZ mesajına çevirir — bkz. `_run`)."""
+    meta_path = Path(meta_path)
+    if not meta_path.exists():
+        raise ValueError(f"{meta_path} yok.")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"{meta_path} ayrıştırılamadı: {exc}") from exc
+    required = {"complete", "attempted", "planned"}
+    if not isinstance(meta, dict) or not required.issubset(meta):
+        raise ValueError(
+            f"{meta_path} beklenen alanları taşımıyor ({sorted(required)})."
+        )
+    return meta
 
 
 def _run(argv: list[str] | None) -> int:
@@ -2960,6 +3827,15 @@ def _run(argv: list[str] | None) -> int:
                         help="istek atmadan planlanan çağrı sayısını göster")
     parser.add_argument("--batch-size", type=int, default=10,
                         help="hakem çağrısı başına öğe sayısı")
+    parser.add_argument(
+        "--allow-incomplete", action="store_true",
+        help=(
+            "steering_sweep_meta.json 'complete: false' derse bile bilerek "
+            "kısmi veriyi değerlendir (karar artefaktı bunu 'incomplete_sweep: "
+            "true' ile işaretler) — varsayılan davranış BUNU REDDEDER (bkz. "
+            "supplement madde E2)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     D = config.model_data_dir()
@@ -2968,6 +3844,42 @@ def _run(argv: list[str] | None) -> int:
         print(f"BAŞARISIZ: {sweep_path} yok.\n"
               "  Önce scripts/08_steering_sweep.py çalıştırılmalı.", file=sys.stderr)
         return 2
+
+    # E2: meta'ya HİÇ bakılmadan mevcut haliyle eksik bir sweep'ten karar
+    # üretmek yanlış bir bilimsel sonuç yayınlamak demektir. Bu kontrol
+    # `.jsonl`'i okumadan/gateway istemcisi kurulmadan ÖNCE yapılır — hem
+    # daha ucuz hem operatöre daha erken teşhis verir.
+    meta_path = D / "steering_sweep_meta.json"
+    try:
+        meta = read_sweep_meta(meta_path)
+    except ValueError as exc:
+        print(
+            f"BAŞARISIZ: sweep meta'sı okunamadı.\n  {exc}\n"
+            "  Önce scripts/08_steering_sweep.py TAMAMLANMIŞ olarak çalıştırılmalı.",
+            file=sys.stderr,
+        )
+        return 2
+
+    incomplete_sweep = not meta["complete"]
+    if incomplete_sweep and not args.allow_incomplete:
+        print(
+            "BAŞARISIZ: sweep tamamlanmamış (complete: false) — "
+            f"attempted {meta['attempted']}/{meta['planned']}.\n"
+            "  B kriteri EKSİK veriden ÜRETİLEMEZ — bu yanlış bir bilimsel "
+            "sonuç yayınlamak olurdu.\n"
+            "  Önce scripts/08_steering_sweep.py'yi tamamlayın, ya da bilerek "
+            "kısmi veriyi değerlendirmek için --allow-incomplete kullanın.",
+            file=sys.stderr,
+        )
+        return 2
+    if incomplete_sweep:
+        print(
+            "UYARI: KISMİ SWEEP DEĞERLENDİRİLİYOR (--allow-incomplete) — "
+            f"attempted {meta['attempted']}/{meta['planned']}. Sonuç "
+            "criterion_b.json içinde 'incomplete_sweep: true' olarak "
+            "işaretlenecek.",
+            file=sys.stderr,
+        )
 
     records = []
     for number, line in enumerate(
@@ -2982,6 +3894,10 @@ def _run(argv: list[str] | None) -> int:
             return 2
 
     groups = group_by_layer_strength(records)
+    # "üst sınır": böl-ve-kurtar hücre başına EK gönderim harcayabilir (bkz.
+    # `_classify_batch`) — E4'ün +10 payı bunun için. Bu sayı retry/bölünme
+    # OLMADAN gereken minimum çağrıdır, gerçek harcamanın kesin üst sınırı
+    # DEĞİLDİR.
     planned = sum((len(v) + args.batch_size - 1) // args.batch_size for v in groups.values())
 
     try:
@@ -3002,25 +3918,97 @@ def _run(argv: list[str] | None) -> int:
         print("BAŞARISIZ: plan kalan bütçeye sığmıyor — koşu başlatılmadı.", file=sys.stderr)
         return 2
 
-    labels_by_group: dict[tuple[int, float], list[str]] = {}
+    labels_path = D / "steering_labels.json"
+    # Artımlı kalıcılığın OKUMA ucu: önceki bir koşudan kalma etiketler
+    # varsa yükle — bu hücreler/konumlar aşağıdaki döngüde TEKRAR
+    # sorulmayacak. Dosya bozuksa (sıfırdan başlamak önceden ÖDENMİŞ
+    # etiketleri sessizce silmek demektir) BAŞARISIZ olunur.
+    try:
+        group_state, unlabelled_state = load_group_labels(labels_path)
+    except (ValueError, KeyError) as exc:
+        print(
+            f"BAŞARISIZ: {labels_path} bozuk — önceki koşudan kalma etiketler "
+            "okunamıyor.\n"
+            f"  Ayrıntı: {exc}\n"
+            "  Dosyayı elle onarın ya da (var olan etiketleri kaybetmeyi göze "
+            "alarak) silin.",
+            file=sys.stderr,
+        )
+        return 2
+
+    def _group_done(key: tuple[int, float]) -> bool:
+        total = len(groups[key])
+        done = len(group_state.get(key, {})) + len(unlabelled_state.get(key, set()))
+        return done >= total
+
+    already_done = sum(1 for key in groups if _group_done(key))
+    if already_done:
+        print(
+            f"{already_done}/{len(groups)} grup diskten yüklendi ({labels_path}) — "
+            "bu gruplar tekrar hakeme sorulmayacak."
+        )
+
+    batches_split_total = 0
     try:
         for key in sorted(groups):
-            items = [(r["question"], r["answer"]) for r in groups[key]]
-            labels_by_group[key] = classify_personas(
-                client, items, stage=STAGE, batch_size=args.batch_size
-            )
-            print(f"\r  {len(labels_by_group)}/{len(groups)} grup", end="", flush=True)
+            items_all = [(r["question"], r["answer"]) for r in groups[key]]
+            group_state.setdefault(key, {})
+            unlabelled_state.setdefault(key, set())
+            pending = [
+                pos for pos in range(len(items_all))
+                if pos not in group_state[key] and pos not in unlabelled_state[key]
+            ]
+            for start in range(0, len(pending), args.batch_size):
+                chunk_positions = pending[start : start + args.batch_size]
+                chunk_items = [items_all[pos] for pos in chunk_positions]
+                chunk_labels, chunk_unlabelled, split = _classify_batch(
+                    client, positions=chunk_positions, items=chunk_items, stage=STAGE
+                )
+                group_state[key].update(chunk_labels)
+                unlabelled_state[key].update(chunk_unlabelled)
+                batches_split_total += split
+                # Artımlı kalıcılığın YAZMA ucu: HER hakem batch'inden sonra
+                # diske yaz — bir çökme/kesinti bu yüzden en fazla BİR
+                # batch'lik (<=`args.batch_size` öğe) işi kaybettirir.
+                save_group_labels(labels_path, group_state, unlabelled_state)
+            done_now = sum(1 for k in groups if _group_done(k))
+            print(f"\r  {done_now}/{len(groups)} grup", end="", flush=True)
     except (BudgetExceeded, CircuitOpen, BudgetCorrupted) as exc:
         print(f"\nDURDURULDU: {exc}", file=sys.stderr)
+        print(
+            f"  Bu ana kadar toplanan etiketler {labels_path}'e kalıcı olarak "
+            "yazıldı — tekrar koşuda bu hücreler/konumlar tekrar sorulmayacak.",
+            file=sys.stderr,
+        )
         return 2
-    except (GatewayError, JudgeParseError) as exc:
+    except GatewayError as exc:
+        # `JudgeParseError` ARTIK bu grupta DEĞİL (06'daki AYNI düzeltme,
+        # bkz. supplement madde E1): `_classify_batch` onu tek başına düşen
+        # bir öğe için bile hep KENDİ İÇİNDE yakalayıp "etiketlenemedi"
+        # sayar, hiçbir zaman burada YÜKSELMEZ.
         print(f"\nBAŞARISIZ: {exc}", file=sys.stderr)
+        print(
+            f"  Bu ana kadarki ilerleme {labels_path}'e kalıcı olarak yazıldı.",
+            file=sys.stderr,
+        )
         return 2
 
     print()
-    (D / "steering_labels.json").write_text(json.dumps(
-        {f"{l}|{s}": labels for (l, s), labels in labels_by_group.items()},
-        ensure_ascii=False), encoding="utf-8")
+
+    labels_by_group: dict[tuple[int, float], list[str]] = {
+        key: list(group_state.get(key, {}).values()) for key in groups
+    }
+    unlabelled_by_group: dict[tuple[int, float], int] = {
+        key: len(unlabelled_state.get(key, set())) for key in groups
+    }
+    total_unlabelled = sum(unlabelled_by_group.values())
+    if total_unlabelled:
+        print(
+            f"UYARI: toplam {total_unlabelled} öğe hakem tarafından (tek tek "
+            "sorulsa bile) etiketlenemedi — hücre başına döküm "
+            "criterion_b.json içindeki 'unlabelled_by_group' alanında.",
+            file=sys.stderr,
+        )
 
     rates = rates_by_layer(labels_by_group)
     verdicts = evaluate_all_layers(rates)
@@ -3030,13 +4018,30 @@ def _run(argv: list[str] | None) -> int:
     (out_dir / "rate_by_strength.json").write_text(json.dumps(
         {str(l): {str(s): r for s, r in by.items()} for l, by in rates.items()},
         ensure_ascii=False, indent=2), encoding="utf-8")
-    (out_dir / "criterion_b.json").write_text(json.dumps({
+
+    criterion_payload: dict = {
         "model": config.TARGET_MODEL,
         "layers": {str(l): v for l, v in verdicts.items()},
-        "note": ("Kriter KATMAN BAŞINA değerlendirildi. Eşik ve taban ön-tescildeki "
-                 "hâliyle sabit: en negatif güçteki Assistant-dışı oran, 0.0 gücündeki "
-                 "orandan en az 25 puan yüksek olmalı."),
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
+        "unlabelled_by_group": {
+            _group_key(key): unlabelled_by_group[key] for key in sorted(groups)
+        },
+        "note": (
+            "Kriter KATMAN BAŞINA değerlendirildi. Eşik ve taban ön-tescildeki "
+            "hâliyle sabit: en negatif güçteki Assistant-dışı oran, 0.0 "
+            "gücündeki orandan en az 25 puan yüksek olmalı. PAYDA: her "
+            "hücrenin oranı yalnızca hakemin ETİKETLEYEBİLDİĞİ öğeler "
+            "üzerinden hesaplanır — hakemin (tek tek sorulsa bile) "
+            "ayrıştıramadığı öğeler o hücrenin paydasından DÜŞER; kaç öğenin "
+            "düştüğü 'unlabelled_by_group'ta hücre başına kayıtlıdır."
+        ),
+    }
+    if incomplete_sweep:
+        criterion_payload["incomplete_sweep"] = True
+        criterion_payload["sweep_attempted"] = meta["attempted"]
+        criterion_payload["sweep_planned"] = meta["planned"]
+    (out_dir / "criterion_b.json").write_text(
+        json.dumps(criterion_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     print()
     for layer in sorted(verdicts):
@@ -3049,17 +4054,39 @@ def _run(argv: list[str] | None) -> int:
             print(f"     {v['reason']}")
     print()
     code = overall_exit_code(verdicts)
-    print("B KRİTERİ:", "HER KATMANDA GEÇTİ" if code == 0 else "EN AZ BİR KATMANDA DÜŞTÜ")
+    if code == 0:
+        print("B KRİTERİ: HER KATMANDA GEÇTİ")
+    elif code == 1:
+        print("B KRİTERİ: EN AZ BİR KATMANDA DÜŞTÜ")
+    else:
+        print("B KRİTERİ: KARAR ÜRETİLEMEDİ (hiçbir katman değerlendirilemedi)")
+    print(f"Bölünüp kurtarılmaya çalışılan batch: {batches_split_total}")
     print(f"Gönderilen istek: {client.sends_made}")
     return code
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Tanı sarmalayıcısı — `07_extract_axis.py:609-637` / `08_steering_
+    sweep.py::main` ile AYNI desen: gerçek gövde `_run()`'da, burada
+    yalnızca ÖNGÖRÜLMEMİŞ bir istisnayı (ör. `evaluate_criterion_b`'nin
+    guard `ValueError`'larından biri, ya da bir I/O hatası) yakalayıp temiz
+    bir Türkçe teşhisle çıkış kodu 2 döndürür.
+
+    Bu, `susceptibility.py`'nin guard'larının (boş etiket listesi, 0.0
+    taban eksik, sonlu olmayan oran, negatif güç ölçümü yok) HİÇBİRİNİN
+    çıplak bir traceback'e ya da — daha kötüsü — çıkış kodu 1'e ("B KRİTERİ
+    DÜŞTÜ" anlamına gelir) DÖNÜŞMEMESİNİ garanti eder: exit 1 bu script'te
+    YALNIZCA "kriter fiilen değerlendirildi ve düştü" demektir, bir kurulum/
+    girdi hatası değil.
+
+    `KeyboardInterrupt` BİLEREK ayrı tutulur ve yeniden fırlatılır:
+    operatörün Ctrl-C'si bir "BAŞARISIZ" tanısına dönüşmemeli.
+    """
     try:
         return _run(argv)
     except KeyboardInterrupt:
         raise
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — kasıtlı geniş yakalama, gerekçe docstring'de
         print(f"BAŞARISIZ: beklenmeyen hata — bu bir B kriteri kararı DEĞİLDİR.\n"
               f"  {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
@@ -3072,19 +4099,52 @@ if __name__ == "__main__":
 - [ ] **Step 5: Testlerin geçtiğini doğrula**
 
 Run: `cd ~/assistant-axis && uv run --extra dev pytest tests/test_evaluate_steering.py -v`
-Expected: PASS, 7 passed
+Expected: PASS, 27 passed (E5/E6 düzeltmesi: brief'in "7 passed" beklentisi
+yalnızca Adım 2'nin ilk kod bloğu içindi; supplement E1-E3'ün eklediği 20
+test dahil gerçek sayı 27'dir).
 
 - [ ] **Step 6: Tam paketin yeşil olduğunu doğrula**
 
-Run: `cd ~/assistant-axis && uv run --extra dev pytest -q`
-Expected: PASS. Plan 2 sonundaki 466 test + bu planın 46 testi = 512 (3'ü gpu işaretli, varsayılan koşuda elenir).
+Run: `cd ~/assistant-axis && uv run --extra dev pytest -q -m "not gpu"`
+Expected: PASS.
+
+**E5 düzeltmesi:** brief'in "Plan 2 sonundaki 466 test + bu planın 46 testi =
+512 (3'ü gpu işaretli)" beklentisi Task 4'ün dayanıklılık düzeltme turundan
+(Fix Round 1/2) SONRA bayatladı. Ölçülen gerçek sayı (Task 5 tamamlandığında):
+toplam **582 test** (`pytest --collect-only`), varsayılan koşuda (`-m "not
+gpu"`, `pyproject.toml`'daki `addopts`) **9'u gpu işaretli test elenir** →
+**573 passed, 9 deselected**. `-m gpu` 9 testi, `-m ml` (bir kısmı `gpu` ile
+örtüşmeyen) 6 testi ayrıca koşar/toplar — GPU'suz ortamda ikisi de yalnızca
+*collect* edilebildiği doğrulandı (gerçek GPU koşusu bu Task'ın kapsamı
+dışında, operatörün elinde).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add scripts/09_evaluate_steering.py tests/test_evaluate_steering.py
+git add scripts/09_evaluate_steering.py tests/test_evaluate_steering.py \
+        src/aax/config.py tests/test_config.py \
+        docs/superpowers/plans/2026-08-10-plan3-steering.md
 git commit -m "feat: Aşama 4 değerlendirmesi ve B kriteri"
 ```
+
+**E4 düzeltmesi — `src/aax/config.py`:** `stage4_steering` alt bütçesi eski
+210'dan **360**'a yükseltildi. Gerekçe: gerçek plan iki katman (L14, L19) ×
+7 güç = 14 grup, grup başına 250 öğe (50 rol × 5 introspektif soru),
+`batch_size=10` ile grup başına 25 çağrı → 14 × 25 = **350 çağrı**, +10
+böl-ve-kurtar payı = **360**. `GLOBAL_BUDGET` (1500) DEĞİŞMEDİ — bu artış
+yalnızca `stage4_steering`'in KENDİ alt sayacını büyütüyor; ölçülen gerçek
+harcama (`data/gateway_budget.json`, doğrulandı) harcanan 613, kalan 887 —
+350 çağrı bu payın rahatça içinde kalıyor (613 + 350 = 963 ≤ 1500). Bu
+değişikliğin `tests/test_gateway.py::
+test_global_budget_still_binds_across_model_scoped_stage_keys` testini
+etkilemediği doğrulandı (bu test kendi sahte tavanlarını kurup global
+tavanın hâlâ bağladığını sınıyor, `config.STAGE_BUDGETS`'ın gerçek
+sayılarına bakmıyor). `tests/test_config.py::
+test_stage_budget_table_matches_spec_bolum_6` (config.py'nin spec Bölüm 6
+tablosuyla birebir eşleşmesini sabitleyen test) `stage4_steering: 210` ve
+toplam `1320`'yi hardcode ediyordu; bu iki sayı da (`360`, `1470`)
+güncellendi — aksi hâlde E4'ün yaptığı, açıkça izin verilen tek satırlık
+config.py değişikliği kendi test paketini kırmış olurdu.
 
 - [ ] **Step 8: OPERATÖR ADIMI — B kriteri kararı**
 
@@ -3094,7 +4154,16 @@ git commit -m "feat: Aşama 4 değerlendirmesi ve B kriteri"
 cd ~/assistant-axis && AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run python scripts/09_evaluate_steering.py --dry-run
 ```
 
-`stage4_steering` alt bütçesi tek katman için boyutlanmıştı (210). İki katmanlı sweep ~350 çağrı ister ve bu **global 1500 tavanının içinde** kalır (harcanan 613, kalan 887). Dry-run bütçeye sığmıyor derse alt bütçe yükseltilir — **global tavan yükseltilmez.**
+`stage4_steering` alt bütçesi artık 360 (E4, yukarı bkz.). İki katmanlı sweep
+~350 çağrı ister ve bu hem 360'lık alt bütçenin hem **global 1500 tavanının
+içinde** kalır (harcanan 613, kalan 887). Dry-run bütçeye sığmıyor derse alt
+bütçe yükseltilir — **global tavan yükseltilmez.**
+
+`steering_sweep.jsonl`'in yanındaki `steering_sweep_meta.json`'da
+`complete: false` görülürse (E2) script VARSAYILAN olarak REDDEDER — önce
+`scripts/08_steering_sweep.py`'yi TAMAMLAYIN. Kısmi veriyi bilerek
+değerlendirmek isterseniz `--allow-incomplete` ekleyin; sonuç
+`criterion_b.json` içinde `incomplete_sweep: true` ile işaretlenir.
 
 Sonra:
 
@@ -3102,7 +4171,10 @@ Sonra:
 cd ~/assistant-axis && AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run --extra ml python scripts/09_evaluate_steering.py
 ```
 
-Çıktı katman başına oranı ve kararı basar, `results/models/<slug>/steering/` altına yazar.
+Çıktı katman başına oranı ve kararı basar, `results/models/<slug>/steering/`
+altına yazar. Kesinti/çökme olursa `data/models/<slug>/steering_labels.json`
+o ana kadarki hücreleri/konumları kalıcı olarak taşır (E1); aynı komutu
+TEKRAR çalıştırmak yalnızca eksik hücreleri/konumları sorar.
 
 ---
 

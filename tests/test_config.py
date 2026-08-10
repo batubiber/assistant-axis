@@ -53,13 +53,16 @@ def test_stage_budget_table_matches_spec_bolum_6():
         "stage0_roles": 145,
         "stage05_judge_gate": 15,
         "stage2_probe_labels": 300,
-        "stage4_steering": 210,
+        # 2026-08-10 düzeltmesi (bkz. p3-task-5-supplement.md, madde E4):
+        # 210 tek katmanlık bir sweep içindi; gerçek plan iki katman için
+        # 350 çağrı + 10 böl-ve-kurtar payı = 360 (bkz. config.py'deki yorum).
+        "stage4_steering": 360,
         "stage5_drift": 385,
         "stage6_capping": 180,
         "stage7_turkish": 75,
     }
     assert sum(config.STAGE_LOGICAL_CALLS.values()) == 1082
-    assert sum(config.STAGE_BUDGETS.values()) == 1320
+    assert sum(config.STAGE_BUDGETS.values()) == 1470
 
 
 def test_model_dependent_stages_matches_spec_bolum_6():

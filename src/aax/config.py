@@ -89,7 +89,13 @@ STAGE_BUDGETS: dict[str, int] = {
     "stage0_roles": 145,
     "stage05_judge_gate": 15,
     "stage2_probe_labels": 300,
-    "stage4_steering": 210,
+    # 2026-08-10 düzeltmesi (bkz. `.superpowers/sdd/p3-task-5-supplement.md`,
+    # madde E4): eski 210 TEK katmanlık bir sweep içindi. Gerçek plan iki
+    # katman × 7 güç = 14 grup, grup başına 250 öğe (50 rol × 5 soru),
+    # batch_size=10 ile grup başına 25 çağrı -> 14 × 25 = 350 çağrı, +10
+    # böl-ve-kurtar payı = 360. GLOBAL_BUDGET (1500) DEĞİŞMEDİ — bu artış
+    # yalnızca stage4_steering'in KENDİ alt sayacını büyütür.
+    "stage4_steering": 360,
     "stage5_drift": 385,
     "stage6_capping": 180,
     "stage7_turkish": 75,
