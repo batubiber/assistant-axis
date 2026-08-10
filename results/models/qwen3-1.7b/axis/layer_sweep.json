@@ -1,169 +1,178 @@
 {
-  "what": "A kriterinin iki kosulunun katman katman degeri.",
-  "preregistered_layer": 14,
-  "verdict_at_preregistered_layer": "DUSTU",
-  "finding": "Kosinüs her katmanda 0.93-0.95 — eksen baştan sona mevcut. Persentil derinlikle tekduze artiyor ve 0.9 esigini L19 civarinda geciyor. Yani yapi replike oluyor, ama varsayilan Assistant o yapida ancak GEC katmanlarda uc noktaya yerlesiyor.",
-  "roles_projecting_above_default_at_middle": [
-    "researcher",
-    "specialist",
-    "validator",
-    "planner",
-    "assistant",
-    "consultant",
-    "evaluator",
-    "analyst",
-    "engineer",
-    "generalist",
-    "debugger",
-    "designer",
-    "facilitator",
-    "forecaster",
-    "economist"
-  ],
-  "note_on_those_roles": "Onbesinin tamami Assistant benzeri profesyonel rol — makalenin PC1 Assistant ucu.",
-  "first_layer_passing_both": 19,
-  "confound": "Kategoriler probe yerine rol duzeyi geri cekilmesinden geldi (probe held-out %63.5 < %85). 24 rol dusuruldu, fully cogunlukla belirlendi. Yanit basina etiketle persentil farkli cikabilirdi.",
-  "discipline": "Kriter ORTA KATMANDA tescillenmisti. Derin katmanlarda gecmesi sonucu degistirmez; bu tarama yorum icindir, kriterin yeniden tanimlanmasi degil.",
+  "model": "Qwen/Qwen3-1.7B",
+  "n_layers": 28,
+  "n_vectors": 93,
+  "n_fully": 55,
+  "first_passing_layer": 19,
+  "relative_depth": 0.6785714285714286,
   "layers": [
     {
       "layer": 0,
       "cos": 0.9062,
-      "default_percentile": 0.7204
+      "pct": 0.7204,
+      "passes": false
     },
     {
       "layer": 1,
       "cos": 0.9147,
-      "default_percentile": 0.7527
+      "pct": 0.7527,
+      "passes": false
     },
     {
       "layer": 2,
       "cos": 0.924,
-      "default_percentile": 0.7527
+      "pct": 0.7527,
+      "passes": false
     },
     {
       "layer": 3,
       "cos": 0.9349,
-      "default_percentile": 0.7634
+      "pct": 0.7634,
+      "passes": false
     },
     {
       "layer": 4,
       "cos": 0.9299,
-      "default_percentile": 0.7634
+      "pct": 0.7634,
+      "passes": false
     },
     {
       "layer": 5,
       "cos": 0.9344,
-      "default_percentile": 0.7634
+      "pct": 0.7634,
+      "passes": false
     },
     {
       "layer": 6,
       "cos": 0.9368,
-      "default_percentile": 0.7634
+      "pct": 0.7634,
+      "passes": false
     },
     {
       "layer": 7,
       "cos": 0.9414,
-      "default_percentile": 0.7849
+      "pct": 0.7849,
+      "passes": false
     },
     {
       "layer": 8,
       "cos": 0.9425,
-      "default_percentile": 0.7957
+      "pct": 0.7957,
+      "passes": false
     },
     {
       "layer": 9,
       "cos": 0.9492,
-      "default_percentile": 0.7957
+      "pct": 0.7957,
+      "passes": false
     },
     {
       "layer": 10,
       "cos": 0.9504,
-      "default_percentile": 0.7957
+      "pct": 0.7957,
+      "passes": false
     },
     {
       "layer": 11,
       "cos": 0.9499,
-      "default_percentile": 0.7957
+      "pct": 0.7957,
+      "passes": false
     },
     {
       "layer": 12,
       "cos": 0.9466,
-      "default_percentile": 0.8065
+      "pct": 0.8065,
+      "passes": false
     },
     {
       "layer": 13,
       "cos": 0.9458,
-      "default_percentile": 0.8065
+      "pct": 0.8065,
+      "passes": false
     },
     {
       "layer": 14,
       "cos": 0.9431,
-      "default_percentile": 0.8387
+      "pct": 0.8387,
+      "passes": false
     },
     {
       "layer": 15,
       "cos": 0.9365,
-      "default_percentile": 0.8817
+      "pct": 0.8817,
+      "passes": false
     },
     {
       "layer": 16,
       "cos": 0.9384,
-      "default_percentile": 0.8925
+      "pct": 0.8925,
+      "passes": false
     },
     {
       "layer": 17,
       "cos": 0.9384,
-      "default_percentile": 0.8817
+      "pct": 0.8817,
+      "passes": false
     },
     {
       "layer": 18,
       "cos": 0.936,
-      "default_percentile": 0.8925
+      "pct": 0.8925,
+      "passes": false
     },
     {
       "layer": 19,
       "cos": 0.94,
-      "default_percentile": 0.9247
+      "pct": 0.9247,
+      "passes": true
     },
     {
       "layer": 20,
       "cos": 0.9405,
-      "default_percentile": 0.9355
+      "pct": 0.9355,
+      "passes": true
     },
     {
       "layer": 21,
       "cos": 0.9394,
-      "default_percentile": 0.9247
+      "pct": 0.9247,
+      "passes": true
     },
     {
       "layer": 22,
       "cos": 0.9413,
-      "default_percentile": 0.9677
+      "pct": 0.9677,
+      "passes": true
     },
     {
       "layer": 23,
       "cos": 0.9413,
-      "default_percentile": 0.9677
+      "pct": 0.9677,
+      "passes": true
     },
     {
       "layer": 24,
       "cos": 0.9458,
-      "default_percentile": 0.9785
+      "pct": 0.9785,
+      "passes": true
     },
     {
       "layer": 25,
       "cos": 0.9458,
-      "default_percentile": 0.9247
+      "pct": 0.9247,
+      "passes": true
     },
     {
       "layer": 26,
       "cos": 0.9428,
-      "default_percentile": 0.9355
+      "pct": 0.9355,
+      "passes": true
     },
     {
       "layer": 27,
       "cos": 0.9442,
-      "default_percentile": 0.871
+      "pct": 0.871,
+      "passes": false
     }
   ]
 }

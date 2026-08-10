@@ -1,0 +1,64 @@
+{
+  "tarih": "2026-08-10",
+  "soru": "Persona temsili kucuk modellerde goreli olarak daha gec mi konsolide olur?",
+  "on_tescil": "results/scale_hypothesis_preregistration.json (sonuc gorulmeden yazildi)",
+  "modeller": {
+    "Qwen/Qwen3-1.7B": {
+      "n_layers": 28,
+      "n_role_vectors": 93,
+      "n_fully": 55,
+      "ilk_gecen_katman": 19,
+      "goreli_derinlik": 0.6785714285714286,
+      "orta_katman": {
+        "cos": 0.9431,
+        "pct": 0.8387
+      },
+      "cos_araligi": [
+        0.906,
+        0.95
+      ],
+      "pct_araligi": [
+        0.72,
+        0.979
+      ]
+    },
+    "Qwen/Qwen3-0.6B": {
+      "n_layers": 28,
+      "n_role_vectors": 80,
+      "n_fully": 34,
+      "ilk_gecen_katman": null,
+      "goreli_derinlik": null,
+      "orta_katman": {
+        "cos": -0.8697,
+        "pct": 0.425
+      },
+      "cos_araligi": [
+        0.795,
+        0.956
+      ],
+      "pct_araligi": [
+        0.35,
+        0.487
+      ]
+    }
+  },
+  "bulgu": {
+    "eksen_her_iki_olcekte_de_var": "|cos(PC1, kontrast)| her katmanda 0.82-0.96. Eksen — Assistant benzeri rolleri teatral rollerden ayiran yon — iki olcekte de guclu ve derinlikten bagimsiz mevcut.",
+    "olcege_bagli_olan_sey": "Varsayilan Assistant in O EKSEN UZERINDEKI UC NOKTALIGI.",
+    "qwen3_0_6b": "Persentil her derinlikte 0.35-0.49 arasinda DUZ. Derinlikle artmiyor. Hicbir katmanda uc desile ulasmiyor. Varsayilan, persona uzayinin ORTASINDA.",
+    "qwen3_1_7b": "Persentil derinlikle tekduze artiyor (0.72 -> 0.84 @L14 -> 0.98 @L24), L19 da (goreli 0.679) uc desile giriyor.",
+    "makale_27_70B": "Orta katmanda zaten uc noktada (makale oradan olcuyor ve calisiyor).",
+    "uc_noktali_olcek_hikayesi": "0.6B: hic uc degil -> 1.7B: gec katmanlarda uc -> 27B+: orta katmanda uc."
+  },
+  "on_tescile_gore": {
+    "tahmin": "0.6B orta katman persentili 0.839 un ALTINDA, goreli gecis derinligi 0.679 un USTUNDE",
+    "gozlem": "Orta katman persentili 0.425 (< 0.839) — TAHMIN TUTTU. Ancak gecis HICBIR katmanda olmuyor, yani mekanizma \"daha gec konsolide oluyor\" degil, \"o olcekte varsayilan hic uc noktaya gelmiyor\".",
+    "ucuncu_ihtimal_gerceklesmedi": "On-tescil \"cos hicbir katmanda 0.6 yi gecmezse eksen olusmuyordur\" demisti. Gerceklesmedi: 0.6B de cos 0.87. Eksen olusuyor."
+  },
+  "confoundlar": [
+    "0.6B de 34 fully rol (1.7B: 55), 33 rol atildi (1.7B: 24) — kucuk model rolleri daha tutarsiz ustleniyor. Daha az ve gurultulu fully vektoru kontrast vektorunu etkileyebilir; yine de cos 0.87, eksen iyi belirlenmis.",
+    "Her iki modelde de kategoriler probe yerine rol duzeyi geri cekilmesinden geldi (probe: 1.7B %63.5, 0.6B %65.8; esik %85). Gurultunun hakemden geldigi, iki degerin yakinligindan anlasiliyor.",
+    "Hakem kapisi yalnizca 1.7B icin kosuldu (%77.8) ve etiketleri insan degil model verdi. 0.6B icin kapi tekrar kosulmadi."
+  ],
+  "kriter_degismedi": "A kriteri her iki model icin de DUSTU olarak kalir. Bu karsilastirma yorumdur, kriterin yeniden tanimlanmasi degil."
+}
