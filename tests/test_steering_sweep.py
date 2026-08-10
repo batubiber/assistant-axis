@@ -185,9 +185,35 @@ def _fake_load_hf_model():
     return _FakeBundle()
 
 
-def _fake_generate_steered(bundle, messages, *, layer, strength, layer_norm,
-                            max_new_tokens, **_kwargs):
-    return f"yanit L{layer} g{strength}"
+def _new_recording_fake():
+    """`generate_steered`'ın gerçek imzasıyla (`src/aax/steering.py:158-166`)
+    BİREBİR aynı keyword-only parametreleri alan bir sahte döndürür —
+    `**_kwargs` YOKTUR. Eski sahte (`**_kwargs` yutan) bir çağrı sitesinden
+    `direction=direction` gibi bir keyword'ün SİLİNMESİNİ fark edemiyordu;
+    bu sahte onu `TypeError` ile yakalar (bkz. Fix Round 2 brief, M4+M5).
+
+    Ayrıca her çağrıyı `.calls`'a kaydeder ki testler üretici fonksiyona
+    ulaşan GERÇEK (layer, strength, layer_norm, direction) değerlerini
+    doğrulayabilsin — eski sahte yalnızca `layer, strength`'i taşıyan sabit
+    bir string döndürüyordu, `direction`/`layer_norm`'un doğru mu yanlış mı
+    geçtiğini hiçbir test göremiyordu.
+    """
+    calls: list[dict] = []
+
+    def fake(bundle, messages, *, layer, direction, strength, layer_norm,
+              max_new_tokens=120):
+        calls.append({
+            "layer": layer,
+            "direction": np.asarray(direction),
+            "strength": strength,
+            "layer_norm": layer_norm,
+            "messages": messages,
+            "max_new_tokens": max_new_tokens,
+        })
+        return f"yanit L{layer} g{strength}"
+
+    fake.calls = calls
+    return fake
 
 
 def _refuse_to_load_model():
@@ -261,7 +287,7 @@ def test_non_finite_layer_norm_exits_2_before_loading_model(tmp_path, monkeypatc
 def test_main_end_to_end_happy_path_writes_expected_schema_and_meta(tmp_path, monkeypatch):
     model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
     monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
-    monkeypatch.setattr(ss, "generate_steered", _fake_generate_steered)
+    monkeypatch.setattr(ss, "generate_steered", _new_recording_fake())
 
     exit_code = ss.main(["--layers", "14", "--n-roles", "5"])
 
@@ -316,7 +342,7 @@ def test_main_fails_when_selected_role_missing_from_catalog(tmp_path, monkeypatc
 def test_writes_records_incrementally_during_the_loop(tmp_path, monkeypatch):
     model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=10)
     monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
-    monkeypatch.setattr(ss, "generate_steered", _fake_generate_steered)
+    monkeypatch.setattr(ss, "generate_steered", _new_recording_fake())
 
     seen_lengths: list[int] = []
     real_write_sweep = ss.write_sweep
@@ -432,3 +458,240 @@ def test_complete_reflects_attempted_not_produced_when_some_answers_are_blank(
     assert meta["attempted"] == total
     assert meta["produced"] < total
     assert meta["complete"] is True
+
+
+# --- Fix Round 2, M1: main() öngörülmemiş bir I/O hatasını sarmalar --------
+#
+# `.superpowers/sdd/p3-task-4-fix2-brief.md`: `write_sweep`/`write_json_atomic`
+# tam diskte (ENOSPC) sarmasız fırlarsa, çıplak Python traceback + çıkış
+# kodu 1 ile çıkardı — bu projede 1 "kriter değerlendirildi ve düştü" demek.
+# `main()` artık `07_extract_axis.py:609-637`'deki desenle bunu yakalayıp
+# temiz bir Türkçe teşhisle çıkış 2 döner.
+
+
+def test_main_wraps_unexpected_write_failure_as_exit_2_not_a_bare_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    monkeypatch.setattr(ss, "generate_steered", _new_recording_fake())
+
+    def boom_write_sweep(*_args, **_kwargs):
+        raise OSError("[Errno 28] No space left on device (simüle)")
+
+    monkeypatch.setattr(ss, "write_sweep", boom_write_sweep)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "Traceback" not in err
+
+
+def test_main_lets_keyboard_interrupt_that_escapes_run_propagate(monkeypatch):
+    """`main()`'in `except Exception` bloğu `KeyboardInterrupt`'ı (bir
+    `BaseException`) hiç yakalamamalı — sarmasız bile geçseydi bu zaten
+    doğru olurdu, ama sarmalayıcının `except KeyboardInterrupt: raise`
+    satırı BİLEREK açık: operatörün Ctrl-C'si bir "BAŞARISIZ" tanısına asla
+    dönüşmemeli."""
+
+    def boom_run(argv=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ss, "_run", boom_run)
+
+    with pytest.raises(KeyboardInterrupt):
+        ss.main(["--layers", "14"])
+
+
+# --- Fix Round 2, M2: meta döngü öncesi + her periyodik write ile tazelenir -
+
+
+def test_meta_is_written_before_the_loop_and_at_each_periodic_flush(
+    tmp_path, monkeypatch
+):
+    """M2: meta artık (a) döngü BAŞLAMADAN ÖNCE bir kez ve (b) her periyodik
+    `write_sweep`'in yanında `complete: false` ile yazılıyor. Önceki
+    davranışta meta yalnızca döngü SONUNDA yazıldığı için bir SIGKILL/
+    elektrik kesintisi taze bir kısmi `.jsonl`'in yanına ÖNCEKİ koşunun
+    meta'sını bırakabiliyordu."""
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=10)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    monkeypatch.setattr(ss, "generate_steered", _new_recording_fake())
+
+    seen: list[dict] = []
+    real_write_json_atomic = ss.write_json_atomic
+
+    def spy_write_json_atomic(path, payload):
+        seen.append(dict(payload))
+        real_write_json_atomic(path, payload)
+
+    monkeypatch.setattr(ss, "write_json_atomic", spy_write_json_atomic)
+
+    # 1 katman × 7 güç × 10 rol × 5 soru = 350 üretim -> PROGRESS_PERIOD=100
+    # sınırını done=100/200/300'de geçer: 1 döngü-öncesi + 3 periyodik +
+    # 1 final = 5 meta yazımı.
+    exit_code = ss.main(["--layers", "14", "--n-roles", "10"])
+
+    assert exit_code == 0
+    assert len(seen) == 5
+    assert seen[0]["attempted"] == 0
+    assert seen[0]["complete"] is False
+    for payload in seen[:-1]:
+        assert payload["complete"] is False
+    attempted_seq = [p["attempted"] for p in seen]
+    assert attempted_seq == sorted(attempted_seq)
+    assert seen[-1]["complete"] is True
+    assert seen[-1]["attempted"] == 350
+    meta_on_disk = json.loads(
+        (model_data / "steering_sweep_meta.json").read_text(encoding="utf-8")
+    )
+    assert meta_on_disk == seen[-1]
+
+
+# --- Fix Round 2, M3: mevcut bir sweep sessizce ezilmeden önce kenara alınır -
+
+
+def test_existing_sweep_is_archived_before_being_overwritten(
+    tmp_path, monkeypatch, capsys
+):
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    monkeypatch.setattr(ss, "generate_steered", _new_recording_fake())
+
+    out_path = model_data / "steering_sweep.jsonl"
+    ss.write_sweep(out_path, [
+        ss.sweep_record(layer=1, strength=0.0, role="r", question="q", answer="ONCEKI KOŞU")
+    ])
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3"])
+
+    assert exit_code == 0
+    prev_path = model_data / "steering_sweep.jsonl.prev"
+    assert prev_path.exists()
+    prev_records = ss.read_sweep(prev_path)
+    assert len(prev_records) == 1
+    assert prev_records[0]["answer"] == "ONCEKI KOŞU"
+
+    err = capsys.readouterr().err
+    assert "UYARI" in err
+    assert "1" in err
+    assert str(prev_path) in err
+
+    # Yeni koşu hedef dosyanın üzerine yazmış olmalı (sessizce EZMEMİŞ, ama
+    # tam resume KAPSAM DIŞI — yeni koşu KENDİ kayıtlarını üretir).
+    new_records = ss.read_sweep(out_path)
+    assert all(r["answer"] != "ONCEKI KOŞU" for r in new_records)
+
+
+def test_no_prior_sweep_means_no_prev_file_and_no_warning(tmp_path, monkeypatch, capsys):
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    monkeypatch.setattr(ss, "generate_steered", _new_recording_fake())
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3"])
+
+    assert exit_code == 0
+    err = capsys.readouterr().err
+    assert "UYARI" not in err
+
+
+# --- Fix Round 2, M4+M5: testler steering'in FİİLEN uygulandığını sabitler -
+#
+# Mutasyonla doğrulandı (brief): `strength=strength` → `strength=0.0`
+# (steering'i kapatmak), `direction=direction` satırını SİLMEK, ve
+# `strength=strength` → `STRENGTHS[0]` (kayıt alanını sabitlemek) — üçü de
+# eski (kwargs-yutan, çağrı kaydetmeyen) sahteyle 22/22 testten GEÇİYORDU.
+# Aşağıdaki testler `_new_recording_fake()`'in kaydettiği ÇAĞRILARI ve
+# üretilen KAYITLARI karşılaştırarak bu boşluğu kapatır.
+
+
+def test_generator_receives_exactly_the_full_strength_set(tmp_path, monkeypatch):
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "5"])
+
+    assert exit_code == 0
+    assert {c["strength"] for c in gen.calls} == set(ss.STRENGTHS)
+
+
+def test_layer_norm_passed_to_generator_matches_that_calls_own_layer(
+    tmp_path, monkeypatch
+):
+    """`layer_norms[layer]` yerine `layer_norms[args.layers[0]]` gibi tek bir
+    katmana sabitleyen bir mutasyonu yakalar — bunu görebilmek için EN AZ
+    iki farklı katman gerekir (`--layers 14 5`)."""
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    acts = np.load(model_data / "activations.npy")
+    index = json.loads(
+        (model_data / "activations_index.json").read_text(encoding="utf-8")
+    )
+    default_rows = [i for i, r in enumerate(index["rows"]) if r["kind"] == "default"]
+    expected = {
+        L: ss.mean_residual_norm(acts[default_rows[:1000]], L) for L in (14, 5)
+    }
+    assert expected[14] != expected[5]  # sağlama: fikstür ayırt edilebilir olmalı
+
+    exit_code = ss.main(["--layers", "14", "5", "--n-roles", "5"])
+
+    assert exit_code == 0
+    assert {c["layer"] for c in gen.calls} == {14, 5}
+    for call in gen.calls:
+        assert call["layer_norm"] == pytest.approx(expected[call["layer"]])
+
+
+def test_direction_passed_to_generator_matches_axis_of_that_calls_own_layer(
+    tmp_path, monkeypatch
+):
+    """`direction=direction` satırının SİLİNMESİNİ (gerçek fonksiyonun
+    keyword-only ZORUNLU parametresi) `TypeError` ile, `axis[args.layers[0]]`
+    gibi tek bir katmana sabitlemeyi ise aşağıdaki karşılaştırmayla yakalar."""
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    axis = np.load(ss.config.model_results_dir() / "axis" / "assistant_axis.npy")
+    assert not np.allclose(axis[14], axis[5])  # sağlama: ayırt edilebilir olmalı
+
+    exit_code = ss.main(["--layers", "14", "5", "--n-roles", "5"])
+
+    assert exit_code == 0
+    assert {c["layer"] for c in gen.calls} == {14, 5}
+    for call in gen.calls:
+        np.testing.assert_allclose(call["direction"], axis[call["layer"]])
+
+
+def test_record_strength_field_matches_the_strength_that_actually_generated_it(
+    tmp_path, monkeypatch
+):
+    """`sweep_record(..., strength=strength, ...)`'daki `strength=strength`'in
+    `STRENGTHS[0]` gibi sabit bir değere değiştirilmesini yakalar: kayıt
+    şeması ve sayısı bu mutasyon altında da doğru kalır, ama TEK BİR alan
+    DEĞERİ (`strength`) üretici çağrısının gerçek gücüyle uyuşmaz olur."""
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "5"])
+
+    assert exit_code == 0
+    records = ss.read_sweep(model_data / "steering_sweep.jsonl")
+    # Sahte hiçbir zaman boş yanıt döndürmez, yani her çağrı tam olarak bir
+    # kayıt üretir ve sıra korunur (itertools.product'ın ürettiği sırayla).
+    assert len(records) == len(gen.calls)
+    for record, call in zip(records, gen.calls):
+        # Cevap metni üretici çağrısının GERÇEK gücünü taşır (sahtenin
+        # döndürdüğü string, `call["strength"]`'ten üretildi); kayıt alanı
+        # bununla uyuşmalı.
+        assert record["answer"] == f"yanit L{call['layer']} g{call['strength']}"
+        assert record["strength"] == call["strength"]
