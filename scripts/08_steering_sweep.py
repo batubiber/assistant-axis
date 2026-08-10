@@ -41,6 +41,33 @@ yansımamıştı. Artık:
     bir `activations_index.json` artık model YÜKLENMEDEN önce temiz bir
     Türkçe mesajla reddediliyor — eskiden `nan` basıp GPU'ya modeli yükler,
     ilk `generate_steered` çağrısında sarmalanmamış bir `ValueError` alırdı.
+
+Dayanıklılık düzeltmesi, ikinci tur (Fix Round 2; bkz.
+`.superpowers/sdd/p3-task-4-fix2-brief.md`), operatörün BİRAZDAN koşacağı
+~1.5 saatlik gözetimsiz koşuyu doğrudan ilgilendiren dört madde:
+
+  - `main()` artık `07_extract_axis.py:609-637`'deki desenle bir tanı
+    sarmalayıcısı: gerçek gövde `_run()`'a taşındı, `main()` yalnızca onu
+    çağırıp öngörülmemiş bir `Exception`'ı (ör. `write_sweep`/
+    `write_json_atomic` tam diskte ENOSPC ile patlarsa) yakalayıp temiz bir
+    Türkçe teşhisle çıkış 2 döner — sarmasız hâli çıplak traceback + çıkış
+    1 veriyordu, ve bu projede 1 "kriter değerlendirildi ve düştü" demek;
+  - meta dosyası artık döngü BAŞLAMADAN ÖNCE bir kez (bu koşunun
+    parametreleriyle, `attempted=0`) ve her periyodik `write_sweep`'in
+    yanında `complete: false` ile yazılıyor — eskiden yalnızca döngü
+    SONUNDA yazıldığı için bir SIGKILL/elektrik kesintisi taze bir kısmi
+    `.jsonl`'in yanına ÖNCEKİ koşunun (farklı katman/rol/güç) meta'sını
+    bırakabiliyordu;
+  - hedef `.jsonl` ilk yazımdan önce zaten var ve boş değilse, üzerine
+    yazılmadan önce `steering_sweep.jsonl.prev`'e kopyalanıyor ve stderr'e
+    bir UYARI basılıyor — tam resume KAPSAM DIŞI kalmaya devam ediyor, bu
+    yalnızca SESSİZ EZMEYİ önlüyor (ör. bitmiş 3500 kayıtlık bir sweep'in
+    üstüne 105 kayıtlık bir duman testi çalıştırmak);
+  - testler artık steering'in FİİLEN uygulandığını sabitliyor: üretici
+    fonksiyona ulaşan güç kümesinin tam `set(STRENGTHS)` olduğunu, her
+    çağrının `layer_norm`/`direction`'ının O katmanın (ilk katmanın değil)
+    değerleri olduğunu, ve üretilen kayıtların `strength` alanının o kaydı
+    üreten çağrının gücüyle aynı olduğunu doğruluyor.
 """
 from __future__ import annotations
 
@@ -48,6 +75,7 @@ import argparse
 import itertools
 import json
 import os
+import shutil
 import sys
 import tempfile
 from datetime import timedelta
@@ -148,7 +176,60 @@ def write_json_atomic(path: str | Path, payload: dict) -> None:
         raise
 
 
-def main(argv: list[str] | None = None) -> int:
+def _meta_payload(
+    *,
+    layers: list[int],
+    roles: list[str],
+    layer_norms: dict[int, float],
+    axis_run_id,
+    planned: int,
+    attempted: int,
+    produced: int,
+    complete: bool,
+) -> dict:
+    """Meta gövdesi — üç çağrı yerinde (döngüden önce, her periyodik
+    `write_sweep`'in yanında, döngü sonunda) TEKRARLANMASIN diye tek bir
+    yerde üretilir (bkz. Fix Round 2 brief, M2)."""
+    return {
+        "layers": layers,
+        "strengths": list(STRENGTHS),
+        "n_roles": len(roles),
+        "roles": roles,
+        "questions": list(INTROSPECTIVE_QUESTIONS),
+        "layer_norms": {str(k): v for k, v in layer_norms.items()},
+        "axis_run_id": axis_run_id,
+        "planned": planned,
+        "attempted": attempted,
+        "produced": produced,
+        "complete": complete,
+    }
+
+
+def _archive_existing_sweep(out: str | Path) -> None:
+    """`out` yolunda ZATEN bir sweep varsa, ilk yazımdan önce kenara kopyalar.
+
+    Tam resume ÖZELLİKLE KAPSAM DIŞI (bkz. Fix Round 2 brief, M3) — bu
+    yalnızca SESSİZ EZMEYİ önler. Örnek: 3400 kayıt biriktirmiş bir koşunun
+    ardından `--limit-roles 3` ile bir duman testi tekrar koşulursa, mevcut
+    kod bu 3400 kaydı sessizce 105'e indirir; bu yardımcı önce onları
+    `.jsonl.prev`'e taşıyıp stderr'e bir UYARI basar.
+    """
+    out = Path(out)
+    if not out.exists() or out.stat().st_size == 0:
+        return
+    existing = sum(
+        1 for line in out.read_text(encoding="utf-8").splitlines() if line.strip()
+    )
+    prev = out.with_name(out.name + ".prev")
+    shutil.copyfile(out, prev)
+    print(
+        f"UYARI: {out} ZATEN VAR ({existing} kayıt) — {prev} OLARAK KOPYALANDI, "
+        "BU KOŞU ÜZERİNE YAZACAK.",
+        file=sys.stderr,
+    )
+
+
+def _run(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--layers", type=int, nargs="+", required=True,
                         help="steering yapılacak katmanlar, ör. --layers 14 19")
@@ -288,6 +369,20 @@ def main(argv: list[str] | None = None) -> int:
     done = 0
     out = D / "steering_sweep.jsonl"
     meta_path = D / "steering_sweep_meta.json"
+    # M3: hedef `.jsonl` önceki bir koşudan kalma ve boş değilse, ilk
+    # yazımdan önce kenara kopyala — aksi hâlde biraz aşağıdaki ilk periyodik
+    # (ya da döngü hiç girmezse döngü sonrası) `write_sweep` onu SESSİZCE
+    # ezerdi.
+    _archive_existing_sweep(out)
+    # M2: meta döngü BAŞLAMADAN ÖNCE bir kez (bu koşunun parametreleriyle,
+    # `attempted=0`) yazılır — aksi hâlde meta yalnızca döngü SONUNDA
+    # yazıldığı için bir SIGKILL/elektrik kesintisi taze bir kısmi `.jsonl`'in
+    # yanına ÖNCEKİ koşunun (farklı katman/rol/güç) meta'sını bırakabilirdi.
+    write_json_atomic(meta_path, _meta_payload(
+        layers=args.layers, roles=role_keys, layer_norms=layer_norms,
+        axis_run_id=index.get("run_id"), planned=total,
+        attempted=0, produced=0, complete=False,
+    ))
     # Yalnızca üretim çağrısı sırasında fırlayan beklenmeyen bir `Exception`
     # (CUDA OOM, geçici cihaz hatası — ikisi de `RuntimeError` alt sınıfı)
     # burada tutulur; `KeyboardInterrupt` `BaseException`dır ve içteki
@@ -337,6 +432,14 @@ def main(argv: list[str] | None = None) -> int:
                 # tam yeniden yazmak bedava — bir sonraki çökme/kesinti bu
                 # ana kadarki ilerlemeyi kaybettirmez.
                 write_sweep(out, records)
+                # M2: meta'yı jsonl'in HER periyodik yazımının yanında
+                # tazele (`complete: false` ile) — pencereyi (jsonl güncel,
+                # meta bayat) döngünün tamamı yerine milisaniyelere indirir.
+                write_json_atomic(meta_path, _meta_payload(
+                    layers=args.layers, roles=role_keys, layer_norms=layer_norms,
+                    axis_run_id=index.get("run_id"), planned=total,
+                    attempted=done, produced=len(records), complete=False,
+                ))
                 el = monotonic() - started
                 eta = el / done * (total - done)
                 print(f"\r  {done}/{total} — geçen {timedelta(seconds=int(el))}, "
@@ -356,19 +459,11 @@ def main(argv: list[str] | None = None) -> int:
     # `attempted == planned`e bakar (`produced == planned`e DEĞİL): hiç
     # kesilmemiş ama birkaç boş yanıt üretmiş tam bir koşu artık
     # `complete: false` görünmez.
-    write_json_atomic(meta_path, {
-        "layers": args.layers,
-        "strengths": list(STRENGTHS),
-        "n_roles": len(role_keys),
-        "roles": role_keys,
-        "questions": list(INTROSPECTIVE_QUESTIONS),
-        "layer_norms": {str(k): v for k, v in layer_norms.items()},
-        "axis_run_id": index.get("run_id"),
-        "planned": total,
-        "attempted": done,
-        "produced": len(records),
-        "complete": done == total,
-    })
+    write_json_atomic(meta_path, _meta_payload(
+        layers=args.layers, roles=role_keys, layer_norms=layer_norms,
+        axis_run_id=index.get("run_id"), planned=total,
+        attempted=done, produced=len(records), complete=done == total,
+    ))
 
     print(f"Yazıldı: {out} ({len(records)}/{total} kayıt)")
     if len(records) != total:
@@ -376,6 +471,44 @@ def main(argv: list[str] | None = None) -> int:
     if crashed is not None:
         return 2
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Tanı sarmalayıcısı — çıkış 1'i bu script hiç kullanmaz, ama `_run()`'ın
+    İÇİNDE öngörülmemiş bir istisna (ör. `write_sweep`/`write_json_atomic`
+    tam diskte ENOSPC ile patlarsa) sarmalanmadan yorumlayıcıdan çıkarsa
+    Python traceback basıp çıkış kodu 1 ile döner — ve bu projede 1 "kriter
+    değerlendirildi ve düştü" demek (bkz. modül docstring'i, Fix Round 2 /
+    M1). Bir I/O hatasının böyle yorumlanması kabul edilemez: aynı sınıftan
+    bir hata `06_label_and_train_probe.py`'de commit 44dd90e ile ve
+    `07_extract_axis.py:609-637`'de zaten düzeltilmişti; bu script aynı
+    dersi bu turda alıyor ve AYNI deseni uyguluyor.
+
+    `_run()`'ın kendi gövdesindeki her adım (rol seçimi, norm hesabı, üretim
+    döngüsü) zaten kendi Türkçe teşhisini ve çıkış kodu 2'sini üretiyor —
+    buradaki `except Exception` yalnızca ÖNGÖRÜLMEMİŞ bir çökme içindir.
+    `KeyboardInterrupt` (operatörün Ctrl-C'si) BİLEREK ayrı tutulur ve
+    yeniden fırlatılır: bir "BAŞARISIZ" tanısına dönüşmemeli. Not: tam disk
+    durumunda `write_json_atomic` da aynı sebeple düşer — bu sarmalayıcı
+    yalnızca çıkış kodunu ve mesajı düzeltir, eksik meta'yı KURTARMAZ; bu
+    beklenen ve kapsam dışıdır.
+    """
+    try:
+        return _run(argv)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # noqa: BLE001 — kasıtlı geniş yakalama, gerekçe docstring'de
+        print(
+            "BAŞARISIZ: beklenmeyen bir hata yüzünden sweep tamamlanamadı.\n"
+            f"  Ayrıntı: {type(exc).__name__}: {exc}\n"
+            "  Bu bir kriter kararı DEĞİLDİR (çıkış 1 değil 2): hesaplama "
+            "tamamlanmadı, üretilmiş olabilecek kısmi veriler B kriteri "
+            "değerlendirmesi için tam sayılmamalı.\n"
+            "  Olası neden: disk dolu (ENOSPC), izin hatası ya da beklenmeyen "
+            "bir I/O sorunu. Diski/izinleri kontrol edip tekrar koşun.",
+            file=sys.stderr,
+        )
+        return 2
 
 
 if __name__ == "__main__":
