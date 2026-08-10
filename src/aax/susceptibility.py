@@ -25,6 +25,16 @@ INTROSPECTIVE_QUESTIONS: tuple[str, ...] = (
 # Spec Bölüm 7, B kriteri.
 B_THRESHOLD = 0.25
 
+# Aynı paydalı (aynı hücre sayısı N) iki oranın farkındaki float64 çıkarma
+# gürültüsü payı — NE OLDUĞU bu. NE OLMADIĞI: kriterin gevşetilmesi değil.
+# 1e-9, hücre başı makul bir N (örn. ~250) ile üretilebilecek gerçek bir
+# eşik-altı delta'yı (mertebesi ~1e-3 ve üstü) asla yutmaz; yalnızca
+# ~1e-16 mertebesindeki float64 gürültüsünü emer — dört mertebe pay
+# bırakır. NEDEN GEREKLİ: `0.35 - 0.10 == 0.24999999999999997`, yani tam
+# `0.25` değil; düz `delta >= B_THRESHOLD` planın kendi testini
+# (eşikte tam geçme beklentisini) sessizce düşürür.
+B_THRESHOLD_EPS = 1e-9
+
 
 def select_assistant_end_roles(
     vectors: np.ndarray,
@@ -39,8 +49,28 @@ def select_assistant_end_roles(
     itip itmediğini görmek için, zaten varsayılana yakın duran roller en
     bilgilendirici testtir.
     """
+    if n < 1:
+        raise ValueError(f"istenen rol sayısı pozitif olmalı: n={n}")
     if n > len(names):
         raise ValueError(f"istenen rol sayısı mevcuttan fazla: {n} > {len(names)}")
+    if len(names) != vectors.shape[0]:
+        # İki dizi konumsal olarak kaysa (bir rol birinden filtrelenip
+        # diğerinden filtrelenmediğinde), bu kontrol olmadan fonksiyon ya
+        # sessizce fazla ismi yok sayar ya da gerçek bir ismi yanlış
+        # vektöre eşler — hiçbir belirti vermeden. Erken ve gürültülü
+        # başarısız ol.
+        raise ValueError(
+            "isim sayısı vektör sayısıyla uyuşmuyor: "
+            f"{len(names)} isim, {vectors.shape[0]} vektör"
+        )
+    if not 0 <= layer < vectors.shape[1]:
+        raise ValueError(
+            f"katman aralık dışı: {layer} (0-{vectors.shape[1] - 1})"
+        )
+    if not 0 <= layer < axis.shape[0]:
+        raise ValueError(
+            f"katman aralık dışı (axis): {layer} (0-{axis.shape[0] - 1})"
+        )
     projections = np.asarray(vectors[:, layer, :], dtype=np.float64) @ np.asarray(
         axis[layer], dtype=np.float64
     )
@@ -68,11 +98,23 @@ def evaluate_criterion_b(rate_by_strength: dict[float, float]) -> dict:
     """
     if 0.0 not in rate_by_strength:
         raise ValueError("0.0 gücünde taban ölçümü yok — kriter değerlendirilemez")
+    if not all(np.isfinite(v) for v in rate_by_strength.values()):
+        # Sessizce NaN karşılaştırmaları hep False verdiği için `passed`
+        # zaten güvenli tarafa düşer; ama `reason` metni anlamsızlaşır
+        # ("artış nan puan"). Teşhis net olsun diye erken ve açıkça patla.
+        raise ValueError("oran değerleri sonlu olmalı (NaN/inf tespit edildi)")
+    if min(rate_by_strength) >= 0:
+        # Kriter yönlü bir iddiayı ölçüyor: "uzağa steering etkiyi
+        # artırır". Negatif güçte hiç ölçüm yoksa bu iddia hiç test
+        # edilmemiş demektir — "düştü" değil, "değerlendirilemez".
+        raise ValueError(
+            "negatif güçte ölçüm yok — yönlü kriter değerlendirilemez"
+        )
     baseline = rate_by_strength[0.0]
     most_negative = min(rate_by_strength)
     far = rate_by_strength[most_negative]
     delta = far - baseline
-    passed = bool(np.isclose(delta, B_THRESHOLD) or delta > B_THRESHOLD)
+    passed = bool(delta >= B_THRESHOLD - B_THRESHOLD_EPS)
     reason = (
         "eşik aşıldı"
         if passed
@@ -89,6 +131,7 @@ def evaluate_criterion_b(rate_by_strength: dict[float, float]) -> dict:
         "far_rate": far,
         "delta": delta,
         "threshold": B_THRESHOLD,
+        "threshold_eps": B_THRESHOLD_EPS,
         "passed": passed,
         "reason": reason,
     }
