@@ -527,11 +527,11 @@ katkıda bulunmaya devam eder — yalnızca YENİ gönderimler yeni model-scoped
 | 1 — rollout/aktivasyon | — | — | 0 | 0 | 0 |
 | 2 — rol ifadesi filtresi | `stage2_probe_labels` | model başına | 250 | 50 | 300 |
 | 3 — eksen çıkarımı | — | — | 0 | 0 | 0 |
-| 4 — steering sweep | `stage4_steering` | model başına | 175 | 35 | 210 |
+| 4 — steering sweep | `stage4_steering` | model başına | 350 | 10 | 360 |
 | 5 — persona drift | `stage5_drift` | model başına | 320 | 65 | 385 |
 | 6 — capping | `stage6_capping` | model başına | 150 | 30 | 180 |
 | 7 — Türkçe transfer | `stage7_turkish` | model başına | 60 | 15 | 75 |
-| **Toplam (TEK model)** | | | **1,082** | **238** | **1,320** |
+| **Toplam (TEK model)** | | | **1,257** | **213** | **1,470** |
 | **Kodda sert tavan** | `GLOBAL_BUDGET` | | | | **1,500** |
 
 Bu tablo `src/aax/config.py`'deki `STAGE_LOGICAL_CALLS` ve `STAGE_BUDGETS` ile birebir
@@ -614,7 +614,10 @@ Hepsi bilinçli ve gerekçelidir; sonuç raporunda bu tabloyla birlikte sunulur.
 | 8 | Base model deneyleri (Bölüm 3.2.2), trait uzayı (Ek C) | Yok | Kapsam dışı — bkz. Bölüm 11 |
 | 9 | Hakem kapısı **insan** etiketiyle doğrulanır (makale: 200 örnek, %91.6 insan uyumu) | 45 örnek, **model** (ikinci bir model) etiketiyle, %77.8 | Operatörün kararı (2026-08-07). Ölçülen şey iki LLM arası uyum; insan-model uyumu değil. İki dil modeli aynı hataya birlikte düşebilir. Ayrıntılı künye `data/models/<slug>/judge_gate.json` → `human_labels_provenance` |
 | 10 | Steering **orta katmanda** yapılır (makale Bölüm 3.2.1) | **İki katmanda**: orta katman (L14) ve varsayılanın uç desile girdiği katman (L19) | Operatörün kararı (2026-08-10). A kriteri bulgusu, varsayılanın uç noktalığının derinliğe bağlı olduğunu gösterdi; orta katman bizde varsayılanın uç noktada *olmadığı* katman. Tek katmanda ölçmek "steering çalışmıyor" ile "yanlış katmanda ölçtük" arasını ayıramazdı. Steering gücü her katmanın kendi ortalama residual normunun oranı olarak verilir (L14=137.0, L19=435.6 — üç kat fark; mutlak ölçek karşılaştırmayı anlamsız kılardı). |
-| 10 | (spec'in kendi ilk varsayımı) Probe reddedilirse rol başına 15 rollout hakeme sor, rol düzeyinde tut/at (**~180 YENİ çağrı**) | `--role-level-fallback`: aynı >=10 kuralı, ama VAR OLAN 2k hakem etiketinden (rol başına ~17), **0 yeni çağrı** | Etiketler probe eğitimi için zaten toplanmış ve ödenmişti (240 gönderim) — response-level bir örneklem daha sormak parayı ikinci kez harcamak olurdu. Fiilen tetiklendi (2026-08-07): probe %63,5 uyumla reddedildi (eşik %85), fallback 55 fully / 38 somewhat / 3 no / 24 atık verdi. Ayrıntı: Aşama 2 altındaki güncelleme kutusu, `.superpowers/sdd/p2-fallback-report.md` |
+| 11 | (spec'in kendi ilk varsayımı) Probe reddedilirse rol başına 15 rollout hakeme sor, rol düzeyinde tut/at (**~180 YENİ çağrı**) | `--role-level-fallback`: aynı >=10 kuralı, ama VAR OLAN 2k hakem etiketinden (rol başına ~17), **0 yeni çağrı** | Etiketler probe eğitimi için zaten toplanmış ve ödenmişti (240 gönderim) — response-level bir örneklem daha sormak parayı ikinci kez harcamak olurdu. Fiilen tetiklendi (2026-08-07): probe %63,5 uyumla reddedildi (eşik %85), fallback 55 fully / 38 somewhat / 3 no / 24 atık verdi. Ayrıntı: Aşama 2 altındaki güncelleme kutusu, `.superpowers/sdd/p2-fallback-report.md` |
+| 12 | (spec'in kendi ilk varsayımı) B kriteri eşiği `delta >= 0.25` | `delta >= 0.25 - B_THRESHOLD_EPS`, `B_THRESHOLD_EPS = 1e-9` | Planın kendi testi kendi koduyla çelişiyordu: float64'te `0.35 - 0.10 == 0.24999999999999997`, yani tam eşikteki bir sonuç düz `>=` ile DÜŞÜYORDU. Pay, aynı paydalı bir çıkarmanın gürültüsünden (~1e-16) 7 mertebe büyük, eşiğin kendisinden 8 mertebe küçük — kriteri gevşetmiyor, kayan nokta artefaktını emiyor. Pay `criterion_b.json`'a `threshold_eps` alanı olarak yazılır; karar artefaktı payını kendi içinde söyler. |
+| 13 | (yeni karar) Steering sweep'te roller **her katman için ayrı** seçilebilirdi | Roller `--layers`'ın İLK katmanında bir kez seçilir ve tüm katmanlarda sabit tutulur | Sapma 10 iki katmanda ölçmeye karar verdi; katman başına ayrı rol seti L14 ile L19'u karşılaştırılamaz kılardı. Seçilen roller `steering_sweep_meta.json` → `roles` alanına yazılır, seçim denetlenebilir kalır. |
+| 14 | (yeni karar) `stage4_steering` bütçesi 210 | 360 | Gerçek plan 2 katman × 7 güç = 14 grup, grup başına 250 öğe, batch 10 → **350 çağrı**; +10 böl-ve-kurtar payı. `GLOBAL_BUDGET` **1500'de bırakıldı** — kullanıcının onayladığı sayı odur ve yükseltilmedi. Aşama tavanları toplamı 1.470 ≤ 1.500. Ölçüm öncesi diskteki harcama 613, koşudan sonra ~963. |
 
 **Aşama 0.5'in sonucu ve bir uyarı.** Kapı %77.8 ile geçti (eşik %75, 45'te 35). Uyuşmazlık rastgele değil:
 10 uyuşmazlığın 9'u aynı yönde (`hakem=2, etiketleyici=3`) ve **engineer / examiner / prophet** rollerinde

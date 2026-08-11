@@ -12,7 +12,7 @@
 
 ```bash
 uv sync --extra dev --extra ml          # aktivasyon hattı
-uv run --extra dev pytest -q            # 466 test, ağa çıkmaz
+uv run --extra dev pytest -q            # 584 test, ağa çıkmaz
 ```
 
 Boru hattı (hedef model `AAX_TARGET_MODEL` ile seçilir):
@@ -23,6 +23,17 @@ AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run --extra ml  python scripts/05_capture_
 AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run --extra ml  python scripts/06_label_and_train_probe.py
 AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run --extra ml  python scripts/07_extract_axis.py
 ```
+
+Aşama 4 — steering (B kriteri). Sweep GPU'da koşar ve **ağa çıkmaz**; değerlendirme
+hakemi çağırır ve `torch` istemez:
+
+```bash
+AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run --extra ml python scripts/08_steering_sweep.py --layers 14 19
+AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run python scripts/09_evaluate_steering.py --dry-run
+AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run python scripts/09_evaluate_steering.py
+```
+
+B kriteri **ölçümden önce** tescillendi: [results/steering_preregistration.json](results/steering_preregistration.json).
 
 Hakem çağrıları `APP_KEY_JAILBREAK` ortam değişkeni ister. Anahtar hiçbir dosyaya yazılmaz.
 

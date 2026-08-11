@@ -3973,7 +3973,7 @@ değerlendirilememesi — hiçbiri "B KRİTERİ DÜŞTÜ" DEĞİLDİR).
 
 Kullanım:
     uv run python scripts/09_evaluate_steering.py --dry-run
-    uv run --extra ml python scripts/09_evaluate_steering.py
+    uv run python scripts/09_evaluate_steering.py
 
 Dayanıklılık (2026-08-10 düzeltmesi; bkz.
 `.superpowers/sdd/p3-task-5-supplement.md`, madde E1): `classify_personas`
@@ -4878,7 +4878,7 @@ değerlendirmek isterseniz `--allow-incomplete` ekleyin; sonuç
 Sonra:
 
 ```bash
-cd ~/assistant-axis && AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run --extra ml python scripts/09_evaluate_steering.py
+cd ~/assistant-axis && AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run python scripts/09_evaluate_steering.py
 ```
 
 Çıktı katman başına oranı ve kararı basar, `results/models/<slug>/steering/`
