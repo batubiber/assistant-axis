@@ -42,6 +42,8 @@ Kriter iki modelde de düştü, ama düşme *biçimleri* farklı ve aradaki fark
 
 Yani **varsayılanın eksende uçta durduğu katman ile o eksenden müdahalenin en iyi çalıştığı katman aynı değil.** Gözlemsel uç-noktalık, müdahale kolu olarak yararlılığın ne gerek ne de yeter şartı. Bunu ancak iki katmanda birden ölçtüğümüz için görebildik.
 
+**Ve etki eksene özgü.** Ayrı bir ön-tescille üç kontrol yönü ölçüldü — aynı büyüklükte rastgele bir yön, eksenin koordinat profilini birebir koruyup yönünü bozan bir yön, ve rol vektörlerinin aynı alt uzayında eksene dik bir yön. Üçünün de artışı **negatif** (−14.8, −3.6, −25.7 puan); hiçbiri 25 puanlık eşiğe yaklaşmadı. Dahası, eksen −0.6'da %94 Assistant-dışı üretirken `nonsensical` yalnızca %4.8; aynı alt uzaydaki dik yön ise %28.9 çöp üretiyor — yani eksen boyunca hareket, komşusuna kıyasla modeli çok daha az bozuyor. (Tek katman, tek güç, tek tohum — sınırları §5.5 ve §8'de.)
+
 ---
 
 ## 2. Soru ve önceden tescil
@@ -263,6 +265,58 @@ Makale bu ikisini 27-70B ölçeğinde aynı katmanda buluyor ve ayırt etmesi i�
 
 `results/models/qwen3-1.7b/steering/criterion_b.json`, `.../rate_by_strength.json`.
 
+### 5.5 Kontrol yönleri — etki eksene mi özgü? (C kriteri)
+
+§5.4 tek başına şunu ayıramaz: *"bu iş bu **yöne** özgü"* mü, yoksa *"bu **büyüklükte** herhangi bir bozulma modeli weird_role'e iter"* mi? Bu, çalışmanın en savunmasız yeriydi ve ayrı bir ön-tescille kapatıldı (`results/control_preregistration.json`, koddan önce).
+
+Üç kontrol yönü, artan zorlukta. Hepsi birim norma normalize edilip **eksenle birebir aynı** büyüklükle (L14'ün kendi residual normu, 136.8) ölçeklendi ve **aynı üretim kod yolundan** geçti:
+
+| yön | ne | neyi kontrol eder |
+|---|---|---|
+| `gaussian` | izotropik rastgele birim vektör | en zayıf bariyer: bu büyüklükte *herhangi* bir bozulma yeter mi? |
+| `shuffled` | eksenin **kendi koordinatlarının** permütasyonu | eksen ağır kuyruklu (max/medyan 31×). Büyüklük profilini aynen korur, yönü yok eder — etki "birkaç dev aktivasyon boyutuna dokunmaktan" mı geliyor? |
+| `rolespan` | rol vektörlerinin **span'inde**, eksene ortogonal | en zor bariyer: aynı alt uzay, farklı yön — etki "persona uzayını itmekten" mi geliyor? |
+
+**C kriteri** (ön-tescilli): hiçbir kontrol yönünün artışı B'nin 25 puanlık eşiğine ulaşmamalı. Taban, Aşama 4'ün 0.0 hücresinden paylaşıldı — `steering_delta` 0.0 gücünde *her* yön için tam olarak sıfır vektör döndürür, yani üretim orada yönden bağımsızdır.
+
+```
+eksen     +48.4 puan   (referans)
+gaussian  -14.8 puan
+shuffled   -3.6 puan
+rolespan  -25.7 puan
+```
+
+**Üçü de negatif.** Hiçbiri eşiğe yaklaşmadı; C kriteri geçti. Etki "bu büyüklükte herhangi bir bozulma" değil, hatta "persona uzayını itmek" bile değil — **spesifik olarak o yön**.
+
+#### Ama düşük oranın sebebi her kontrolde aynı değil
+
+Kategori kırılımı, tek başına orana bakmanın yanıltacağını gösteriyor. L14, güç −0.6:
+
+| | assistant | human_role | nonhuman_role | weird_role | nonsensical | Asst-dışı |
+|---|---:|---:|---:|---:|---:|---:|
+| eksen 0.0 (taban) | 51.2% | 22.4% | 18.4% | 4.8% | 2.4% | 45.6% |
+| **eksen −0.6** | **0.4%** | 7.2% | 6.0% | **80.8%** | **4.8%** | **94.0%** |
+| gaussian −0.6 | 64.8% | 9.6% | 16.8% | 4.4% | 3.6% | 30.8% |
+| shuffled −0.6 | 52.4% | 14.8% | 19.2% | 8.0% | 3.6% | 42.0% |
+| rolespan −0.6 | 44.7% | 13.0% | 4.5% | 2.4% | **28.9%** | 19.9% |
+
+- `gaussian` modeli **tutarlı** bırakıyor ve tabandan daha *asistan* yapıyor (%51.2 → %64.8).
+- `shuffled` tabandan neredeyse ayırt edilemiyor (%52.4 vs %51.2) — yani eksenin ağır kuyruklu koordinat profilini korumak tek başına hiçbir şey açıklamıyor.
+- `rolespan`'ın düşük oranı **asistan kalmasından değil, kısmen çözülmesinden** geliyor: `nonsensical` %28.9 (eksende %4.8) ve 750 üretimin 4'ü tamamen boş geldi.
+
+Bu son satır ekseni ayrıca güçlendiriyor. Eksen −0.6'da **%94 Assistant-dışı üretirken `nonsensical` yalnızca %4.8**; aynı alt uzayda ona dik bir yön ise %28.9 çöp üretiyor.
+
+Buradan çıkarılabilecek şeyin sınırını net çizmek gerek: bu **tek bir noktada** (L14, güç −0.6, `rolespan` için tek tohum) yapılmış bir karşılaştırma, ve tutarlılık/tutarsızlık sınırını §8'de tartışılan tek bir hakem çiziyor. Ölçülen şu: *bu* koşulda eksen, dik komşusunun altı katı daha az çöp üretiyor. "Eksen, modelin dağılmadan hareket edebildiği yöndür" daha genel bir iddia olurdu ve bu veri onu tek başına taşımaz — birden çok tohum ve birden çok güç ister.
+
+Ön-tescilin üç tahmininden birincisinin **başlığı** gerçekleşti: *"eksen yöne özgüyse üç kontrol de 25 puanın belirgin altında kalır."* Ama aynı tahminin iki nicel alt maddesi tutmadı, ve ikisi de aynı sebepten — **kontrollerin işareti beklenmedik çıktı**:
+
+- *"`rolespan` üçün en büyüğü olur"* — büyüklük olarak tuttu (−25.7 en büyük mutlak sapma), ama tahmin edilen zayıf bir **artış**tı; ölçülen bir **düşüş**.
+- *"Oran > 2"* — tutmadı. `criterion_c.json`'daki `ratio_axis_to_control` rolespan için **−1.88**. Zaten bu metrik, kontrol deltalarının pozitif olacağı varsayımıyla yazılmıştı; hepsi negatif çıkınca "kaç kat büyük" sorusu anlamını yitiriyor. Mutlak değerce de 1.88 < 2.
+
+Yani ön-tescil doğru soruyu sordu ama sonucun **yönünü** yanlış tahmin etti. Kriter değiştirilmedi; metriğin anlamını yitirdiği bu satıra yazıldı.
+
+`results/models/qwen3-1.7b/steering/criterion_c.json`.
+
 ---
 
 ## 6. Makaleden sapmalar
@@ -338,6 +392,8 @@ Aynı sınıflar tekrarladı, ama üçü yeni ve hepsi "sessizce yanlış bilim 
 
 **Bir katman çifti bir eğri değildir.** L14 ile L19 arasındaki ayrışma iki noktadan okunuyor. Tüm derinlik boyunca bir steering taraması mekanizmayı çok daha iyi belirlerdi (etki derinlikle mi azalıyor, yoksa L19'a özgü bir şey mi?), ama her katman 1750 üretim daha demek — ~45 dakika GPU başına.
 
+**Kontroller tek tohum, tek katman.** Her kontrol yönü `seed=0` ile bir kez üretildi ve yalnızca L14'te ölçüldü. Üç yönün üçü de negatif çıktığı için sonuç sağlam görünüyor, ama tohum başına tek çekiliş, "bu *özel* rastgele yön şanssızdı" itirazına kapalı değil. Yön başına 3-5 tohum, yön başına 75 çağrı daha isterdi.
+
 **Tek model.** Aşama 4 yalnızca 1.7B'de koşuldu. 0.6B'de A kriteri farklı bir biçimde düşmüştü (varsayılan hiçbir derinlikte uca yaklaşmıyor); orada steering'in de çalışıp çalışmadığı ölçülmedi. Ölçek hikâyesinin nedensel yarısı eksik.
 
 ---
@@ -352,18 +408,23 @@ Aynı sınıflar tekrarladı, ama üçü yeni ve hepsi "sessizce yanlış bilim 
 
 **Çoklu model.** Artifact'ler modele göre kapsamlı (`AAX_TARGET_MODEL` → `data/models/<slug>/`). Gateway aşama alt bütçeleri (aşama, model) başına; global 1500 tavanı tüm anahtarların tek toplamı olarak kalır.
 
-**Bütçe:** 966 / 1500 harcandı.
+**Bütçe:** 1191 / 1500 harcandı.
 
 | Anahtar | Gönderim | Tavan |
 |---|---|---|
 | `stage4_steering:qwen3-1.7b` | 353 | 360 |
+| `stage4_controls:qwen3-1.7b` | 225 | 240 |
 | `stage2_probe_labels` (1.7B, eski çıplak anahtar) | 300 | 300 |
 | `stage2_probe_labels:qwen3-0.6b` | 182 | 300 |
 | `stage0_roles` | 120 | 145 |
 | `stage05_judge_gate` | 9 | 15 |
 | `smoke` | 2 | 10 |
 
-Aşama 4'ün alt bütçesi ölçümden önce 210'dan 360'a çıkarıldı — gerçek plan 14 grup × 25 çağrı = 350'ydi. **Global 1500 tavanına dokunulmadı**; o sayı kullanıcının onayladığı sınır ve projenin hiçbir aşamasında yükseltilmedi. Gerçek harcama 353 oldu (350 plan + böl-ve-kurtar 2 + hatalı anahtarla yanan 1 gönderim), yani 7 pay kaldı.
+Aşama 4'ün alt bütçesi ölçümden önce 210'dan 360'a çıkarıldı — gerçek plan 14 grup × 25 çağrı = 350'ydi. Gerçek harcama 353 oldu (350 plan + böl-ve-kurtar 2 + hatalı anahtarla yanan 1 gönderim), yani 7 pay kaldı.
+
+Kontrol deneyi kendi anahtarını aldı (`stage4_controls`, 240) çünkü `stage4_steering`'de 7 çağrı kalmıştı ve kontrol ayrı bir deneydir; harcaması da ayrı okunabilmeli. Karşılığı **henüz koşulmamış** `stage5_drift`'ten alındı (385 → 145), böylece aşama tavanları toplamı 1.470'te kaldı. Gerçek harcama 225 oldu, sıfır bölünmeyle.
+
+**Global 1500 tavanına projenin hiçbir aşamasında dokunulmadı**; o sayı kullanıcının paylaşımlı bir production endpoint'i için onayladığı sınır. Bir alt bütçe sıkıştığında çözüm hep başka bir aşamadan pay almak oldu, tavanı yükseltmek değil. **Sonuç:** Aşama 5 artık 145 çağrılık bir bütçeyle duruyor ve koşulmadan önce yeniden bütçelenmek zorunda — `config.py`'de Türkçe yorumla ve spec'in Aşama 5 bölümünde açıkça kayıtlı.
 
 ---
 
@@ -384,6 +445,9 @@ results/models/<slug>/axis/assistant_axis.npy                            eksen (
 results/models/<slug>/axis/role_vectors.npy                              rol vektörleri
 results/models/<slug>/steering/criterion_b.json                          B kriteri kararı (katman başına)
 results/models/<slug>/steering/rate_by_strength.json                     doz-yanıt eğrisi (Şekil 4 muadili)
+results/control_preregistration.json                                     kontrol ön-tescili (koddan ve ölçümden önce)
+results/models/<slug>/steering/criterion_c.json                          C kriteri kararı (üç kontrol yönü)
+results/models/<slug>/steering/rate_by_strength_<yön>.json                kontrol doz-yanıt eğrileri
 ```
 
 `data/` commit edilmez (16k rollout metni + 5.3 GB aktivasyon), `results/` edilir.
@@ -392,13 +456,15 @@ results/models/<slug>/steering/rate_by_strength.json                     doz-yan
 
 ## 11. Sırada ne var
 
-Aşama 4 bitti ve iki soru açtı.
+Aşama 4 ve kontrol deneyi bitti. Çalışmanın en savunmasız yeri — "etki eksene mi özgü?" — kapandı (§5.5). Açık kalan sorular:
+
+**0. Kontroller tek tohumla ölçüldü.** Yön başına 3-5 tohum, "bu *özel* rastgele yön şanssızdı" itirazını da kapatırdı. Yön başına 75 çağrı; kalan bütçe (309) üçünü de üç tohuma çıkarmaya yetmez, seçim gerekir.
 
 **1. Ayrışma gerçek mi, iki noktanın gürültüsü mü?** L14 ile L19 arasındaki duyarlılık farkı, tüm derinlik boyunca bir steering taraması ile sınanmalı. Eğer etki derinlikle tekdüze azalıyorsa açıklama basit (steering'in yayılacak katmanı kalmıyor); eğer L14 civarında bir tepe varsa mekanizma daha ilginç. Katman başına 1750 üretim ≈ 45 dakika GPU.
 
-**2. Nedensel yarısı 0.6B'de ne olur?** 0.6B'de varsayılan hiçbir derinlikte uca yaklaşmıyordu. Steering yine de çalışır mı? Eğer çalışırsa, "uçta olmak müdahale için gerekli değil" iddiası ikinci bir ölçekte doğrulanır; çalışmazsa ayrışmanın sınırı bulunur. Bütçe uygun (534 gönderim kaldı, ihtiyaç ~350) ama sweep'in GPU süresi tekrar 1.5 saat.
+**2. Nedensel yarısı 0.6B'de ne olur?** 0.6B'de varsayılan hiçbir derinlikte uca yaklaşmıyordu. Steering yine de çalışır mı? Eğer çalışırsa, "uçta olmak müdahale için gerekli değil" iddiası ikinci bir ölçekte doğrulanır; çalışmazsa ayrışmanın sınırı bulunur. **Bütçe artık yetmiyor:** kalan 309, ihtiyaç ~350. Kontrol deneyi 225 çağrı harcadı ve global tavan 1500 yükseltilmeyecek. Yani bu, ya başka bir aşamadan pay alınarak ya da daha az rolle (ör. 40 rol → 280 çağrı) koşulabilir. Ayrıca sweep'in GPU süresi tekrar 1.5 saat.
 
-**Aşama 5-7 (kapsamda, koşulmadı):** persona drift (C kriteri), aktivasyon capping (Eq. 1), Türkçe transfer testi. Bütçe tablosunda payları duruyor ama üçünün toplamı (640) kalan 534'ü aşıyor — hepsi koşulacaksa yeniden bütçelenmeli.
+**Aşama 5-7 (kapsamda, koşulmadı):** persona drift, aktivasyon capping (Eq. 1), Türkçe transfer testi. Kalan bütçe 309; üçünün tavanları toplamı 400 — hepsi koşulacaksa yeniden bütçelenmeli. (Not: "C kriteri" adı bu çalışmada kontrol yönlerine verildi; persona drift için ayrı bir kriter tescillenecek.)
 
 **Kapatılmamış boşluklar:**
 - Probe'un otomatik geri çekilmesi uygulanmadı; `06` operatöre seçenekleri yazıp duruyor. İki koşuda da elle `--role-level-fallback` seçildi.
