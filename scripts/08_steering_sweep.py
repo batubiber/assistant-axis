@@ -68,6 +68,20 @@ Dayanıklılık düzeltmesi, ikinci tur (Fix Round 2; bkz.
     çağrının `layer_norm`/`direction`'ının O katmanın (ilk katmanın değil)
     değerleri olduğunu, ve üretilen kayıtların `strength` alanının o kaydı
     üreten çağrının gücüyle aynı olduğunu doğruluyor.
+
+Kontrol yönü desteği (Task 2; bkz. `.superpowers/sdd/p4-task-2-brief.md`),
+`results/control_preregistration.json`'daki ön-tescilli kontrol koşusunu
+AYNI script'le koşturmak için: `--direction {axis,gaussian,shuffled,rolespan}`
+(varsayılan `axis` — davranış BİREBİR bugünküyle aynı kalır), `--seed` (yalnızca
+kontrol yönleri için anlamlı), `--variant` (verilirse artefaktlar
+`steering_sweep_<AD>(.jsonl/_meta.json)` olur; verilmezse bugünkü adlar
+DEĞİŞMEDEN kalır) ve `--strengths` (varsayılan `aax.susceptibility.STRENGTHS`
+— kontrol koşusu ön-tescilin 3 gücünü kullanır, 7'sini değil, aksi hâlde
+225 yerine 525 hakem çağrısı gerekirdi). `axis` DIŞINDAKİ bir yön `--variant`
+OLMADAN reddedilir (çıkış 2) — bir kontrol koşusu, committed Aşama 4
+sweep'ini asla sessizce ezmemeli. Kontrol yönü `aax.controls.control_direction`
+ile, model YÜKLENMEDEN ÖNCE (layer_norms hesabıyla aynı disiplinde) kurulur;
+oradan gelen bir `ValueError` de aynı temiz-mesaj + çıkış 2 desenini izler.
 """
 from __future__ import annotations
 
@@ -85,6 +99,7 @@ from time import monotonic
 import numpy as np
 
 from aax import config
+from aax.controls import CONTROL_KINDS, control_direction, direction_fingerprint
 from aax.model import load_hf_model
 from aax.steering import generate_steered, mean_residual_norm
 from aax.susceptibility import (
@@ -179,6 +194,7 @@ def write_json_atomic(path: str | Path, payload: dict) -> None:
 def _meta_payload(
     *,
     layers: list[int],
+    strengths: list[float],
     roles: list[str],
     layer_norms: dict[int, float],
     axis_run_id,
@@ -186,13 +202,22 @@ def _meta_payload(
     attempted: int,
     produced: int,
     complete: bool,
+    direction_kind: str,
+    direction_seed: int | None,
+    direction_sha256: str,
 ) -> dict:
     """Meta gövdesi — üç çağrı yerinde (döngüden önce, her periyodik
     `write_sweep`'in yanında, döngü sonunda) TEKRARLANMASIN diye tek bir
-    yerde üretilir (bkz. Fix Round 2 brief, M2)."""
+    yerde üretilir (bkz. Fix Round 2 brief, M2).
+
+    `strengths` artık sabit `STRENGTHS`'ten değil çağıranın kendi listesinden
+    gelir (Task 2: `--strengths`) — varsayılanı hâlâ `STRENGTHS` ama artık
+    çağıran belirliyor, burası varsaymıyor. `direction_kind`/`direction_seed`/
+    `direction_sha256` de Task 2: hangi yönle koşulduğunu ve (kontrol
+    yönlerinde) hangi tohumla, hangi vektöre çözüldüğünü artefakta yazar."""
     return {
         "layers": layers,
-        "strengths": list(STRENGTHS),
+        "strengths": list(strengths),
         "n_roles": len(roles),
         "roles": roles,
         "questions": list(INTROSPECTIVE_QUESTIONS),
@@ -202,6 +227,9 @@ def _meta_payload(
         "attempted": attempted,
         "produced": produced,
         "complete": complete,
+        "direction_kind": direction_kind,
+        "direction_seed": direction_seed,
+        "direction_sha256": direction_sha256,
     }
 
 
@@ -239,7 +267,35 @@ def _run(argv: list[str] | None = None) -> int:
                         help="duman testi: yalnızca ilk N rol")
     parser.add_argument("--max-new-tokens", type=int, default=120,
                         help="yanıt başına üretilecek azami token")
+    parser.add_argument("--direction", choices=("axis", *CONTROL_KINDS), default="axis",
+                        help="steering yönü: axis (Assistant Axis, varsayılan) ya da "
+                             "bir kontrol yönü (gaussian/shuffled/rolespan)")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="kontrol yönü RNG tohumu — yalnızca --direction "
+                             "axis DIŞINDAYKEN anlamlı")
+    parser.add_argument("--variant", type=str, default=None,
+                        help="verilirse artefaktlar steering_sweep_<AD>.jsonl / "
+                             "steering_sweep_<AD>_meta.json olarak yazılır; "
+                             "verilmezse bugünkü adlar DEĞİŞMEDEN kalır")
+    parser.add_argument("--strengths", type=float, nargs="+", default=list(STRENGTHS),
+                        help="steering güç ızgarası (varsayılan: "
+                             "aax.susceptibility.STRENGTHS)")
     args = parser.parse_args(argv)
+
+    # `axis` DIŞINDAKİ bir yön `--variant` OLMADAN reddedilir — bir kontrol
+    # koşusu committed Aşama 4 sweep'ini (`steering_sweep.jsonl`) asla
+    # sessizce ezmemeli. Bu kontrol hiçbir Stage 3 artifact'i OKUMADAN,
+    # hiçbir dosyaya DOKUNMADAN önce çalışır: en ucuz, en erken kapı.
+    if args.direction != "axis" and not args.variant:
+        print(
+            "BAŞARISIZ: --direction axis dışında bir değer verildi ama "
+            "--variant eksik — bir kontrol koşusu mevcut Aşama 4 sweep'ini "
+            "asla sessizce ezmemeli.\n"
+            "  --variant <ad> ekleyin (ör. --variant gaussian_seed0) ya da "
+            "--direction axis kullanın.",
+            file=sys.stderr,
+        )
+        return 2
 
     D = config.model_data_dir()
     R = config.model_results_dir() / "axis"
@@ -346,7 +402,7 @@ def _run(argv: list[str] | None = None) -> int:
     # `ValueError` de traceback + çıkış 1 veriyordu.
     try:
         total = planned_generation_count(
-            n_layers=len(args.layers), n_strengths=len(STRENGTHS),
+            n_layers=len(args.layers), n_strengths=len(args.strengths),
             n_roles=len(role_keys), n_questions=len(INTROSPECTIVE_QUESTIONS),
         )
     except ValueError as exc:
@@ -358,17 +414,57 @@ def _run(argv: list[str] | None = None) -> int:
         )
         return 2
     print(f"{total} üretim planlandı "
-          f"({len(args.layers)} katman × {len(STRENGTHS)} güç × "
+          f"({len(args.layers)} katman × {len(args.strengths)} güç × "
           f"{len(role_keys)} rol × {len(INTROSPECTIVE_QUESTIONS)} soru)")
     for L, n in layer_norms.items():
         print(f"  L{L} ortalama residual normu: {n:.1f}")
+
+    # Yön kurulumu (Task 2) model YÜKLENMEDEN ÖNCE olur — layer_norms
+    # hesabıyla AYNI disiplin: `control_direction`'ın attığı bir `ValueError`
+    # GPU'ya bir model yüklemeden önce yakalanmalı. `axis` koşusunda
+    # `directions[L]` bugünküyle BİREBİR aynı (`axis[L]`) — davranış değişmez.
+    try:
+        if args.direction == "axis":
+            directions = {L: axis[L] for L in args.layers}
+        else:
+            # `role_vectors_layer` TÜM rol vektörleri (`vectors`), yalnızca
+            # seçili `role_keys` DEĞİL — ön-tescil bunu tüm rol span'i
+            # (rank 92) üzerinden tanımlıyor, `select_assistant_end_roles`'ın
+            # daha sonra bu span'den seçtiği alt kümeden değil.
+            directions = {
+                L: control_direction(
+                    args.direction,
+                    axis_layer=axis[L],
+                    role_vectors_layer=vectors[:, L, :],
+                    seed=args.seed,
+                )
+                for L in args.layers
+            }
+    except ValueError as exc:
+        print(
+            f"BAŞARISIZ: kontrol yönü kurulamadı.\n  {exc}\n"
+            "  Model YÜKLENMEDİ.",
+            file=sys.stderr,
+        )
+        return 2
+    direction_seed = None if args.direction == "axis" else args.seed
+    # Birden fazla katman verilirse (ör. --layers 14 19) her katmanın kendi
+    # yönü var; tek bir parmak izi için katman sırasına göre istiflenir —
+    # aynı tohum + aynı katman kümesi HER ZAMAN aynı sha üretir.
+    direction_sha256 = direction_fingerprint(
+        np.stack([directions[L] for L in args.layers])
+    )
 
     bundle = load_hf_model()
     records: list[dict] = []
     started = monotonic()
     done = 0
-    out = D / "steering_sweep.jsonl"
-    meta_path = D / "steering_sweep_meta.json"
+    # `--variant` verilmezse `suffix` boş string olur ve adlar bugünküyle
+    # BİREBİR aynı kalır (`steering_sweep.jsonl` / `steering_sweep_meta.json`)
+    # — committed Aşama 4 artefaktları hiçbir koşulda değişmez.
+    suffix = f"_{args.variant}" if args.variant else ""
+    out = D / f"steering_sweep{suffix}.jsonl"
+    meta_path = D / f"steering_sweep{suffix}_meta.json"
     # M3: hedef `.jsonl` önceki bir koşudan kalma ve boş değilse, ilk
     # yazımdan önce kenara kopyala — aksi hâlde biraz aşağıdaki ilk periyodik
     # (ya da döngü hiç girmezse döngü sonrası) `write_sweep` onu SESSİZCE
@@ -379,9 +475,11 @@ def _run(argv: list[str] | None = None) -> int:
     # yazıldığı için bir SIGKILL/elektrik kesintisi taze bir kısmi `.jsonl`'in
     # yanına ÖNCEKİ koşunun (farklı katman/rol/güç) meta'sını bırakabilirdi.
     write_json_atomic(meta_path, _meta_payload(
-        layers=args.layers, roles=role_keys, layer_norms=layer_norms,
-        axis_run_id=index.get("run_id"), planned=total,
+        layers=args.layers, strengths=args.strengths, roles=role_keys,
+        layer_norms=layer_norms, axis_run_id=index.get("run_id"), planned=total,
         attempted=0, produced=0, complete=False,
+        direction_kind=args.direction, direction_seed=direction_seed,
+        direction_sha256=direction_sha256,
     ))
     # Yalnızca üretim çağrısı sırasında fırlayan beklenmeyen bir `Exception`
     # (CUDA OOM, geçici cihaz hatası — ikisi de `RuntimeError` alt sınıfı)
@@ -391,9 +489,9 @@ def _run(argv: list[str] | None = None) -> int:
     crashed: Exception | None = None
     try:
         for layer, strength, role, question in itertools.product(
-            args.layers, STRENGTHS, role_keys, INTROSPECTIVE_QUESTIONS
+            args.layers, args.strengths, role_keys, INTROSPECTIVE_QUESTIONS
         ):
-            direction = axis[layer]
+            direction = directions[layer]
             # Her katalog rolü üç sistem promptu varyantı taşır; sweep
             # boyunca sabit ilkini kullanmak koşuyu deterministik tutar
             # (varyant başına 3× daha fazla üretim yerine).
@@ -436,9 +534,11 @@ def _run(argv: list[str] | None = None) -> int:
                 # tazele (`complete: false` ile) — pencereyi (jsonl güncel,
                 # meta bayat) döngünün tamamı yerine milisaniyelere indirir.
                 write_json_atomic(meta_path, _meta_payload(
-                    layers=args.layers, roles=role_keys, layer_norms=layer_norms,
-                    axis_run_id=index.get("run_id"), planned=total,
-                    attempted=done, produced=len(records), complete=False,
+                    layers=args.layers, strengths=args.strengths, roles=role_keys,
+                    layer_norms=layer_norms, axis_run_id=index.get("run_id"),
+                    planned=total, attempted=done, produced=len(records),
+                    complete=False, direction_kind=args.direction,
+                    direction_seed=direction_seed, direction_sha256=direction_sha256,
                 ))
                 el = monotonic() - started
                 eta = el / done * (total - done)
@@ -460,9 +560,11 @@ def _run(argv: list[str] | None = None) -> int:
     # kesilmemiş ama birkaç boş yanıt üretmiş tam bir koşu artık
     # `complete: false` görünmez.
     write_json_atomic(meta_path, _meta_payload(
-        layers=args.layers, roles=role_keys, layer_norms=layer_norms,
-        axis_run_id=index.get("run_id"), planned=total,
+        layers=args.layers, strengths=args.strengths, roles=role_keys,
+        layer_norms=layer_norms, axis_run_id=index.get("run_id"), planned=total,
         attempted=done, produced=len(records), complete=done == total,
+        direction_kind=args.direction, direction_seed=direction_seed,
+        direction_sha256=direction_sha256,
     ))
 
     print(f"Yazıldı: {out} ({len(records)}/{total} kayıt)")
