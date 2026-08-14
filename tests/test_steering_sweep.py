@@ -796,3 +796,275 @@ def test_role_field_in_record_matches_system_prompt_used(tmp_path, monkeypatch):
         system_prompt = call["messages"][0]["content"]
         expected_role = system_prompt.replace("You are a ", "").replace(".", "")
         assert record["role"] == expected_role
+
+
+# --- Task 2: --direction / --seed / --variant --------------------------------
+#
+# `.superpowers/sdd/p4-task-2-brief.md`: aynı script'i
+# `results/control_preregistration.json`'daki kontrol koşusu için de
+# kullanabilmek. En üstteki kısıt: `axis` koşusunun davranışı (artefakt
+# adları, meta içeriği — üç yeni alan hariç, üretim yolu, çıkış kodları)
+# hiçbir koşulda değişmemeli; yukarıdaki 35 test bunu zaten sabitliyor.
+
+
+def test_variant_writes_suffixed_names_and_leaves_default_names_untouched(
+    tmp_path, monkeypatch
+):
+    """`--variant ctrl` verilince artefaktlar `steering_sweep_ctrl.jsonl` /
+    `steering_sweep_ctrl_meta.json` olarak yazılmalı; bugünkü
+    `steering_sweep.jsonl` / `steering_sweep_meta.json` adları hiç
+    dokunulmadan kalmalı (var olsalar bile)."""
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    monkeypatch.setattr(ss, "generate_steered", _new_recording_fake())
+
+    # Committed Aşama 4 sweep'ini taklit eden var olan dosyalar — variant
+    # koşusu bunlara HİÇ dokunmamalı.
+    default_out = model_data / "steering_sweep.jsonl"
+    default_meta = model_data / "steering_sweep_meta.json"
+    default_out.write_text('{"ONCEKI": true}\n', encoding="utf-8")
+    default_meta.write_text('{"ONCEKI": true}', encoding="utf-8")
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3", "--variant", "ctrl"])
+
+    assert exit_code == 0
+    variant_out = model_data / "steering_sweep_ctrl.jsonl"
+    variant_meta = model_data / "steering_sweep_ctrl_meta.json"
+    assert variant_out.exists()
+    assert variant_meta.exists()
+    # Bugünkü adlar BİREBİR aynı içerikle kalmış olmalı — hiç yazılmamış.
+    assert default_out.read_text(encoding="utf-8") == '{"ONCEKI": true}\n'
+    assert default_meta.read_text(encoding="utf-8") == '{"ONCEKI": true}'
+    # Ve variant'ın kendi `.prev` arşivi de olmamalı (var olan bir şeyin
+    # üzerine yazmadı, o yüzden arşivlenecek bir şey yoktu).
+    assert not (model_data / "steering_sweep_ctrl.jsonl.prev").exists()
+
+
+def test_control_direction_without_variant_exits_2_and_writes_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """`--direction gaussian` `--variant` OLMADAN verilirse çıkış 2 dönmeli
+    ve hiçbir artefakt (Stage 3 artifact'leri bile OKUNMADAN) yazılmamalı —
+    bir kontrol koşusu committed Aşama 4 sweep'ini asla ezmemeli."""
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _refuse_to_load_model)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3", "--direction", "gaussian"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "--variant" in err
+    assert "Traceback" not in err
+    assert not (model_data / "steering_sweep.jsonl").exists()
+    assert not (model_data / "steering_sweep_meta.json").exists()
+
+
+def test_meta_gains_three_direction_fields_axis_run_has_null_seed(
+    tmp_path, monkeypatch
+):
+    """Her koşuda meta'ya üç alan eklenir: `direction_kind`, `direction_seed`,
+    `direction_sha256`. `axis` koşusunda `direction_kind == "axis"` ve
+    `direction_seed` her zaman `null` (--seed verilse bile — tohum yalnızca
+    kontrol yönleri için anlamlı)."""
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    monkeypatch.setattr(ss, "generate_steered", _new_recording_fake())
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3", "--seed", "7"])
+
+    assert exit_code == 0
+    meta = json.loads((model_data / "steering_sweep_meta.json").read_text(encoding="utf-8"))
+    assert meta["direction_kind"] == "axis"
+    assert meta["direction_seed"] is None
+    assert isinstance(meta["direction_sha256"], str) and len(meta["direction_sha256"]) == 16
+
+    axis = np.load(ss.config.model_results_dir() / "axis" / "assistant_axis.npy")
+    expected_sha = ss.direction_fingerprint(np.stack([axis[14]]))
+    assert meta["direction_sha256"] == expected_sha
+
+
+def test_control_direction_seed_recorded_and_matches_control_direction(
+    tmp_path, monkeypatch
+):
+    """Kontrol koşusunda `direction_kind`/`direction_seed` verilen değerleri
+    taşımalı ve `direction_sha256`, `aax.controls.control_direction` ile
+    (TÜM rol vektörleriyle — yalnızca seçili roller değil) bağımsızca
+    hesaplanan yönün parmak iziyle eşleşmeli."""
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    monkeypatch.setattr(ss, "generate_steered", _new_recording_fake())
+
+    exit_code = ss.main([
+        "--layers", "14", "--n-roles", "5",
+        "--direction", "gaussian", "--seed", "3", "--variant", "ctrl",
+    ])
+
+    assert exit_code == 0
+    model_data = ss.config.model_data_dir()
+    meta = json.loads(
+        (model_data / "steering_sweep_ctrl_meta.json").read_text(encoding="utf-8")
+    )
+    assert meta["direction_kind"] == "gaussian"
+    assert meta["direction_seed"] == 3
+
+    axis = np.load(ss.config.model_results_dir() / "axis" / "assistant_axis.npy")
+    vectors = np.load(ss.config.model_results_dir() / "axis" / "role_vectors.npy")
+    expected_direction = ss.control_direction(
+        "gaussian", axis_layer=axis[14], role_vectors_layer=vectors[:, 14, :], seed=3,
+    )
+    expected_sha = ss.direction_fingerprint(np.stack([expected_direction]))
+    assert meta["direction_sha256"] == expected_sha
+
+
+def test_same_seed_gives_same_sha_different_seed_gives_different_sha(
+    tmp_path, monkeypatch
+):
+    """Aynı tohum aynı `direction_sha256`'yı vermeli; farklı tohum farklı
+    (yeniden üretilebilirlik ön kayıtta zorunlu — bkz. control_preregistration.json)."""
+    def _run_with_seed(seed, variant):
+        _write_fixture(tmp_path / variant, monkeypatch, n_role_vectors=5)
+        monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+        monkeypatch.setattr(ss, "generate_steered", _new_recording_fake())
+        exit_code = ss.main([
+            "--layers", "14", "--n-roles", "5",
+            "--direction", "gaussian", "--seed", str(seed), "--variant", variant,
+        ])
+        assert exit_code == 0
+        model_data = ss.config.model_data_dir()
+        meta = json.loads(
+            (model_data / f"steering_sweep_{variant}_meta.json").read_text(encoding="utf-8")
+        )
+        return meta["direction_sha256"]
+
+    sha_seed0 = _run_with_seed(0, "a")
+    sha_seed0_again = _run_with_seed(0, "b")
+    sha_seed1 = _run_with_seed(1, "c")
+
+    assert sha_seed0 == sha_seed0_again
+    assert sha_seed0 != sha_seed1
+
+
+def test_control_direction_reaches_generator_and_differs_from_axis(
+    tmp_path, monkeypatch
+):
+    """Kontrol yönünün `generate_steered`'a FİİLEN ulaştığını sabitler —
+    önceki turda bir mutasyon steering'i devre dışı bırakıp tüm testlerden
+    geçmişti (bkz. modül docstring'i, Fix Round 2, M4+M5). Kaydeden sahteyle
+    `direction` argümanını yakalayıp hem beklenen kontrol yönüyle eşit hem de
+    eksenden FARKLI olduğunu doğrular."""
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    exit_code = ss.main([
+        "--layers", "14", "--n-roles", "5",
+        "--direction", "shuffled", "--seed", "0", "--variant", "ctrl",
+    ])
+    assert exit_code == 0
+    assert len(gen.calls) > 0
+
+    axis = np.load(ss.config.model_results_dir() / "axis" / "assistant_axis.npy")
+    vectors = np.load(ss.config.model_results_dir() / "axis" / "role_vectors.npy")
+    expected_direction = ss.control_direction(
+        "shuffled", axis_layer=axis[14], role_vectors_layer=vectors[:, 14, :], seed=0,
+    )
+
+    for call in gen.calls:
+        np.testing.assert_allclose(call["direction"], expected_direction)
+        # Kontrol yönü eksenden GERÇEKTEN farklı olmalı — aksi hâlde bu test
+        # steering'in devre dışı kaldığı bir mutasyonu yakalayamaz.
+        assert not np.allclose(call["direction"], axis[14])
+
+
+def test_default_run_still_writes_axis_direction_and_default_names(
+    tmp_path, monkeypatch
+):
+    """Sağlama: `--direction`/`--variant` hiç verilmeyince (bugünkü tek
+    kullanım biçimi) `direction` çağrıya eksenin KENDİSİ olarak ulaşır ve
+    artefaktlar bugünkü adlarla yazılır — üstteki 35 test bunu zaten
+    kapsıyor, burası yalnızca yeni `directions` sözlüğünün axis-kolunu
+    (`directions[layer] = axis[layer]`) doğrudan hedefler."""
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "5"])
+
+    assert exit_code == 0
+    axis = np.load(ss.config.model_results_dir() / "axis" / "assistant_axis.npy")
+    for call in gen.calls:
+        np.testing.assert_allclose(call["direction"], axis[14])
+    assert (model_data / "steering_sweep.jsonl").exists()
+    assert (model_data / "steering_sweep_meta.json").exists()
+
+
+def test_strengths_default_is_the_susceptibility_strengths_grid(tmp_path, monkeypatch):
+    """`--strengths` verilmezse varsayılan `aax.susceptibility.STRENGTHS`
+    olmalı — hem üretici fonksiyona ulaşan güç kümesinde hem de meta'da."""
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    exit_code = ss.main(["--layers", "14", "--n-roles", "3"])
+
+    assert exit_code == 0
+    assert {c["strength"] for c in gen.calls} == set(ss.STRENGTHS)
+    meta = json.loads((model_data / "steering_sweep_meta.json").read_text(encoding="utf-8"))
+    assert meta["strengths"] == list(ss.STRENGTHS)
+
+
+def test_strengths_flag_is_honored_by_generator_and_meta(tmp_path, monkeypatch):
+    """`--strengths` verilince üretici fonksiyona ulaşan güç kümesi TAM
+    olarak verilen kümeye eşit olmalı — ön-tescilin 3 gücü (-0.6 -0.4 -0.2),
+    varsayılanın 7'si değil. Aksi hâlde kontrol koşusu 225 yerine 525 hakem
+    çağrısına mal olurdu (bkz. control_preregistration.json)."""
+    model_data = _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    exit_code = ss.main([
+        "--layers", "14", "--n-roles", "3",
+        "--strengths", "-0.6", "-0.4", "-0.2",
+    ])
+
+    assert exit_code == 0
+    assert {c["strength"] for c in gen.calls} == {-0.6, -0.4, -0.2}
+    meta = json.loads((model_data / "steering_sweep_meta.json").read_text(encoding="utf-8"))
+    assert meta["strengths"] == [-0.6, -0.4, -0.2]
+    total = 1 * 3 * 3 * len(ss.INTROSPECTIVE_QUESTIONS)
+    records = ss.read_sweep(model_data / "steering_sweep.jsonl")
+    assert len(records) == total
+
+
+def test_invalid_strengths_value_fails_cleanly(tmp_path, monkeypatch, capsys):
+    """Sayısal olmayan bir `--strengths` değeri ('abc') temiz bir başarısızlıkla
+    (çıkış 2, çıplak Python traceback YOK) sonuçlanmalı — argparse'ın kendi
+    `type=float` doğrulaması bunu üretim döngüsüne hiç girmeden yakalar."""
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _refuse_to_load_model)
+
+    with pytest.raises(SystemExit) as exc_info:
+        ss.main(["--layers", "14", "--n-roles", "3", "--strengths", "abc"])
+
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+
+
+def test_invalid_direction_choice_fails_cleanly(tmp_path, monkeypatch, capsys):
+    """Bilinmeyen bir `--direction` değeri de aynı şekilde temiz başarısız
+    olmalı (argparse `choices` doğrulaması, çıkış 2)."""
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=3)
+    monkeypatch.setattr(ss, "load_hf_model", _refuse_to_load_model)
+
+    with pytest.raises(SystemExit) as exc_info:
+        ss.main(["--layers", "14", "--n-roles", "3", "--direction", "bogus"])
+
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
