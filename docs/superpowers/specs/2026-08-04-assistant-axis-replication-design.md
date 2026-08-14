@@ -403,9 +403,11 @@ Hakem etiketleri makalenin Ek D.1.3 şemasıyla birebir: `assistant`, `human_rol
 
 Çıktı: makalenin Şekil 4'ünün muadili.
 
-### Aşama 5 — Persona drift · ~320 çağrı
+### Aşama 5 — Persona drift · 145 çağrı (orijinal: ~320)
 
-4 alan (coding, writing, therapy, philosophy) × 8 konuşma × 10 tur.
+**⚠️ Bütçe düzeltildi (2026-08-10):** Bu bölüm orijinal olarak 4 alan × 8 konuşma × 10 tur = 320 çağrılı bir protokol tanımlıyordu. Ancak Aşama 4 kontrol deneyi (`stage4_controls`) bu kaynakları talep eder; bütçe mühendisliği nedeniyle Aşama 5 bütçesi 145'e indirilmiştir. **Yazılı protokol artık bütçeye sığmaz — Aşama 5, 145 çağrı içinde yeniden kapsamlandırılmalı veya baştan tasarlanmalıdır.** Aşağıdaki açıklama 320-çağrı orijinal tasarımıdır; uygulama başlamadan bütçe-kapsam uyumu ele alınmalı.
+
+4 alan (coding, writing, therapy, philosophy) × 8 konuşma × 10 tur *(sığmıyor; baştan tasarla)*.
 `hakem-llm` kullanıcıyı canlandırır; makalenin **Ek E.2'deki auditor sistem promptu birebir** kullanılır
 (2 cümle sınırı, asistan gibi davranma, vb.). Hedef modele sistem promptu verilmez — makaledeki gibi.
 
@@ -417,7 +419,7 @@ zayıf. Terapi/felsefe senaryolarının duygusal baskısı yeterince güçlü ku
 Bu, sonucu yorumlarken açıkça belirtilir; tek auditor kullandığımız için makalenin
 "üç auditor ile confound azaltma" adımı bizde **yok**.
 
-Çıktı: makalenin Şekil 7'sinin muadili.
+Çıktı: makalenin Şekil 7'sinin muadili (bütçe ve kapsam uyumlandıktan sonra).
 
 ### Aşama 6 — Activation capping · ~150 çağrı · en uzun aşama
 
