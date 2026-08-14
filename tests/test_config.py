@@ -47,7 +47,8 @@ def test_stage_budget_table_matches_spec_bolum_6():
         # 175 tek katmanlık bir sweep'in kalıntısıydı; STAGE_BUDGETS zaten
         # 360'a yükseltilmişti (E4) ama bu sözlük senkronsuz kalmıştı.
         "stage4_steering": 350,
-        "stage5_drift": 320,
+        "stage4_controls": 225,
+        "stage5_drift": 120,
         "stage6_capping": 150,
         "stage7_turkish": 60,
     }
@@ -60,11 +61,12 @@ def test_stage_budget_table_matches_spec_bolum_6():
         # 210 tek katmanlık bir sweep içindi; gerçek plan iki katman için
         # 350 çağrı + 10 böl-ve-kurtar payı = 360 (bkz. config.py'deki yorum).
         "stage4_steering": 360,
-        "stage5_drift": 385,
+        "stage4_controls": 240,
+        "stage5_drift": 145,
         "stage6_capping": 180,
         "stage7_turkish": 75,
     }
-    assert sum(config.STAGE_LOGICAL_CALLS.values()) == 1257
+    assert sum(config.STAGE_LOGICAL_CALLS.values()) == 1282
     assert sum(config.STAGE_BUDGETS.values()) == 1470
 
 
@@ -77,6 +79,7 @@ def test_model_dependent_stages_matches_spec_bolum_6():
         "stage05_judge_gate",
         "stage2_probe_labels",
         "stage4_steering",
+        "stage4_controls",
         "stage5_drift",
         "stage6_capping",
         "stage7_turkish",
