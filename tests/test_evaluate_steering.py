@@ -1108,3 +1108,285 @@ def test_atomic_write_failure_leaves_existing_labels_file_untouched(tmp_path, mo
 
     assert path.read_text(encoding="utf-8") == "ONCEKI-ICERIK"
     assert [p.name for p in tmp_path.iterdir()] == ["steering_labels.json"]
+
+
+# --- Task 3 (`.superpowers/sdd/p4-task-3-brief.md`): `--variant` -----------
+#
+# Kontrol sweep'lerini AYNI script'le değerlendirebilmek için: `--variant AD`
+# verilirse `steering_sweep_<AD>.jsonl` / `..._meta.json` okunur,
+# `steering_labels_<AD>.json` ve `rate_by_strength_<AD>.json` yazılır. Kontrol
+# sweep'lerinde 0.0 gücü YOK (taban Aşama 4'ün eksen koşusundan PAYLAŞILIYOR,
+# bkz. `results/control_preregistration.json`) — bu yüzden B kriteri BURADA
+# değerlendirilmez, yalnızca C. Harcama `stage4_steering` (7 çağrısı kalan)
+# DEĞİL, `stage4_controls`'un (240'lık, hiç harcanmamış) bütçesinden düşer.
+# `--variant` verilmezse bugünkü davranış (artefakt adları, STAGE, B kriteri)
+# BİREBİR aynı kalmalı — üstteki 38 test bunu zaten sabitliyor; buradaki
+# testler yalnızca EKLENEN davranışı hedefler.
+
+
+class StageRecordingClient:
+    """Hem `remaining_budget` hem `.chat()`'e ULAŞAN `stage` değerini kaydeden
+    sahte istemci — `--variant` verildiğinde harcamanın GERÇEKTEN
+    `stage4_controls`'a gittiğini (`stage4_steering`'e DEĞİL) doğrulamak
+    için. Var olan paylaşımlı `FakeClient`'a HİÇ dokunulmadı — üstteki 38
+    testin hiçbiri bu sınıfı bilmiyor."""
+
+    def __init__(self, *, default_label: str = "assistant") -> None:
+        self.default_label = default_label
+        self.calls = 0
+        self.sends_made = 0
+        self.budget_stages_seen: list[str] = []
+        self.chat_stages_seen: list[str] = []
+
+    def remaining_budget(self, stage):
+        self.budget_stages_seen.append(stage)
+        return 10_000, 10_000
+
+    def chat(self, messages, *, stage, temperature=0.0, max_tokens=1024):
+        self.calls += 1
+        self.sends_made += 1
+        self.chat_stages_seen.append(stage)
+        content = messages[0]["content"]
+        n_items = content.count("[ITEM ")
+        return json.dumps([self.default_label] * n_items)
+
+
+def test_variant_uses_stage4_controls_not_stage4_steering(tmp_path, monkeypatch):
+    """Bütçe/gönderim ANAHTARI (`STAGE`), `--variant` verildiğinde
+    `stage4_controls` olmalı — `stage4_steering` DEĞİL. `08_steering_sweep.py`
+    üç kontrol yönünü de AYNI (paylaşılan) `stage4_controls` bütçesinden
+    harcıyor; `stage4_steering`'in yalnızca 7 çağrısı kalmıştı, yanlış
+    anahtara yazan bir kontrol koşusu ilk çağrıda BAŞARISIZ olurdu."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [-0.6, -0.4, -0.2], n_roles=2, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep_gaussian.jsonl", records)
+    _write_meta(
+        data_dir / "steering_sweep_gaussian_meta.json",
+        planned=6, attempted=6, complete=True,
+    )
+    client = StageRecordingClient()
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main(["--variant", "gaussian"])
+
+    assert exit_code == 0
+    assert client.budget_stages_seen, "remaining_budget hiç çağrılmamış"
+    assert all(s == "stage4_controls" for s in client.budget_stages_seen)
+    assert client.chat_stages_seen, "chat hiç çağrılmamış"
+    assert all(s == "stage4_controls" for s in client.chat_stages_seen)
+    assert "stage4_steering" not in client.budget_stages_seen
+    assert "stage4_steering" not in client.chat_stages_seen
+
+
+def test_default_run_still_uses_stage4_steering(tmp_path, monkeypatch):
+    """Sağlama: `--variant` verilmeyince (bugünkü tek kullanım biçimi) STAGE
+    hâlâ `stage4_steering` — yeni `stage4_controls` dalı varsayılan koşuya
+    hiç sızmamalı."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=2, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=4, attempted=4, complete=True)
+    client = StageRecordingClient()
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main([])
+
+    assert exit_code in (0, 1)
+    assert client.budget_stages_seen == ["stage4_steering"]
+    assert client.chat_stages_seen and all(
+        s == "stage4_steering" for s in client.chat_stages_seen
+    )
+
+
+def test_variant_writes_labels_and_rate_by_strength_only_no_criterion_b(
+    tmp_path, monkeypatch
+):
+    """`--variant` verildiğinde yalnızca `steering_labels_<AD>.json` ve
+    `rate_by_strength_<AD>.json` yazılmalı — `criterion_b_<AD>.json` HİÇ
+    yazılmamalı (B kriteri bu modda değerlendirilmiyor), ve varsayılan
+    (eksen) adlarına da hiç dokunulmamalı."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [-0.6, -0.4, -0.2], n_roles=3, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep_shuffled.jsonl", records)
+    _write_meta(
+        data_dir / "steering_sweep_shuffled_meta.json",
+        planned=9, attempted=9, complete=True,
+    )
+    client = FakeClient(
+        label_rule=lambda block: "human_role" if "s-0.6" in block else "assistant"
+    )
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main(["--variant", "shuffled"])
+
+    assert exit_code == 0
+    assert (data_dir / "steering_labels_shuffled.json").exists()
+    steering_dir = results_dir / "steering"
+    rate_payload = json.loads(
+        (steering_dir / "rate_by_strength_shuffled.json").read_text(encoding="utf-8")
+    )
+    assert rate_payload["14"]["-0.6"] == pytest.approx(1.0)
+    assert rate_payload["14"]["-0.4"] == pytest.approx(0.0)
+    assert not (steering_dir / "criterion_b_shuffled.json").exists()
+    assert not (steering_dir / "criterion_b.json").exists()
+    assert not (data_dir / "steering_labels.json").exists()
+    assert not (steering_dir / "rate_by_strength.json").exists()
+
+
+def test_variant_does_not_evaluate_criterion_b_even_though_zero_strength_missing(
+    tmp_path, monkeypatch
+):
+    """Kontrol sweep'lerinde 0.0 gücü HİÇ yok — sarmasız `evaluate_all_layers`
+    çağrılsaydı bu bir `ValueError` (ve dolayısıyla `main()`'in dış
+    sarmalayıcısında çıkış 2) verirdi. `--variant` verildiğinde bu hiç
+    ÇAĞRILMAMALI — koşu 0.0'sız veriyle bile temiz bir şekilde 0 dönmeli."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [-0.6, -0.4, -0.2], n_roles=2, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep_rolespan.jsonl", records)
+    _write_meta(
+        data_dir / "steering_sweep_rolespan_meta.json",
+        planned=6, attempted=6, complete=True,
+    )
+    client = FakeClient(default_label="assistant")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main(["--variant", "rolespan"])
+
+    assert exit_code == 0
+
+
+def test_variant_zero_record_sweep_returns_two_without_overwriting(
+    tmp_path, monkeypatch, capsys
+):
+    """F5 ile AYNI ilke, kontrol koluna taşınmış: karar üretemeyen bir koşu
+    (sıfır kayıtlı sweep) var olan GERÇEK bir `rate_by_strength_<AD>.json`'ı
+    EZMEMELİ."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    sweep_path = data_dir / "steering_sweep_gaussian.jsonl"
+    sweep_path.parent.mkdir(parents=True, exist_ok=True)
+    sweep_path.write_text("", encoding="utf-8")
+    _write_meta(
+        data_dir / "steering_sweep_gaussian_meta.json",
+        planned=0, attempted=0, complete=True,
+    )
+    steering_dir = results_dir / "steering"
+    steering_dir.mkdir(parents=True, exist_ok=True)
+    previous_payload = {"14": {"-0.6": 0.5}}
+    (steering_dir / "rate_by_strength_gaussian.json").write_text(
+        json.dumps(previous_payload), encoding="utf-8"
+    )
+    client = FakeClient()
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main(["--variant", "gaussian"])
+
+    assert exit_code == 2
+    after_payload = json.loads(
+        (steering_dir / "rate_by_strength_gaussian.json").read_text(encoding="utf-8")
+    )
+    assert after_payload == previous_payload, "boş sweep önceki GERÇEK oranları EZMEMELİ"
+    assert client.calls == 0
+
+
+def test_variant_missing_sweep_file_exits_two(tmp_path, monkeypatch, capsys):
+    """`steering_sweep_<AD>.jsonl` yoksa (var olan varsayılan
+    `steering_sweep.jsonl` olsa bile) çıkış 2 — YANLIŞ dosyaya sessizce
+    düşülmemeli."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [0.0, -0.6], n_roles=1, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep.jsonl", records)  # yalnızca varsayılan var
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=2, attempted=2, complete=True)
+    client = FakeClient()
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main(["--variant", "gaussian"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "steering_sweep_gaussian.jsonl" in err
+    assert client.calls == 0
+
+
+def test_variant_and_default_runs_coexist_without_clobbering_each_other(
+    tmp_path, monkeypatch
+):
+    """Aynı model dizininde önce varsayılan koşu, sonra bir kontrol koşusu
+    çalıştırılırsa ikisi de kendi adlarını yazar — biri diğerini SİLMEZ/
+    EZMEZ."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    axis_records = _make_records(14, [0.0, -0.6], n_roles=2, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep.jsonl", axis_records)
+    _write_meta(data_dir / "steering_sweep_meta.json", planned=4, attempted=4, complete=True)
+    control_records = _make_records(14, [-0.6, -0.4, -0.2], n_roles=2, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep_gaussian.jsonl", control_records)
+    _write_meta(
+        data_dir / "steering_sweep_gaussian_meta.json",
+        planned=6, attempted=6, complete=True,
+    )
+
+    client_axis = FakeClient(default_label="assistant")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client_axis)
+    axis_exit = ev.main([])
+    assert axis_exit in (0, 1)  # B kriteri kararı bu testin konusu DEĞİL
+
+    client_ctrl = FakeClient(default_label="assistant")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client_ctrl)
+    ctrl_exit = ev.main(["--variant", "gaussian"])
+    assert ctrl_exit == 0
+
+    steering_dir = results_dir / "steering"
+    assert (steering_dir / "criterion_b.json").exists()
+    assert (steering_dir / "rate_by_strength.json").exists()
+    assert (steering_dir / "rate_by_strength_gaussian.json").exists()
+    assert not (steering_dir / "criterion_b_gaussian.json").exists()
+    assert (data_dir / "steering_labels.json").exists()
+    assert (data_dir / "steering_labels_gaussian.json").exists()
+
+
+def test_variant_entirely_unlabelled_cell_exits_two_not_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    """E1'in kontrol koluna taşınmış hâli: bir hücrenin TÜM öğeleri
+    etiketlenemezse (`non_assistant_rate` boş listede `ValueError` atar) bu
+    `--variant` altında da temiz bir 2'ye dönüşmeli, traceback'e ya da yanlış
+    bir 0'a değil — bu kontrol yolu B kriteri değerlendirmesini ATLASA bile
+    `rates_by_layer` çağrısı ORTAK kaldığı için aynı korumadan geçer."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [-0.6, -0.4], n_roles=1, n_questions=1)
+    _write_sweep(data_dir / "steering_sweep_gaussian.jsonl", records)
+    _write_meta(
+        data_dir / "steering_sweep_gaussian_meta.json",
+        planned=2, attempted=2, complete=True,
+    )
+    # -0.6 grubunun TEK öğesi her zaman zehirli.
+    client = FakeClient(default_label="assistant", poison_marker="s-0.6")
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main(["--variant", "gaussian"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "Traceback" not in err
+    assert not (results_dir / "steering" / "rate_by_strength_gaussian.json").exists()
+
+
+def test_variant_dry_run_checks_stage4_controls_budget(tmp_path, monkeypatch, capsys):
+    """`--dry-run` ile `--variant` birlikte verildiğinde bütçe kontrolü de
+    `stage4_controls`'a karşı yapılmalı — `stage4_steering`'e karşı DEĞİL."""
+    data_dir, results_dir = _patch_paths(monkeypatch, tmp_path)
+    records = _make_records(14, [-0.6, -0.4, -0.2], n_roles=5, n_questions=2)  # 10 öğe/grup
+    _write_sweep(data_dir / "steering_sweep_gaussian.jsonl", records)
+    _write_meta(
+        data_dir / "steering_sweep_gaussian_meta.json",
+        planned=30, attempted=30, complete=True,
+    )
+    client = StageRecordingClient()
+    monkeypatch.setattr(ev, "build_default_client", lambda: client)
+
+    exit_code = ev.main(["--variant", "gaussian", "--dry-run"])
+
+    assert exit_code == 0
+    assert client.budget_stages_seen == ["stage4_controls"]
+    assert client.calls == 0, "--dry-run tek bir hakem çağrısı bile atmamalı"

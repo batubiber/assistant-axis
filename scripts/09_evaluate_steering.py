@@ -70,6 +70,23 @@ KAPSAMA bakar (`set(labels) | set(unlabelled) >= set(range(total))`) ve
 oranın hesaplandığı `labels_by_group`/`unlabelled_by_group` o hücrenin
 `range(len(items_all))` aralığına KIRPILIR — bayat/sızmış bir pozisyon
 diskte kalsa bile orana giremez.
+
+Kontrol sweep'i desteği (Task 3; bkz. `.superpowers/sdd/p4-task-3-brief.md`),
+kontrol yönlerini (`gaussian`/`shuffled`/`rolespan`) AYNI script'le
+değerlendirmek için: `--variant AD` verilirse `steering_sweep_<AD>.jsonl` /
+`..._meta.json` okunur, `steering_labels_<AD>.json` yazılır ve karar
+`rate_by_strength_<AD>.json` olur — `criterion_b_<AD>.json` HİÇ YAZILMAZ.
+Kontrol sweep'lerinde 0.0 gücü YOKTUR (`results/control_preregistration.
+json`, taban Aşama 4'ün eksen koşusundan PAYLAŞILIYOR) — `evaluate_all_
+layers`/`evaluate_criterion_b` 0.0 tabanı olmadan `ValueError` fırlatır, bu
+yüzden `--variant` verildiğinde B kriteri BU SCRIPT'TE değerlendirilmez; C
+kriterini paylaşılan tabanla `scripts/10_evaluate_controls.py` hesaplar.
+Harcama ANAHTARI da değişir: `STAGE` (`stage4_steering`) yerine
+`stage4_controls` kullanılır — `stage4_steering`'in koşu sırasında yalnızca
+birkaç çağrısı kalmıştı, kontrol harcamasının oraya yazılması ilk çağrıda
+bütçe yetersizliğiyle düşerdi. `--variant` verilmezse (bugünkü tek kullanım
+biçimi) `STAGE`, artefakt adları ve B kriteri değerlendirmesi BİREBİR aynı
+kalır — üstteki 38 test bunu zaten sabitliyor.
 """
 from __future__ import annotations
 
@@ -418,10 +435,33 @@ def _run(argv: list[str] | None) -> int:
             "supplement madde E2)"
         ),
     )
+    parser.add_argument(
+        "--variant", type=str, default=None,
+        help=(
+            "verilirse steering_sweep_<AD>.jsonl / ..._meta.json okunur, "
+            "steering_labels_<AD>.json / rate_by_strength_<AD>.json yazılır "
+            "(bkz. Task 3 brief) — kontrol sweep'lerinde 0.0 gücü YOK, bu "
+            "yüzden B kriteri BURADA değerlendirilmez (C kriterini "
+            "scripts/10_evaluate_controls.py hesaplar); harcama "
+            "'stage4_controls' bütçesinden düşer. Verilmezse bugünkü davranış "
+            "(artefakt adları, STAGE, B kriteri) BİREBİR aynı kalır."
+        ),
+    )
     args = parser.parse_args(argv)
 
+    # Task 3: `--variant` verildiğinde artefakt adları `_<AD>` soneki alır ve
+    # harcama `stage4_steering`'in (yalnızca 7 çağrısı kalan) DEĞİL,
+    # `stage4_controls`'un (240'lık, hiç harcanmamış) bütçesinden düşer —
+    # aksi hâlde kontrol koşusu ilk çağrıda bütçe yetersizliğiyle düşerdi.
+    # `variant=None` (bugünkü tek kullanım) `suffix`'i boş string, `stage`'i
+    # modül sabiti `STAGE`'in KENDİSİ yapar — aşağıdaki HİÇBİR dosya yolu ya
+    # da bütçe/çağrı davranışı bu durumda DEĞİŞMEZ.
+    variant = args.variant
+    suffix = f"_{variant}" if variant else ""
+    stage = "stage4_controls" if variant else STAGE
+
     D = config.model_data_dir()
-    sweep_path = D / "steering_sweep.jsonl"
+    sweep_path = D / f"steering_sweep{suffix}.jsonl"
     if not sweep_path.exists():
         print(f"BAŞARISIZ: {sweep_path} yok.\n"
               "  Önce scripts/08_steering_sweep.py çalıştırılmalı.", file=sys.stderr)
@@ -431,7 +471,7 @@ def _run(argv: list[str] | None) -> int:
     # üretmek yanlış bir bilimsel sonuç yayınlamak demektir. Bu kontrol
     # `.jsonl`'i okumadan/gateway istemcisi kurulmadan ÖNCE yapılır — hem
     # daha ucuz hem operatöre daha erken teşhis verir.
-    meta_path = D / "steering_sweep_meta.json"
+    meta_path = D / f"steering_sweep{suffix}_meta.json"
     try:
         meta = read_sweep_meta(meta_path)
     except ValueError as exc:
@@ -494,7 +534,7 @@ def _run(argv: list[str] | None) -> int:
     # olabilir; bu ikinci, bağımsız bir savunma katmanıdır).
     record_counts = {key: len(v) for key, v in groups.items()}
 
-    labels_path = D / "steering_labels.json"
+    labels_path = D / f"steering_labels{suffix}.json"
     # F2: OKUMA ucu artık bütçe kapısının ÜSTÜNDE — diskte zaten hazır
     # (ve maliyeti 0 olan) hücreler/konumlar `planned` hesabına HİÇ
     # girmemeli, aksi hâlde her resume denemesi tüm sweep'in bütçesini
@@ -566,7 +606,7 @@ def _run(argv: list[str] | None) -> int:
         print(f"BAŞARISIZ: gateway istemcisi kurulamadı.\n  {exc}", file=sys.stderr)
         return 2
 
-    stage_left, global_left = client.remaining_budget(STAGE)
+    stage_left, global_left = client.remaining_budget(stage)
     print(f"Grup sayısı: {len(groups)}   toplam planlanan çağrı (üst sınır): {total_planned}"
           f"   bekleyen (bütçe kontrolü buna göre): {planned}")
     print(f"Aşama kalan: {stage_left}   global kalan: {global_left}")
@@ -607,7 +647,7 @@ def _run(argv: list[str] | None) -> int:
                 chunk_positions = pending[start : start + args.batch_size]
                 chunk_items = [items_all[pos] for pos in chunk_positions]
                 chunk_labels, chunk_unlabelled, split = _classify_batch(
-                    client, positions=chunk_positions, items=chunk_items, stage=STAGE
+                    client, positions=chunk_positions, items=chunk_items, stage=stage
                 )
                 group_state[key].update(chunk_labels)
                 unlabelled_state[key].update(chunk_unlabelled)
@@ -680,6 +720,46 @@ def _run(argv: list[str] | None) -> int:
         )
 
     rates = rates_by_layer(labels_by_group)
+
+    # Task 3: `--variant` verildiğinde B kriteri BURADA DEĞERLENDİRİLMEZ.
+    # Kontrol sweep'lerinde 0.0 gücü hiç yok (ön-tescil taban için Aşama
+    # 4'ün eksen sweep'ini PAYLAŞIYOR, bkz. control_preregistration.json) —
+    # `evaluate_all_layers`/`evaluate_criterion_b` 0.0 tabanı olmadan
+    # `ValueError` fırlatır. Bu script yalnızca ETİKETLER ve oranları yazar;
+    # C kriterini `scripts/10_evaluate_controls.py` (paylaşılan tabanı
+    # eksenin KENDİ `rate_by_strength.json`'ından okuyarak) hesaplar.
+    if variant:
+        # F5 ile AYNI ilke: hiçbir grup değerlendirilemediyse (ör. sıfır
+        # kayıtlı bir sweep) var olan GERÇEK bir `rate_by_strength_<AD>.json`
+        # boş bir hesaplamayla EZİLMEZ — hiçbir şey yazılmadan çıkış 2.
+        print()
+        for layer in sorted(rates):
+            for strength in sorted(rates[layer]):
+                print(f"L{layer} güç {strength}: Assistant-dışı oran "
+                      f"{rates[layer][strength]:.3f}")
+        print()
+        if not rates:
+            print(
+                "BAŞARISIZ: hiçbir grup değerlendirilemedi — kontrol etiketleri "
+                "üretilemedi (bu bir C kriteri kararı DEĞİLDİR).",
+                file=sys.stderr,
+            )
+            print(f"Gönderilen istek: {client.sends_made}")
+            return 2
+        out_dir = config.model_results_dir() / "steering"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / f"rate_by_strength{suffix}.json").write_text(json.dumps(
+            {str(l): {str(s): r for s, r in by.items()} for l, by in rates.items()},
+            ensure_ascii=False, indent=2), encoding="utf-8")
+        print(
+            "KONTROL YÖNÜ ETİKETLENDİ — B kriteri BURADA değerlendirilmedi "
+            "(kontrol sweep'lerinde 0.0 gücü yok); C kriteri için "
+            "scripts/10_evaluate_controls.py çalıştırılmalı."
+        )
+        print(f"Bölünüp kurtarılmaya çalışılan batch: {batches_split_total}")
+        print(f"Gönderilen istek: {client.sends_made}")
+        return 0
+
     verdicts = evaluate_all_layers(rates)
 
     # F5: karar artefaktları yalnızca EN AZ BİR katman fiilen
