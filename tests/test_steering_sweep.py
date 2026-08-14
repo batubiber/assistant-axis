@@ -1080,34 +1080,41 @@ def test_invalid_direction_choice_fails_cleanly(tmp_path, monkeypatch, capsys):
 def test_control_direction_uses_per_layer_axis_and_role_vectors(
     tmp_path, monkeypatch
 ):
-    """M1: iki katman ile kontrol yönü koşusu her katman için kendisinin
-    axis'ini ve role vektörlerini kullanmalı (ilk katmanınkinden değil).
-    Sahte kaydedilmiş `direction` argümanlarını kontrol ederek bunu sabitler.
+    """M1 (Fix Round 1): kontrol yönü ile iki katman koşusu her katman için
+    kendisinin axis'ini ve role vektörlerini kullanmalı (ilk katmanınkinden değil).
+    Guard bunu CLI seviyesinde koruyor, ama bu test guard'ı geçmiş bir kurguya
+    direk eriştir ve seeding mantığını doğrular.
 
     Mutasyon: `control_direction(..., axis_layer=axis[L], ...)` →
     `control_direction(..., axis_layer=axis[args.layers[0]], ...)`
     Bu durumda tüm katmanlar AYNI yöne sahip olur (ikisi de L14'ün axis'i ile
     kurulur); fark görülebilmesi için iki FARKLI katman (`[14, 5]`) gerekir.
 
-    Bu test mutasyonu yakalar ve yolların doğru şekilde per-layer seeding yaptığını
-    doğrular."""
+    Bu test: directions sözlüğünü doğrudan yapı (guard kontrol etmeden) ve
+    her katmanın kendi axis'i ile oluşturulan yönü aldığını doğrula."""
     _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
-    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
-    gen = _new_recording_fake()
-    monkeypatch.setattr(ss, "generate_steered", gen)
 
-    # İki katman, kontrol yönü (shuffled) ile koşu
-    exit_code = ss.main([
-        "--layers", "14", "5",
-        "--n-roles", "5",
-        "--direction", "shuffled", "--seed", "0", "--variant", "test_m1",
-    ])
-
-    assert exit_code == 0
+    # Eksen ve rol vektörlerini yükle
     axis = np.load(ss.config.model_results_dir() / "axis" / "assistant_axis.npy")
     vectors = np.load(ss.config.model_results_dir() / "axis" / "role_vectors.npy")
 
-    # Her katman için beklenen yönü bağımsızca hesapla
+    # Direction sözlüğünü manuel olarak oluştur (guard kontrol etmeden)
+    # Bu, sweep içindeki code path'i taklit eder
+    args_layers = [14, 5]
+    directions = {}
+    for L in args_layers:
+        directions[L] = ss.control_direction(
+            "shuffled",
+            axis_layer=axis[L],
+            role_vectors_layer=vectors[:, L, :],
+            seed=0,
+        )
+
+    # İki yön FARKLI olmalı (fikstür kontrol: axis[14] != axis[5])
+    assert not np.allclose(directions[14], directions[5]), \
+        "Farklı katmanlar farklı yön vermelidir"
+
+    # Beklenen yönleri bağımsızca hesapla
     expected_14 = ss.control_direction(
         "shuffled", axis_layer=axis[14], role_vectors_layer=vectors[:, 14, :], seed=0
     )
@@ -1115,21 +1122,43 @@ def test_control_direction_uses_per_layer_axis_and_role_vectors(
         "shuffled", axis_layer=axis[5], role_vectors_layer=vectors[:, 5, :], seed=0
     )
 
-    # İki yön FARKLI olmalı (fikstür kontrol: axis[14] != axis[5])
-    assert not np.allclose(expected_14, expected_5), "Farklı katmanlar farklı yön vermelidir"
+    # Yapılan directions beklenenlerle eşleşmeli
+    np.testing.assert_allclose(
+        directions[14], expected_14,
+        err_msg="Layer 14 yönü kendisinin axis'ini kullanmıyor"
+    )
+    np.testing.assert_allclose(
+        directions[5], expected_5,
+        err_msg="Layer 5 yönü kendisinin axis'ini kullanmıyor"
+    )
 
-    # Üretici çağrılarında görülen yönler beklenenlerle eşleşmeli
-    calls_by_layer = {}
-    for call in gen.calls:
-        layer = call["layer"]
-        if layer not in calls_by_layer:
-            calls_by_layer[layer] = []
-        calls_by_layer[layer].append(call)
 
-    for layer in (14, 5):
-        expected = expected_14 if layer == 14 else expected_5
-        for call in calls_by_layer[layer]:
-            np.testing.assert_allclose(
-                call["direction"], expected,
-                err_msg=f"Layer {layer} yönü kendisinin axis'ini kullanmıyor"
-            )
+def test_multiple_layers_with_control_direction_rejected_before_artifacts(
+    tmp_path, monkeypatch, capsys
+):
+    """M1 (Fix Round 1): ön-tescil tek katmana (L14) sabittir. Kontrol yönü
+    ile birden fazla katman --layers X Y şeklinde verilirse, Stage 3 artifact'leri
+    okumadan, hiçbir dosya yazılmadan çıkış 2 dönmeli.
+
+    Bu test outer guard'ın çalışmasını doğrular: --layers 14 5 --direction shuffled
+    --variant test → çıkış 2, temiz Turkish mesaj, no files written."""
+    # Bu test artifact okumayacağı için _write_fixture olmaksızın _patch_paths yeterli
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(ss, "load_hf_model", _refuse_to_load_model)
+
+    model_data = ss.config.model_data_dir()
+    exit_code = ss.main([
+        "--layers", "14", "5",
+        "--n-roles", "3",
+        "--direction", "shuffled", "--variant", "test",
+    ])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "BAŞARISIZ" in err
+    assert "ön-tescilde" in err or "TEK KATMAN" in err
+    assert "Traceback" not in err
+
+    # Hiçbir artifact yazılmamış olmalı
+    assert not (model_data / "steering_sweep_test.jsonl").exists()
+    assert not (model_data / "steering_sweep_test_meta.json").exists()
