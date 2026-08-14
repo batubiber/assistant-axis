@@ -44,7 +44,8 @@ def test_shuffled_preserves_the_coordinate_multiset():
     """Ağır kuyruklu büyüklük profili AYNEN korunmalı — kontrolün varlık sebebi bu."""
     v = _axis()
     out = control_direction("shuffled", axis_layer=v, role_vectors_layer=_roles(), seed=5)
-    assert np.allclose(np.sort(np.abs(out)), np.sort(np.abs(v)))
+    # İşaretler korunmalı: sadece büyüklükleri değil, imzalı değerleri de
+    assert np.allclose(np.sort(out), np.sort(v))
 
 
 def test_shuffled_actually_changes_the_direction():
@@ -105,3 +106,37 @@ def test_fingerprint_is_stable_and_discriminating():
     assert direction_fingerprint(a) == direction_fingerprint(a)
     assert direction_fingerprint(a) != direction_fingerprint(b)
     assert len(direction_fingerprint(a)) == 16
+
+
+@pytest.mark.parametrize("kind", ["gaussian", "shuffled", "rolespan"])
+def test_returns_float64_dtype(kind):
+    """Çıktı dtype'ı her zaman float64 olmalı — parmak iz istikrarı için."""
+    # Girdi float32 olsa bile çıktı float64 olmalı
+    v_float32 = _axis().astype(np.float32)
+    roles_float32 = _roles().astype(np.float32)
+    result = control_direction(kind, axis_layer=v_float32, role_vectors_layer=roles_float32, seed=42)
+    assert result.dtype == np.float64, f"{kind} döndürüyor: {result.dtype}"
+
+    # Girdi float64 olduğunda da float64 olmalı
+    v_float64 = _axis()
+    roles_float64 = _roles()
+    result = control_direction(kind, axis_layer=v_float64, role_vectors_layer=roles_float64, seed=42)
+    assert result.dtype == np.float64
+
+
+def test_rolespan_raises_on_degenerate_axis():
+    """Eksenin rol span'indeki izdüşümü sıfıra yakın olursa ValueError fırlatmalı.
+
+    Dejenere durum: rol vektörleri matrisi tek sıra = eksenin kendisi.
+    Span tek 1D, eksenin tamamen içinde değilse (sayısal olarak sıfır),
+    ortogonalleştirme bir gürültü vektörü tutturmaz ve norm eşiğini geçer.
+    Ama eksen TAMAMEN span'e eşitse (örn. eksen tek rol vektörü),
+    çıkartma sonucu sıfır olur.
+    """
+    # Rol vektörü = eksen kendisi (tekil matris)
+    v = _axis()
+    # Rol vektörleri: sadece v'nin kendisini içeren 1×64 matris
+    R_degenerate = v.reshape(1, -1)
+
+    with pytest.raises(ValueError, match="sıfıra çok yakın"):
+        control_direction("rolespan", axis_layer=v, role_vectors_layer=R_degenerate, seed=99)
