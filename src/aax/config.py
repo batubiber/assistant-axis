@@ -77,10 +77,11 @@ def model_results_dir(model_id: str | None = None) -> Path:
 # | stage05_judge_gate |         5 |  10 |    15 |
 # | stage2_probe_labels|       250 |  50 |   300 |
 # | stage4_steering    |       350 |  10 |   360 |
-# | stage5_drift       |       320 |  65 |   385 |
+# | stage4_controls    |       225 |  15 |   240 |
+# | stage5_drift       |       120 |  25 |   145 |
 # | stage6_capping     |       150 |  30 |   180 |
 # | stage7_turkish     |        60 |  15 |    75 |
-# | TOPLAM             |     1.257 | 213 | 1.470 |
+# | TOPLAM             |     1.282 | 188 | 1.470 |
 #
 # `stage4_steering` satırı 2026-08-10 düzeltmesiyle (bkz.
 # `.superpowers/sdd/p3-task-5-fix1-brief.md`, madde F7) güncellendi: eski
@@ -106,7 +107,10 @@ STAGE_BUDGETS: dict[str, int] = {
     # böl-ve-kurtar payı = 360. GLOBAL_BUDGET (1500) DEĞİŞMEDİ — bu artış
     # yalnızca stage4_steering'in KENDİ alt sayacını büyütür.
     "stage4_steering": 360,
-    "stage5_drift": 385,
+    "stage4_controls": 240,  # 2026-08-14: Kontrol deneyi (stage4_steering yönü
+                             # belirtilmedi testi), 225 çağrılık, 15 böl-ve-kurtar payı.
+    "stage5_drift": 145,  # 2026-08-14: Bütçe stage4_controls'a kaydırıldı. Aşama 5
+                          # koşulmadan ÖNCE yeniden bütçelenmelidir (bkz. rapor).
     "stage6_capping": 180,
     "stage7_turkish": 75,
 }
@@ -137,6 +141,7 @@ MODEL_DEPENDENT_STAGES: frozenset[str] = frozenset(
         "stage05_judge_gate",
         "stage2_probe_labels",
         "stage4_steering",
+        "stage4_controls",
         "stage5_drift",
         "stage6_capping",
         "stage7_turkish",
@@ -158,7 +163,8 @@ STAGE_LOGICAL_CALLS: dict[str, int] = {
     "stage05_judge_gate": 5,
     "stage2_probe_labels": 250,
     "stage4_steering": 350,
-    "stage5_drift": 320,
+    "stage4_controls": 225,
+    "stage5_drift": 120,
     "stage6_capping": 150,
     "stage7_turkish": 60,
 }

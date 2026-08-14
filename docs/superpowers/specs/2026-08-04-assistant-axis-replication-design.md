@@ -528,17 +528,18 @@ katkıda bulunmaya devam eder — yalnızca YENİ gönderimler yeni model-scoped
 | 2 — rol ifadesi filtresi | `stage2_probe_labels` | model başına | 250 | 50 | 300 |
 | 3 — eksen çıkarımı | — | — | 0 | 0 | 0 |
 | 4 — steering sweep | `stage4_steering` | model başına | 350 | 10 | 360 |
-| 5 — persona drift | `stage5_drift` | model başına | 320 | 65 | 385 |
+| 4 — kontrol deneyi | `stage4_controls` | model başına | 225 | 15 | 240 |
+| 5 — persona drift | `stage5_drift` | model başına | 120 | 25 | 145 |
 | 6 — capping | `stage6_capping` | model başına | 150 | 30 | 180 |
 | 7 — Türkçe transfer | `stage7_turkish` | model başına | 60 | 15 | 75 |
-| **Toplam (TEK model)** | | | **1,257** | **213** | **1,470** |
+| **Toplam (TEK model)** | | | **1,282** | **188** | **1,470** |
 | **Kodda sert tavan** | `GLOBAL_BUDGET` | | | | **1,500** |
 
 Bu tablo `src/aax/config.py`'deki `STAGE_LOGICAL_CALLS` ve `STAGE_BUDGETS` ile birebir
 aynıdır ve `tests/test_config.py` ikisinin sürüklenmesini engeller. **"Toplam" sütunu TEK
 bir modelin tüketebileceği ÜST SINIRDIR** — model başına aşamalarda ikinci bir model AYNI
 tavanı kendi anahtarıyla yeniden açar, yani N modelle TEORİK üst sınır `paylaşılan +
-N × model-başına` olur (paylaşılan = 10+145=155, model-başına = 15+300+210+385+180+75=1165).
+N × model-başına` olur (paylaşılan = 10+145=155, model-başına = 15+300+360+240+145+180+75=1315).
 Pratikte bu üst sınıra hiç yaklaşılmaz: cache payload'a göre anahtarlandığı için farklı
 modellerin rollout metni doğal olarak farklı payload → çakışma yok, ama gerçek harcama
 her zaman planlanan çağrı sayısı kadardır, tavan kadar değil. Sert tavan (`GLOBAL_BUDGET`,
