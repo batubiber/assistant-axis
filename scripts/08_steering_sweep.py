@@ -431,6 +431,13 @@ def _run(argv: list[str] | None = None) -> int:
             # seçili `role_keys` DEĞİL — ön-tescil bunu tüm rol span'i
             # (rank 92) üzerinden tanımlıyor, `select_assistant_end_roles`'ın
             # daha sonra bu span'den seçtiği alt kümeden değil.
+            #
+            # M1 (Fix Round 1): HER katman kendisinin eksenini ve rol
+            # vektörlerini kullanır. Test (`test_steering_sweep.py`)
+            # `axis_layer=axis[L]` yerine `axis_layer=axis[args.layers[0]]`
+            # mutasyonunu yakalar — tüm katmanları ilk katmanınkisine
+            # sabitlemeyi görerek hatayı test seviyesinde davranış farklılığı
+            # ile algılar.
             directions = {
                 L: control_direction(
                     args.direction,
@@ -449,10 +456,14 @@ def _run(argv: list[str] | None = None) -> int:
         return 2
     direction_seed = None if args.direction == "axis" else args.seed
     # Birden fazla katman verilirse (ör. --layers 14 19) her katmanın kendi
-    # yönü var; tek bir parmak izi için katman sırasına göre istiflenir —
-    # aynı tohum + aynı katman kümesi HER ZAMAN aynı sha üretir.
+    # yönü var; tek bir parmak izi için katmanlar SİRALANIP istiflenir —
+    # aynı tohum + aynı katman KÜMESİ HER ZAMAN aynı sha üretir (katman
+    # sırasından bağımsız olarak). M2 (Fix Round 1): Sıralama `--layers 14 19`
+    # ile `--layers 19 14`'ü farklı parmak izleri vermelerini sağlar — BİREBİR
+    # aynı yönler, farklı sıra, ön-tescilin layer SET tanımıyla uyumlu parmak
+    # izi sabitliği.
     direction_sha256 = direction_fingerprint(
-        np.stack([directions[L] for L in args.layers])
+        np.stack([directions[L] for L in sorted(args.layers)])
     )
 
     bundle = load_hf_model()
