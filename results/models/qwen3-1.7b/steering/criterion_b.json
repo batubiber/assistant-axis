@@ -1,0 +1,60 @@
+{
+  "model": "Qwen/Qwen3-1.7B",
+  "layers": {
+    "14": {
+      "baseline_strength": 0.0,
+      "baseline_rate": 0.456,
+      "far_strength": -0.6,
+      "far_rate": 0.94,
+      "delta": 0.48399999999999993,
+      "threshold": 0.25,
+      "threshold_eps": 1e-09,
+      "passed": true,
+      "reason": "eşik aşıldı"
+    },
+    "19": {
+      "baseline_strength": 0.0,
+      "baseline_rate": 0.416,
+      "far_strength": -0.6,
+      "far_rate": 0.896,
+      "delta": 0.48000000000000004,
+      "threshold": 0.25,
+      "threshold_eps": 1e-09,
+      "passed": true,
+      "reason": "eşik aşıldı"
+    }
+  },
+  "labelled_by_group": {
+    "14|-0.6": 250,
+    "14|-0.4": 250,
+    "14|-0.2": 250,
+    "14|0.0": 250,
+    "14|0.1": 250,
+    "14|0.2": 250,
+    "14|0.3": 250,
+    "19|-0.6": 250,
+    "19|-0.4": 250,
+    "19|-0.2": 250,
+    "19|0.0": 250,
+    "19|0.1": 250,
+    "19|0.2": 250,
+    "19|0.3": 250
+  },
+  "unlabelled_by_group": {
+    "14|-0.6": 0,
+    "14|-0.4": 0,
+    "14|-0.2": 0,
+    "14|0.0": 0,
+    "14|0.1": 0,
+    "14|0.2": 0,
+    "14|0.3": 0,
+    "19|-0.6": 0,
+    "19|-0.4": 0,
+    "19|-0.2": 0,
+    "19|0.0": 0,
+    "19|0.1": 0,
+    "19|0.2": 0,
+    "19|0.3": 0
+  },
+  "note": "Kriter KATMAN BAŞINA değerlendirildi. Eşik ve taban ön-tescildeki hâliyle sabit: en negatif güçteki Assistant-dışı oran, 0.0 gücündeki orandan en az 25 puan yüksek olmalı. PAYDA: her hücrenin oranı yalnızca hakemin ETİKETLEYEBİLDİĞİ öğeler üzerinden hesaplanır; bu payda hücre başına 'labelled_by_group' alanında AÇIKÇA kayıtlıdır — hakemin (tek tek sorulsa bile) ayrıştıramadığı öğeler paydadan DÜŞER, kaç öğenin düştüğü 'unlabelled_by_group'ta hücre başına kayıtlıdır."
+}
