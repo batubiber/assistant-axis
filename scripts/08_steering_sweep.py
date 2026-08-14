@@ -297,6 +297,24 @@ def _run(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    # M1 (Fix Round 1): kontrol koşusu `results/control_preregistration.json`'da
+    # TEK KATMAN (L14) olarak ön-tescilenmiş. Bir kontrol yönüyle birden fazla
+    # katman BİRLİKTE kullanılması ön-tescil kapsamı dışında — bu guard bunu
+    # erken yakalar (model yüklenmeden, artifact yazılmadan). Per-layer seeding
+    # testi ise iç savunma: guard gevşetilirse, seeding doğruluğu test ile
+    # garantilenir.
+    if args.direction != "axis" and len(args.layers) > 1:
+        print(
+            "BAŞARISIZ: --direction axis dışında bir değer verildi ama "
+            "--layers birden fazla katman belirtiyor — kontrol koşusu "
+            "ön-tescilde (results/control_preregistration.json) TEK KATMAN "
+            "(L14) olarak sabitlenmiştir.\n"
+            "  Ya --layers tek bir katman belirtin (ör. --layers 14) ya da "
+            "--direction axis kullanın.",
+            file=sys.stderr,
+        )
+        return 2
+
     D = config.model_data_dir()
     R = config.model_results_dir() / "axis"
     try:
