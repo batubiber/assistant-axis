@@ -1,0 +1,77 @@
+{
+  "model": "Qwen/Qwen3-1.7B",
+  "far_strength": -0.6,
+  "threshold": 0.25,
+  "threshold_eps": 1e-09,
+  "baseline_source": "results/models/<slug>/steering/rate_by_strength.json — Aşama 4 EKSEN koşusunun 0.0 gücündeki hücresi. steering_delta(d, 0.0, norm) HER yön için TAM OLARAK sıfır vektör döndürür (0.0 gücünde üretim yönden BAĞIMSIZDIR); bu yüzden taban kontrol başına YENİDEN ÖLÇÜLMEDİ, Aşama 4'ten PAYLAŞILDI (bkz. results/control_preregistration.json, 'taban').",
+  "directions": {
+    "gaussian": {
+      "layers": {
+        "14": {
+          "baseline_strength": 0.0,
+          "baseline_rate": 0.456,
+          "far_strength": -0.6,
+          "far_rate": 0.308,
+          "delta": -0.14800000000000002,
+          "threshold": 0.25,
+          "threshold_eps": 1e-09,
+          "reached_threshold": false,
+          "passed": true,
+          "reason": "eşiğin altında kaldı: artış -14.8 puan, eşik 25 puan",
+          "axis_delta": 0.48399999999999993,
+          "ratio_axis_to_control": -3.2702702702702693
+        }
+      },
+      "passed": true,
+      "direction_kind": "gaussian",
+      "direction_seed": 0,
+      "direction_sha256": "795925717765b379"
+    },
+    "shuffled": {
+      "layers": {
+        "14": {
+          "baseline_strength": 0.0,
+          "baseline_rate": 0.456,
+          "far_strength": -0.6,
+          "far_rate": 0.42,
+          "delta": -0.03600000000000003,
+          "threshold": 0.25,
+          "threshold_eps": 1e-09,
+          "reached_threshold": false,
+          "passed": true,
+          "reason": "eşiğin altında kaldı: artış -3.6 puan, eşik 25 puan",
+          "axis_delta": 0.48399999999999993,
+          "ratio_axis_to_control": -13.44444444444443
+        }
+      },
+      "passed": true,
+      "direction_kind": "shuffled",
+      "direction_seed": 0,
+      "direction_sha256": "837e20f817631f41"
+    },
+    "rolespan": {
+      "layers": {
+        "14": {
+          "baseline_strength": 0.0,
+          "baseline_rate": 0.456,
+          "far_strength": -0.6,
+          "far_rate": 0.1991869918699187,
+          "delta": -0.25681300813008134,
+          "threshold": 0.25,
+          "threshold_eps": 1e-09,
+          "reached_threshold": false,
+          "passed": true,
+          "reason": "eşiğin altında kaldı: artış -25.7 puan, eşik 25 puan",
+          "axis_delta": 0.48399999999999993,
+          "ratio_axis_to_control": -1.8846397366088383
+        }
+      },
+      "passed": true,
+      "direction_kind": "rolespan",
+      "direction_seed": 0,
+      "direction_sha256": "4aab454c15c51fff"
+    }
+  },
+  "passed": true,
+  "note": "Kriter C (ön-tescil): hiçbir kontrol yönünün artışı B kriterinin 25 puanlık eşiğine ULAŞMAMALI — mutlak bir bardır, oran DEĞİL. 'ratio_axis_to_control' yalnızca İKİNCİL rapordur, kriteri belirlemez. Sonuç ne olursa olsun eşik/taban/üç kontrol yönü DEĞİŞTİRİLMEZ (bkz. results/control_preregistration.json, 'kriter_degistirilmez')."
+}
