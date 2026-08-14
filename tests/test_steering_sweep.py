@@ -1068,3 +1068,68 @@ def test_invalid_direction_choice_fails_cleanly(tmp_path, monkeypatch, capsys):
     assert exc_info.value.code == 2
     err = capsys.readouterr().err
     assert "Traceback" not in err
+
+
+# --- Fix Round 1, M1: per-layer seeding doğrulaması ----------------------
+#
+# Reviewer'ın mutasyonu: `axis_layer=axis[L]` → `axis_layer=axis[args.layers[0]]`.
+# Bu, her layer'ın direction'ını ilk katmanın axis row'undan oluşturur.
+# Test aşağıda bu mutasyonu yakalar — iki farklı katman, iki farklı direction.
+
+
+def test_control_direction_uses_per_layer_axis_and_role_vectors(
+    tmp_path, monkeypatch
+):
+    """M1: iki katman ile kontrol yönü koşusu her katman için kendisinin
+    axis'ini ve role vektörlerini kullanmalı (ilk katmanınkinden değil).
+    Sahte kaydedilmiş `direction` argümanlarını kontrol ederek bunu sabitler.
+
+    Mutasyon: `control_direction(..., axis_layer=axis[L], ...)` →
+    `control_direction(..., axis_layer=axis[args.layers[0]], ...)`
+    Bu durumda tüm katmanlar AYNI yöne sahip olur (ikisi de L14'ün axis'i ile
+    kurulur); fark görülebilmesi için iki FARKLI katman (`[14, 5]`) gerekir.
+
+    Bu test mutasyonu yakalar ve yolların doğru şekilde per-layer seeding yaptığını
+    doğrular."""
+    _write_fixture(tmp_path, monkeypatch, n_role_vectors=5)
+    monkeypatch.setattr(ss, "load_hf_model", _fake_load_hf_model)
+    gen = _new_recording_fake()
+    monkeypatch.setattr(ss, "generate_steered", gen)
+
+    # İki katman, kontrol yönü (shuffled) ile koşu
+    exit_code = ss.main([
+        "--layers", "14", "5",
+        "--n-roles", "5",
+        "--direction", "shuffled", "--seed", "0", "--variant", "test_m1",
+    ])
+
+    assert exit_code == 0
+    axis = np.load(ss.config.model_results_dir() / "axis" / "assistant_axis.npy")
+    vectors = np.load(ss.config.model_results_dir() / "axis" / "role_vectors.npy")
+
+    # Her katman için beklenen yönü bağımsızca hesapla
+    expected_14 = ss.control_direction(
+        "shuffled", axis_layer=axis[14], role_vectors_layer=vectors[:, 14, :], seed=0
+    )
+    expected_5 = ss.control_direction(
+        "shuffled", axis_layer=axis[5], role_vectors_layer=vectors[:, 5, :], seed=0
+    )
+
+    # İki yön FARKLI olmalı (fikstür kontrol: axis[14] != axis[5])
+    assert not np.allclose(expected_14, expected_5), "Farklı katmanlar farklı yön vermelidir"
+
+    # Üretici çağrılarında görülen yönler beklenenlerle eşleşmeli
+    calls_by_layer = {}
+    for call in gen.calls:
+        layer = call["layer"]
+        if layer not in calls_by_layer:
+            calls_by_layer[layer] = []
+        calls_by_layer[layer].append(call)
+
+    for layer in (14, 5):
+        expected = expected_14 if layer == 14 else expected_5
+        for call in calls_by_layer[layer]:
+            np.testing.assert_allclose(
+                call["direction"], expected,
+                err_msg=f"Layer {layer} yönü kendisinin axis'ini kullanmıyor"
+            )
