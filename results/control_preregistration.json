@@ -1,0 +1,49 @@
+{
+  "tarih": "2026-08-14",
+  "durum": "OLCUM GORULMEDEN YAZILDI",
+  "neden": "Asama 4'te eksende steering, Assistant-disi persona oranini L14'te 45.6% -> 94.0% cikardi (B kriteri +48.4 puan, esik 25). Bu olcum tek basina, 'bu ISE bu YONE ozgu' ile 'bu buyuklukte HERHANGI bir bozulma modeli weird_role'e iter' arasini AYIRAMAZ. Kontrol yonu olmadan Asama 4'un nedensel iddiasi eksiktir.",
+
+  "kurulum": {
+    "katman": "Yalnizca L14 — Asama 4'te etkinin en guclu oldugu katman. Kontrol orada da hicbir sey uretmiyorsa kontrast en kuvvetli olur.",
+    "gucler": [-0.6, -0.4, -0.2],
+    "taban": "0.0 gucundeki hucre Asama 4 sweep'inden YENIDEN KULLANILIR (L14 @ 0.0 = 0.456, n=250). Gerekce: steering_delta(d, 0.0, norm) her yon icin TAM OLARAK sifir vektor dondurur, yani 0.0'da uretim yonden bagimsizdir. Yeniden uretmek 25 hakem cagrisini bosa harcardi.",
+    "roller_ve_sorular": "Asama 4'un AYNISI — eksende Assistant ucuna en yakin 50 rol, makalenin Ek D.1.2'deki 5 ic-gozlem sorusu. Hucre basina 250 yanit.",
+    "olcek": "Her kontrol yonu birim norma normalize edilir ve L14'un KENDI ortalama residual normuyla (136.844) olceklenir — eksenle birebir ayni buyukluk.",
+    "kod_yolu": "Kontroller, eksenin gectigi AYNI generate_steered/steer kod yolundan gecer. Ayri bir uretim yolu, yondeki farki degil kosumdaki farki olcerdi.",
+    "toplam_maliyet": "3 yon x 3 guc x 250 oge = 2250 uretim, 225 hakem cagrisi. Olcum oncesi kalan butce 534."
+  },
+
+  "kontrol_yonleri": {
+    "gaussian": {
+      "tanim": "Izotropik rastgele birim vektor (standart normal, normalize).",
+      "neyi_kontrol_eder": "En zayif bariyer: bu buyuklukte HERHANGI bir bozulma yeter mi?"
+    },
+    "shuffled": {
+      "tanim": "Eksenin KENDI koordinatlarinin rastgele permutasyonu.",
+      "neyi_kontrol_eder": "Eksenin koordinat profili agir kuyruklu (max/medyan = 31x). Permutasyon bu buyukluk dagilimini AYNEN korur, yonu yok eder. Etki 'birkac dev aktivasyon boyutuna dokunmaktan' geliyorsa bu kontrol de buyuk cikar."
+    },
+    "rolespan": {
+      "tanim": "Rol vektorlerinin span'i icinde rastgele bir yon, eksene ORTOGONALLESTIRILIP normalize edilmis. (Merkezlenmis rol uzayinin ranki 92.)",
+      "neyi_kontrol_eder": "En zor bariyer: ayni alt uzay, farkli yon. Etki 'persona uzayini itmekten' geliyorsa bu kontrol buyuk cikar ve eksenin ayricalikli olmadigi anlasilir."
+    },
+    "tohum": "Her yon icin sabit tohum kullanilir ve uretilen vektorun sha256'si artefakta yazilir; yeniden uretilebilirlik icin."
+  },
+
+  "kriter_C": "Hicbir kontrol yonunun artisi (en negatif gucteki oran eksi PAYLASILAN 0.0 tabani) B kriterinin 25 puanlik esigine ULASMAMALI. Yani hicbir kontrol yonu, tek basina degerlendirildiginde B kriterini gecmemeli.",
+
+  "ikincil_rapor": "Kriteri belirlemez, sadece raporlanir: eksenin artisinin en buyuk kontrol artisina orani; ve her yon icin tam doz-yanit egrisi ile 7 kategorili kirilim.",
+
+  "tahminler": {
+    "eksen_yone_ozguyse": "Uc kontrol de 25 puanin belirgin altinda kalir. rolespan uctan en buyugu olur (ayni alt uzayda) ama yine de acikca altta. Oran > 2.",
+    "buyukluk_tek_basina_aciklarsa": "gaussian ve shuffled de buyuk cikar. Bu durumda Asama 4'un sonucu ekseni IZOLE ETMIYOR demektir ve raporda boyle yazilir: olculen sey 'Assistant Axis'in etkisi' degil 'bu buyuklukte mudahalenin etkisi'.",
+    "persona_alt_uzayi_aciklarsa": "rolespan buyuk, gaussian ve shuffled kucuk cikar. O zaman eksen persona uzayi ICINDE ayricalikli degildir; iddia 'persona uzayini itmek persona'yi degistirir'e zayiflar — hala anlamli ama makalenin iddiasindan farkli.",
+    "beklenmedik": "Kontrollerden biri eksenden BUYUK cikarsa, Asama 4'un yorumu geri cekilir ve neden arastirilir."
+  },
+
+  "kriter_degistirilmez": "Olculen sonuc ne olursa olsun esik 25 puan, taban paylasilan 0.0 hucresi, ve uc kontrol yonu yukarida yazildigi gibi kalir. Sonuc kotu ciktiginda kontrol eklenmez veya cikarilmaz.",
+
+  "onceki_tescillere_baglanti": [
+    "results/steering_preregistration.json",
+    "results/scale_hypothesis_preregistration.json"
+  ]
+}
