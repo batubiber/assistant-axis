@@ -335,6 +335,7 @@ Hepsi bilinçli ve gerekçeli. Ayrıntı: spec Bölüm 8.
 | 8 | Base model deneyleri, trait uzayı | Yok | Kapsam dışı |
 | 9 | Steering **orta katmanda** yapılır (Bölüm 3.2.1) | **İki katmanda**: L14 ve L19 | Bizde orta katman, varsayılanın uçta *olmadığı* katman. Tek katmanda ölçmek "steering çalışmıyor" ile "yanlış katmanda ölçtük" arasını ayıramazdı — ve §5.4'ün gösterdiği gibi ayrım gerçek çıktı |
 | 10 | Roller katman başına seçilebilirdi | `--layers`'ın ilk katmanında bir kez seçilip sabit tutulur | Katman başına ayrı rol seti L14 ile L19'u karşılaştırılamaz kılardı. Seçilen roller meta artifact'ine yazılır |
+| 11 | Steering etkisi için kontrol yönü raporlanmıyor | **Üç kontrol yönü** (`gaussian`, `shuffled`, `rolespan`), ayrı ön-tescille | Aşama 4 tek başına "bu yöne özgü" ile "bu büyüklükte herhangi bir bozulma" arasını ayıramaz — bkz. §5.5 |
 
 ---
 
