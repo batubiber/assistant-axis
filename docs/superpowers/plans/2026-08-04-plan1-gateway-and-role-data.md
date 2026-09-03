@@ -267,7 +267,7 @@ CIRCUIT_THRESHOLD = 3
 def api_key() -> str:
     """Gateway anahtarını ortamdan oku.
 
-    Anahtar dağıtım-ortamı'deki deploy .env dosyasındadır; yerel llm-gateway/.env
+    Anahtar dağıtım ortamının .env dosyasındadır; bu depoda
     kopyasında yoktur. Repoya asla yazılmaz.
     """
     key = os.environ.get("APP_KEY_JAILBREAK")

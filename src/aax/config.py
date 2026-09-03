@@ -11,9 +11,14 @@ CACHE_DIR = DATA_DIR / "gateway_cache"
 BUDGET_PATH = DATA_DIR / "gateway_budget.json"
 CALL_LOG_PATH = DATA_DIR / "gateway_calls.jsonl"
 
-# LLM Gateway'in /Jailbreak/ uygulaması: hakem promptlarına müdahale edilmiyor.
-GATEWAY_BASE_URL = "https://gateway.invalid/app"
-GATEWAY_MODEL = "hakem-llm"
+# Hakem, OpenAI uyumlu bir gateway'in arkasındaki bir LLM'dir. Seçilen uygulama
+# hakem promptlarına müdahale etmez (kimlik promptu enjeksiyonu ve prompt refiner
+# devre dışı); hız sınırlama tamamen istemci tarafındadır — bkz. `gateway.py`.
+#
+# Adres ve model adı ORTAMDAN gelir. Depoda kurumsal bir endpoint veya iç model
+# sürümü sabitlenmez: public bir depoda bunlar adreslenebilir bir hedef bildirir.
+GATEWAY_BASE_URL = os.environ.get("AAX_GATEWAY_BASE_URL", "https://gateway.invalid/app")
+GATEWAY_MODEL = os.environ.get("AAX_GATEWAY_MODEL", "hakem-llm")
 
 # `AAX_TARGET_MODEL` ile ortamdan geçersiz kılınabilir — ikinci bir hedef
 # modelle (ör. Qwen/Qwen3-0.6B) koşmak için kaynak değişikliği gerekmez.
@@ -181,8 +186,8 @@ CIRCUIT_THRESHOLD = 3
 def api_key() -> str:
     """Gateway anahtarını ortamdan oku.
 
-    Anahtar dağıtım-ortamı'deki deploy .env dosyasındadır; yerel llm-gateway/.env
-    kopyasında yoktur. Repoya asla yazılmaz.
+    Anahtar dağıtım ortamının kendi .env dosyasındadır; bu depoya asla yazılmaz
+    ve yerel bir kopyası tutulmaz.
     """
     key = os.environ.get("APP_KEY_JAILBREAK")
     if not key:
