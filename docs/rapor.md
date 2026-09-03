@@ -58,13 +58,13 @@ Sonuca göre kriter ayarlamayı engellemek için **A kriteri deney başlamadan s
 
 İkinci deney — ölçek karşılaştırması — de **sonuç görülmeden** tescillendi (`results/scale_hypothesis_preregistration.json`).
 
-**B kriteri** (Aşama 4) aynı disiplinle, koddan ve ölçümden önce tescillendi (`results/steering_preregistration.json`, commit `002182d`):
+**B kriteri** (Aşama 4) aynı disiplinle, koddan ve ölçümden önce tescillendi (`results/steering_preregistration.json`, commit `1c934ef`):
 
 > En negatif güçteki Assistant-dışı persona oranı, steering'siz (0.0) orandan en az **25 puan** yüksek olmalı. Assistant-dışı = `human_role + nonhuman_role + weird_role`. Katman başına ayrı değerlendirilir.
 
 Üç sonuç için üç ayrı tahmin yazıldı: eksen nedenselse ikisi de geçer *ve L19'daki etki daha büyük olur*; etki derinliğe bağlıysa L19 geçer L14 düşer; eksen nedensel değilse ikisi de düşer.
 
-Ön-tescil bir kez **düzeltildi** (`70d9f71`), yine ölçümden önce: ilk hâlinde duman koşusundan aktarılan "−0.6'da yanıtlar yinelemeye düşüyor" gözlemi vardı ve bu **yanlıştı**. 105 yanıtın tamamı ölçüldüğünde hiçbir güçte çözülme bulunmadı. Yanlış satırlar silinmedi, üzerine `DUZELTME` alanı eklendi — kayıt ancak böyle dürüst kalır. Eşik, taban ve iki katmanlı kurulum değiştirilmedi.
+Ön-tescil bir kez **düzeltildi** (`c9f81b7`), yine ölçümden önce: ilk hâlinde duman koşusundan aktarılan "−0.6'da yanıtlar yinelemeye düşüyor" gözlemi vardı ve bu **yanlıştı**. 105 yanıtın tamamı ölçüldüğünde hiçbir güçte çözülme bulunmadı. Yanlış satırlar silinmedi, üzerine `DUZELTME` alanı eklendi — kayıt ancak böyle dürüst kalır. Eşik, taban ve iki katmanlı kurulum değiştirilmedi.
 
 ---
 
