@@ -114,9 +114,9 @@ Steering'li üretim **yalnızca HF transformers**'tadır. Hook `register_forward
 
 **GPU: RTX 4060, 8188 MiB, masaüstü ~1215 MiB kullanıyor → gerçekte ~7 GB.** Quantization yasak (aktivasyonları bozar, interp ölçümünü geçersiz kılar). Bu, hedef model seçimini doğrudan belirledi ve aktivasyon yakalamanın bellek profilini kritik hale getirdi.
 
-**Hakem: `hakem-llm`, LLM Gateway'in `/Jailbreak/` uygulaması üzerinden.** Bu uygulama seçildi çünkü hakem promptlarına müdahale edilmiyor — hakem promptlarına müdahale edilmiyor.
+**Hakem: OpenAI uyumlu bir gateway'in arkasındaki bir LLM.** Bu uygulama seçildi çünkü hakem promptlarına müdahale edilmiyor — hakem promptlarına müdahale edilmiyor.
 
-**Kritik kısıt:** `hakem-llm` **paylaşımlı bir production sunucusudur** ve hız sınırlama istemci tarafındadır. Hız sınırlama tamamen istemci tarafındadır. Bu yüzden `src/aax/gateway.py` projedeki tek HTTP noktasıdır ve şunları kapsar:
+**Kritik kısıt:** hakem **paylaşımlı bir sunucudur**. Hız sınırlama tamamen istemci tarafındadır. Bu yüzden `src/aax/gateway.py` projedeki tek HTTP noktasıdır ve şunları kapsar:
 
 - Endpoint başına **paylaşımlı** hız sınırı (1 istek/sn) ve semafor (2 eşzamanlı) — modül düzeyi kayıt defterinde, örnek başına değil
 - Diske kalıcı, **süreçler arası `flock`'lu**, atomik yazımlı bütçe sayacı

@@ -38,7 +38,7 @@ def test_create_connection_engellenir():
 
 def test_isim_cozumleme_engellenir():
     with pytest.raises(AgErisimiEngellendi):
-        socket.getaddrinfo("gateway.invalid", 443)
+        socket.getaddrinfo("ornek.invalid", 443)
 
 
 def test_httpx_gercek_istek_atamaz():

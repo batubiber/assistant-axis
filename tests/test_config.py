@@ -100,9 +100,28 @@ def test_api_key_returns_env_value(monkeypatch):
     assert config.api_key() == "secret-value"
 
 
-def test_gateway_url_targets_jailbreak_app():
-    assert config.GATEWAY_BASE_URL.endswith("/Jailbreak")
+def test_gateway_url_is_https_and_env_overridable(monkeypatch):
+    """Adres ortamdan gelir; depoda kurumsal bir endpoint sabitlenmez.
+
+    Public bir depoda sabit endpoint, adreslenebilir bir hedef bildirir —
+    hangi korumaların kapalı olduğu bilgisiyle birleşince suistimal tarifi olur.
+    Bu test hem şemayı hem de ortamdan geçersiz kılınabilirliği sabitler.
+    """
     assert config.GATEWAY_BASE_URL.startswith("https://")
+    # Varsayilan, bilerek çözülemeyen bir yer tutucudur: depoda kurumsal bir
+    # endpoint sabitlenirse bu satir duser.
+    assert config.GATEWAY_BASE_URL.endswith(".invalid/app")
+
+    monkeypatch.setenv("AAX_GATEWAY_BASE_URL", "https://ornek.invalid/uygulama")
+    monkeypatch.setenv("AAX_GATEWAY_MODEL", "baska-hakem")
+    importlib.reload(config)
+    try:
+        assert config.GATEWAY_BASE_URL == "https://ornek.invalid/uygulama"
+        assert config.GATEWAY_MODEL == "baska-hakem"
+    finally:
+        monkeypatch.delenv("AAX_GATEWAY_BASE_URL", raising=False)
+        monkeypatch.delenv("AAX_GATEWAY_MODEL", raising=False)
+        importlib.reload(config)
 
 
 # --- çoklu model desteği: slug türetme, yol izolasyonu, env geçersiz kılma --

@@ -35,11 +35,17 @@ AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run python scripts/09_evaluate_steering.py
 
 B kriteri **ölçümden önce** tescillendi: [results/steering_preregistration.json](results/steering_preregistration.json).
 
-Hakem çağrıları `APP_KEY_JAILBREAK` ortam değişkeni ister. Anahtar hiçbir dosyaya yazılmaz.
+Hakem çağrıları üç ortam değişkeni ister; hiçbiri depoda sabitlenmez:
 
-## Uyarı: paylaşımlı production endpoint'i
+```bash
+export AAX_GATEWAY_BASE_URL="https://<gateway-adresiniz>/<uygulama>"
+export AAX_GATEWAY_MODEL="<hakem-model-adı>"
+export APP_KEY_JAILBREAK="<anahtar>"       # hiçbir dosyaya yazılmaz
+```
 
-Hakem, canlı uygulamalara hizmet veren paylaşımlı bir vLLM sunucusudur ve gateway'de hız sınırlama **tamamen istemci tarafındadır**. Tüm koruma `src/aax/gateway.py` içindedir: endpoint başına paylaşımlı 1 istek/sn, süreçler arası kilitli ve atomik yazımlı bütçe sayacı, **global 1500 gönderim tavanı**, devre kesici, içerik cache'i. Dışarı giden her çağrı oradan geçer.
+## Uyarı: paylaşımlı endpoint
+
+Hakem, paylaşımlı bir çıkarım sunucusudur ve hız sınırlama **tamamen istemci tarafındadır**. Bu yüzden tüm koruma `src/aax/gateway.py` içindedir: endpoint başına paylaşımlı 1 istek/sn, süreçler arası kilitli ve atomik yazımlı bütçe sayacı, **global 1500 gönderim tavanı**, devre kesici, içerik cache'i. Dışarı giden her çağrı oradan geçer.
 
 ## Çıkış kodları
 

@@ -67,12 +67,11 @@ sonuçlarının alındığı derinlik (Bölüm 2.1.2).
 Bu uygulama seçildi çünkü **T3 kimlik promptu enjeksiyonu kapalı** ve prompt refiner yok
 (`llm-gateway/README.md`, kapasite tablosu) — hakem promptlarımıza müdahale edilmiyor.
 
-Anahtar: `APP_KEY_JAILBREAK` ortam değişkeninden okunur. Anahtar dağıtım-ortamı'deki deploy `.env`'inde;
-yerel `llm-gateway/.env` kopyasında **yok**. Repo'ya hiçbir koşulda yazılmaz.
+Anahtar: `APP_KEY_JAILBREAK` ortam değişkeninden okunur. Anahtar dağıtım ortamının kendi `.env` dosyasındadır;
+yerel bir kopyası tutulmaz. Repo'ya hiçbir koşulda yazılmaz.
 
-**Kritik kısıt:** `hakem-llm` paylaşımlı bir production sunucusudur (vLLM, paylaşımlı, tüm
-gateway uygulamaları aynı backend'i kullanır). Hız sınırlama **istemci tarafındadır** —
-hız sınırlama tamamen istemci tarafındadır, yani bizdedir.
+**Kritik kısıt:** hakem **paylaşımlı bir sunucudur** ve hız sınırlama tamamen
+istemci tarafındadır, yani bizdedir.
 
 ## 4. Mimari
 
@@ -126,9 +125,9 @@ assistant-axis/                     # kendi git repo'su (nested; ev dizini repo'
 
 **Çoklu model desteği (2026-08-10).** İkinci bir hedef modelle (ör. `Qwen/Qwen3-0.6B`) aynı
 pipeline'ı koşmak birinci modelin sonuçlarını EZMEMELİ. Bu yüzden model BAĞIMLI her artefakt
-(yukarıdaki liste) `<slug>` ile anahtarlanan bir alt dizine yazılır — `<slug>`, `config.model_slug()`
+(yukarıdaki liste) `<slug>` ile anahtarlanan bir alt dizine yazılır — `<slug>`, `config.model_slug`
 ile hedef model id'sinden türetilir (`"Qwen/Qwen3-1.7B"` → `"qwen3-1.7b"`: son path bileşeni,
-küçük harfe çevrilmiş). `config.model_data_dir()` ve `config.model_results_dir()` bu dizinleri
+küçük harfe çevrilmiş). `config.model_data_dir` ve `config.model_results_dir` bu dizinleri
 verir; her script bunları `config.DATA_DIR`/`config.RESULTS_DIR` yerine kullanır. Model BAĞIMSIZ
 artefaktlar (rol kataloğu, ortak sorular, gateway cache'i) kasıtlı olarak `<slug>`'a DOKUNMAZ —
 bunlar gateway'den üretilir, hedef modelden değil. `gateway_budget.json` da DOSYA YOLU olarak
@@ -338,7 +337,7 @@ sonuçlarda böyle raporlanır.
 > Üç düzeltme: **artımlı kalıcılık** (`probe_labels.json` her batch'ten sonra atomik yazılır —
 > `aax.rollouts.write_rollouts`'un temp-dosya + `os.replace` deseni — bir sonraki koşu diskteki
 > etiketleri yükleyip o satırları tekrar sormaz); **batch-düzeyi kapsama** (bir `JudgeParseError`
-> artık koşuyu düşürmez — `_label_batch()` batch'i önce 2 yarıya, bir yarı da başarısız olursa
+> artık koşuyu düşürmez — `_label_batch` batch'i önce 2 yarıya, bir yarı da başarısız olursa
 > tekil öğelere bölerek kurtarmaya çalışır; bölme daha AZ öğe içerdiği için FARKLI bir payload,
 > dolayısıyla FARKLI bir cache anahtarı üretir — bu yüzden basit bir retry'nin aksine hakemi
 > GERÇEKTEN yeniden sorar); ve **sınırlı maliyet** (N=10 öğelik bir batch en kötü durumda
