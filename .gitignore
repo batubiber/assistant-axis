@@ -25,3 +25,6 @@ venv/
 # Kaynak makale (4.2 MB, arXiv'den alınabilir)
 *.pdf
 .superpowers/
+
+# yerel hakem çalışma sayfaları ve etiketler; hiç commit edilmez
+work/

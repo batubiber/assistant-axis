@@ -7,14 +7,18 @@ bir sağlayıcıya, kullanıcının kendi hesabıyla gider. Bu yüzden `gateway.
 
 NEDEN GEREKLİ: çalışmanın taşıyıcı varsayımı, persona kategorilerinin doğru
 atandığıdır ve `weird_role`/`nonsensical` sınırı etkinin neredeyse tamamını
-taşır. İlk iki hakem bu sınırda ayrışıyor. Üçüncü ve
-bağımsız bir aile, ayrışmanın hangi hakeme özgü olduğunu söyler.
+taşır. İlk iki hakem bu sınırda ayrışıyor. Üçüncü ve bağımsız bir model
+ailesi, ayrışmanın hangi hakeme özgü olduğunu söyler.
+
+SAĞLAYICI: herhangi bir OpenAI uyumlu chat/completions ucu. Model adı ve uç
+adresi ortamdan gelir; depoda hiçbir sağlayıcı veya model adı sabitlenmez.
 
 KÖRLÜK: bu script yalnız çalışma sayfasını (soru + yanıt) okur. Diğer
 hakemlerin etiketlerini ne okur ne de erişebilir.
 
 Kullanım:
-    export OPENAI_API_KEY="..."
+    export AAX_JUDGE3_API_KEY="..."            # hiçbir dosyaya yazılmaz
+    export AAX_JUDGE3_BASE_URL="https://..."    # isteğe bağlı; boşsa SDK varsayılanı
     uv run --with openai python scripts/11_third_judge.py --model <model-adi>
     uv run --with openai python scripts/11_third_judge.py --model <model-adi> --dry-run
 """
@@ -86,7 +90,7 @@ def cikar_json(ham: str) -> list:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True,
-                    help="Kullanılacak OpenAI modeli (hesabınızda erişiminiz olan bir ad)")
+                    help="Uçta erişiminiz olan model adı (depoda sabitlenmez)")
     ap.add_argument("--batch-size", type=int, default=10)
     ap.add_argument("--max-calls", type=int, default=40,
                     help="Sert tavan; aşılırsa koşu durur")
@@ -119,9 +123,10 @@ def main(argv: list[str] | None = None) -> int:
         print("Kuru koşu — istek atılmadı.")
         return 0
 
-    if not os.environ.get("OPENAI_API_KEY"):
-        print("BAŞARISIZ: OPENAI_API_KEY tanımlı değil.\n"
-              "  export OPENAI_API_KEY='...' ile tanımlayın; bu script anahtarı "
+    anahtar = os.environ.get("AAX_JUDGE3_API_KEY")
+    if not anahtar:
+        print("BAŞARISIZ: AAX_JUDGE3_API_KEY tanımlı değil.\n"
+              "  export AAX_JUDGE3_API_KEY='...' ile tanımlayın; bu script anahtarı "
               "hiçbir dosyaya yazmaz.", file=sys.stderr)
         return 2
     try:
@@ -131,7 +136,8 @@ def main(argv: list[str] | None = None) -> int:
               "`uv run --with openai python ...` ile çalıştırın.", file=sys.stderr)
         return 2
 
-    client = OpenAI(timeout=args.timeout)
+    client = OpenAI(api_key=anahtar, base_url=os.environ.get("AAX_JUDGE3_BASE_URL") or None,
+                    timeout=args.timeout)
     CIKTI.parent.mkdir(parents=True, exist_ok=True)
     etiketler: dict[int, str] = {}
     if CIKTI.exists():   # devam edilebilirlik: kesilen koşu baştan başlamaz
