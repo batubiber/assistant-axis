@@ -373,6 +373,12 @@ Aynı sınıflar tekrarladı, ama üçü yeni ve hepsi "sessizce yanlış bilim 
 
 **Deponun kendi dersini almamış olması.** Sweep script'i 3500 üretimi bellekte biriktirip sonda bir kez yazıyordu; 3400'de bir CUDA OOM 1.5 saati kaybettirirdi. Oysa aynı depoda, plandan **önceki** bir commit'te, 2000 etiketlik bir geçişi 1182'de kaybeden aynı hata zaten artımlı kalıcılıkla çözülmüştü. Plan o dersi taşımamıştı. Şimdi her 100 üretimde atomik yazım var — ve gerçek koşuda da işe yaradı: hakem bir batch'te uzunluk uyuşmazlığı verdi, böl-ve-kurtar devreye girdi, koşu durmadı.
 
+### Yazım aşamasında çıkanlar
+
+Blog yazısı da aynı inceleme disiplininden geçti ve bir hata çıktı. Taslakta "aynı rol ve aynı soru için iki uçtaki yanıtlar" diye sunulan alıntı çifti, gerçek model çıktılarından oluşuyordu; ancak ikinci alıntı başka bir sorudan ve üzerine yazılmış bir koşudan geliyordu. Uydurulan metin değil, **eşleştirmeydi**; bir replikasyon yazısında ikisi arasında fark yoktur. Olgu kontrolü yakaladı, çift sweep artefaktından doğrulanmış bir çiftle değiştirildi.
+
+Blogun önceki taslağında yer alan metodolojik not bölümü kurumsal yayın kaydına uymadığı için kaldırıldı; içeriği bu bölümde tutuluyor.
+
 ---
 
 ## 8. Sınırlamalar ve confound'lar
