@@ -25,7 +25,7 @@
 | Katman taraması | `results/models/<slug>/axis/layer_sweep.json` |
 | Ölçek karşılaştırması | `results/scale_comparison.json` |
 
-**Ön-tesciller** — üçü de ilgili koddan ve ölçümden önce commit'lendi:
+**Ön kayıtlar** (pre-registration) — üçü de ilgili koddan ve ölçümden önce commit'lendi:
 [`scale_hypothesis`](results/scale_hypothesis_preregistration.json) ·
 [`steering`](results/steering_preregistration.json) ·
 [`control`](results/control_preregistration.json)
