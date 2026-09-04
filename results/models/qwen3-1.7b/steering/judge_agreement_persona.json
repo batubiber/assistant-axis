@@ -1,56 +1,128 @@
 {
-  "amac": "Persona rubriginin tasiyici varsayimini olcmek: iki BAGIMSIZ hakem ayni oGeleri ayni sekilde mi etiketliyor?",
+  "amac": "Persona rubriginin tasiyici varsayimini olcmek: UC BAGIMSIZ hakem ayni ogeleri ayni sekilde mi etiketliyor?",
   "tarih": "2026-09-04",
-  "hakem_1": "hakem-1 (calismanin tum etiketlerini ureten hakem)",
-  "hakem_2": "hakem-2 (farkli model ailesi, ayni rubrik, KOR)",
-  "korluk": "hakem-1 etiketleri etiketleyicilerin calisma dizininden fiziksel olarak cikarildi; dort dilim ayri ve kor etiketlendi.",
+  "esik_puan": 25,
+  "hakemler": {
+    "hakem1": "hakem-1 (calismanin tum etiketlerini ureten hakem, temperature=0)",
+    "hakem2": "hakem-2 (kor, dort ayri dilim)",
+    "hakem3": "hakem-3 (kor; etiketleri belirlenimci degil)"
+  },
+  "korluk": "hakem-1 etiketleri etiketleyicilerin calisma dizininden fiziksel olarak cikarildi. Ucu de ayni rubrigi (persona_judge._RUBRIC) gordu.",
   "ornek": {
     "n": 210,
     "tabakalama": "14 hucrenin her birinden 15 oge (eksen sweep'i, L14 ve L19, yedi guc)"
   },
-  "uyum": {
-    "tam_kategori": {
-      "oran": 0.819,
-      "cohen_kappa": 0.726
+  "kategori_dagilimi": {
+    "hakem1": {
+      "assistant": 109,
+      "human_role": 23,
+      "nonhuman_role": 18,
+      "weird_role": 50,
+      "ambiguous": 1,
+      "other": 0,
+      "nonsensical": 9
     },
-    "kriterin_kullandigi_ikili": {
-      "oran": 0.9,
-      "cohen_kappa": 0.794,
-      "assistant_disi_orani": {
-        "hakem_1": 0.433,
-        "hakem_2": 0.39
-      }
+    "hakem2": {
+      "assistant": 108,
+      "human_role": 24,
+      "nonhuman_role": 13,
+      "weird_role": 45,
+      "ambiguous": 5,
+      "other": 0,
+      "nonsensical": 15
+    },
+    "hakem3": {
+      "assistant": 103,
+      "human_role": 23,
+      "nonhuman_role": 24,
+      "weird_role": 19,
+      "ambiguous": 10,
+      "other": 23,
+      "nonsensical": 8
     }
   },
-  "ayrisma_nerede": {
-    "sinir": "weird_role / nonsensical",
-    "gozlem": "Hakem 2 daha kati: hakem 1'in weird_role dedigi 6 oGeyi nonsensical saydi; ters yonde HIC kayma yok.",
-    "yogunlasma": "6 kaymanin 5'i L14 @ -0.6 hucresinde, yani en uc steering'de",
-    "uyari": "Hucre basina n=15; L14@-0.6 icin %95 Wilson araliklari genis ortusuyor ([0.70,0.99] ve [0.36,0.80]). Bu ornek hucre duzeyinde farki cozemez."
+  "uyum": {
+    "ikili_tam_kategori": {
+      "hakem1_vs_hakem2": [
+        0.819,
+        0.726
+      ],
+      "hakem1_vs_hakem3": [
+        0.705,
+        0.578
+      ],
+      "hakem2_vs_hakem3": [
+        0.738,
+        0.628
+      ]
+    },
+    "ikili_kriter_ikilisi": {
+      "hakem1_vs_hakem2": [
+        0.9,
+        0.794
+      ],
+      "hakem1_vs_hakem3": [
+        0.843,
+        0.669
+      ],
+      "hakem2_vs_hakem3": [
+        0.838,
+        0.648
+      ]
+    },
+    "fleiss_kappa_uc_hakem_ikili": 0.703
   },
-  "duyarlilik_analizi": {
-    "yontem": "Hakem 2'nin kayma oranlari (Assistant-disindan cikis %16.5, girisi %5.0) tam olcume (n=250) uygulandi.",
-    "cikis_orani": 0.165,
-    "giris_orani": 0.05,
-    "sonuc": {
-      "14": {
-        "hakem1_delta": 48.4,
-        "hakem2_delta": 38.0,
-        "hakem1_karar": "GECTI",
-        "hakem2_karar": "GECTI"
+  "ayrisma_nerede": {
+    "hakem1_weird_role_50_oge_digerlerinde": {
+      "hakem2": {
+        "weird_role": 38,
+        "nonsensical": 6,
+        "nonhuman_role": 3,
+        "ambiguous": 1,
+        "human_role": 2
       },
-      "19": {
-        "hakem1_delta": 48.0,
-        "hakem2_delta": 37.7,
-        "hakem1_karar": "GECTI",
-        "hakem2_karar": "GECTI"
+      "hakem3": {
+        "other": 19,
+        "weird_role": 17,
+        "nonhuman_role": 12,
+        "ambiguous": 1,
+        "assistant": 1
       }
     },
-    "yorum": "Kriter bir FARK olcuyor; sistematik hakem seviyesi farki iki hucrede de ayni yonde etki ettigi icin buyuk olcude sadelesiyor. Karar 25 puanlik esigin uzerinde kaliyor."
+    "yorum": "Ayrisma weird_role'un SINIRINDA yogunlasiyor ama iki hakem farkli yone kaciyor: hakem-2 nonsensical'a, hakem-3 other'a. `other` diger iki hakemin HIC kullanmadigi bir kategori (0 ve 0) ve Assistant-disi sayilmiyor."
+  },
+  "duyarlilik_analizi": {
+    "yontem": "Her hakemin hakem1'e gore kayma oranlari tam olcume (n=250) uygulandi.",
+    "sonuc": {
+      "hakem1": {
+        "L14": 48.4,
+        "L19": 48.0
+      },
+      "hakem2": {
+        "cikis_orani": 0.165,
+        "giris_orani": 0.05,
+        "L14": 38.0,
+        "L19": 37.7
+      },
+      "hakem3": {
+        "cikis_orani": 0.319,
+        "giris_orani": 0.034,
+        "L14": 31.3,
+        "L19": 31.1
+      },
+      "cogunluk_2_of_3": {
+        "cikis_orani": 0.088,
+        "giris_orani": 0.017,
+        "L14": 43.3,
+        "L19": 43.0
+      }
+    },
+    "yorum": "Karar UC hakemin da altinda ve 2/3 cogunluk altinda esigin ustunde kaliyor. Ama PAY hakeme bagli: hakem-1'de 23 puan, en kati hakemde (hakem-3) 6 puan."
   },
   "sinirlar": [
-    "Insan dogrulamasi DEGIL; iki dil modeli arasindaki uyum.",
+    "Insan dogrulamasi DEGIL; uc dil modeli arasindaki uyum.",
     "n=210, hucre basina 15 — hucre duzeyinde kesin degil.",
+    "hakem3 belirlenimci degil; tekrar kosumda birkac etiket oynayabilir.",
     "Kontrol yonu sweep'leri bu ornekleme dahil edilmedi."
   ]
 }
