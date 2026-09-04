@@ -1,0 +1,56 @@
+{
+  "amac": "Persona rubriginin tasiyici varsayimini olcmek: iki BAGIMSIZ hakem ayni oGeleri ayni sekilde mi etiketliyor?",
+  "tarih": "2026-09-04",
+  "hakem_1": "hakem-1 (calismanin tum etiketlerini ureten hakem)",
+  "hakem_2": "hakem-2 (farkli model ailesi, ayni rubrik, KOR)",
+  "korluk": "hakem-1 etiketleri etiketleyicilerin calisma dizininden fiziksel olarak cikarildi; dort dilim ayri ve kor etiketlendi.",
+  "ornek": {
+    "n": 210,
+    "tabakalama": "14 hucrenin her birinden 15 oge (eksen sweep'i, L14 ve L19, yedi guc)"
+  },
+  "uyum": {
+    "tam_kategori": {
+      "oran": 0.819,
+      "cohen_kappa": 0.726
+    },
+    "kriterin_kullandigi_ikili": {
+      "oran": 0.9,
+      "cohen_kappa": 0.794,
+      "assistant_disi_orani": {
+        "hakem_1": 0.433,
+        "hakem_2": 0.39
+      }
+    }
+  },
+  "ayrisma_nerede": {
+    "sinir": "weird_role / nonsensical",
+    "gozlem": "Hakem 2 daha kati: hakem 1'in weird_role dedigi 6 oGeyi nonsensical saydi; ters yonde HIC kayma yok.",
+    "yogunlasma": "6 kaymanin 5'i L14 @ -0.6 hucresinde, yani en uc steering'de",
+    "uyari": "Hucre basina n=15; L14@-0.6 icin %95 Wilson araliklari genis ortusuyor ([0.70,0.99] ve [0.36,0.80]). Bu ornek hucre duzeyinde farki cozemez."
+  },
+  "duyarlilik_analizi": {
+    "yontem": "Hakem 2'nin kayma oranlari (Assistant-disindan cikis %16.5, girisi %5.0) tam olcume (n=250) uygulandi.",
+    "cikis_orani": 0.165,
+    "giris_orani": 0.05,
+    "sonuc": {
+      "14": {
+        "hakem1_delta": 48.4,
+        "hakem2_delta": 38.0,
+        "hakem1_karar": "GECTI",
+        "hakem2_karar": "GECTI"
+      },
+      "19": {
+        "hakem1_delta": 48.0,
+        "hakem2_delta": 37.7,
+        "hakem1_karar": "GECTI",
+        "hakem2_karar": "GECTI"
+      }
+    },
+    "yorum": "Kriter bir FARK olcuyor; sistematik hakem seviyesi farki iki hucrede de ayni yonde etki ettigi icin buyuk olcude sadelesiyor. Karar 25 puanlik esigin uzerinde kaliyor."
+  },
+  "sinirlar": [
+    "Insan dogrulamasi DEGIL; iki dil modeli arasindaki uyum.",
+    "n=210, hucre basina 15 — hucre duzeyinde kesin degil.",
+    "Kontrol yonu sweep'leri bu ornekleme dahil edilmedi."
+  ]
+}
