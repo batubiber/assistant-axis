@@ -139,10 +139,22 @@ def main(argv: list[str] | None = None) -> int:
             continue
         cagri += 1
         try:
-            yanit = client.chat.completions.create(
-                model=args.model, temperature=0,
-                messages=[{"role": "user", "content": prompt_kur(bekleyen)}],
-            )
+            mesajlar = [{"role": "user", "content": prompt_kur(bekleyen)}]
+            try:
+                # Deterministiklik icin temperature=0 tercih edilir.
+                yanit = client.chat.completions.create(
+                    model=args.model, temperature=0, messages=mesajlar)
+            except Exception as exc:                  # noqa: BLE001
+                # Bazi yeni nesil modeller `temperature`'i reddeder. Bu durumda
+                # parametresiz tekrar dene; reddin baska bir sebebi varsa asagidaki
+                # genel yakalayici zaten devreye girer.
+                if "temperature" not in str(exc).lower():
+                    raise
+                if pi == 1:
+                    print("  not: model `temperature` kabul etmiyor, parametresiz "
+                          "devam ediliyor (belirlenimcilik garanti degil).")
+                yanit = client.chat.completions.create(
+                    model=args.model, messages=mesajlar)
             cikti = cikar_json(yanit.choices[0].message.content or "")
             if len(cikti) != len(bekleyen):
                 raise ValueError(f"uzunluk uyuşmazlığı: {len(cikti)} != {len(bekleyen)}")
