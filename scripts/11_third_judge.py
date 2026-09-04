@@ -91,6 +91,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-calls", type=int, default=40,
                     help="Sert tavan; aşılırsa koşu durur")
     ap.add_argument("--rps", type=float, default=0.5, help="Saniyedeki istek üst sınırı")
+    ap.add_argument("--reasoning-effort", default="low",
+                    choices=["none", "low", "medium", "high", "xhigh", "max"],
+                    help="Akıl yürütme derinliği. Sabit bir rubriğe göre sınıflandırma "
+                         "için `low` yeterlidir; yüksek seviyeler her çağrıyı "
+                         "dakikalarca uzatır ve maliyeti artırır.")
+    ap.add_argument("--timeout", type=float, default=180.0,
+                    help="İstek başına saniye cinsinden üst sınır")
     ap.add_argument("--dry-run", action="store_true",
                     help="İstek atmadan planı göster")
     args = ap.parse_args(argv)
@@ -124,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
               "`uv run --with openai python ...` ile çalıştırın.", file=sys.stderr)
         return 2
 
-    client = OpenAI()
+    client = OpenAI(timeout=args.timeout)
     CIKTI.parent.mkdir(parents=True, exist_ok=True)
     etiketler: dict[int, str] = {}
     if CIKTI.exists():   # devam edilebilirlik: kesilen koşu baştan başlamaz
@@ -140,10 +147,14 @@ def main(argv: list[str] | None = None) -> int:
         cagri += 1
         try:
             mesajlar = [{"role": "user", "content": prompt_kur(bekleyen)}]
+            ek = {}
+            if args.reasoning_effort != "none":
+                ek["reasoning_effort"] = args.reasoning_effort
+            print(f"\r  parti {pi}/{len(partiler)} gönderiliyor…", end="", flush=True)
             try:
                 # Deterministiklik icin temperature=0 tercih edilir.
                 yanit = client.chat.completions.create(
-                    model=args.model, temperature=0, messages=mesajlar)
+                    model=args.model, temperature=0, messages=mesajlar, **ek)
             except Exception as exc:                  # noqa: BLE001
                 # Bazi yeni nesil modeller `temperature`'i reddeder. Bu durumda
                 # parametresiz tekrar dene; reddin baska bir sebebi varsa asagidaki
@@ -153,8 +164,15 @@ def main(argv: list[str] | None = None) -> int:
                 if pi == 1:
                     print("  not: model `temperature` kabul etmiyor, parametresiz "
                           "devam ediliyor (belirlenimcilik garanti degil).")
-                yanit = client.chat.completions.create(
-                    model=args.model, messages=mesajlar)
+                try:
+                    yanit = client.chat.completions.create(
+                        model=args.model, messages=mesajlar, **ek)
+                except Exception as exc2:             # noqa: BLE001
+                    # Model `reasoning_effort`'u da kabul etmiyorsa onu da birak.
+                    if "reasoning" not in str(exc2).lower() or not ek:
+                        raise
+                    yanit = client.chat.completions.create(
+                        model=args.model, messages=mesajlar)
             cikti = cikar_json(yanit.choices[0].message.content or "")
             if len(cikti) != len(bekleyen):
                 raise ValueError(f"uzunluk uyuşmazlığı: {len(cikti)} != {len(bekleyen)}")
@@ -162,6 +180,15 @@ def main(argv: list[str] | None = None) -> int:
                 if k not in KATEGORILER:
                     raise ValueError(f"bilinmeyen kategori: {k!r}")
                 etiketler[o["sid"]] = k
+        except KeyboardInterrupt:
+            # `except Exception` bunu yakalamaz; yakalanmazsa o ana kadarki
+            # etiketler diske hic yazilmadan kaybolur.
+            CIKTI.write_text(json.dumps(
+                {"model": args.model, "etiketler": {str(k): v for k, v in etiketler.items()}},
+                ensure_ascii=False, indent=1), encoding="utf-8")
+            print(f"\nKESİLDİ — {len(etiketler)} etiket diske yazıldı. "
+                  f"Tekrar çalıştırınca kaldığı yerden devam eder.", file=sys.stderr)
+            return 2
         except Exception as exc:                      # noqa: BLE001
             print(f"\nBAŞARISIZ (parti {pi}): {type(exc).__name__}: {exc}\n"
                   f"  {len(etiketler)} etiket diske yazıldı; tekrar çalıştırınca "
