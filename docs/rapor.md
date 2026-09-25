@@ -20,15 +20,16 @@ Bu çalışma o yapının **1.7B ve 0.6B ölçeğinde** de var olup olmadığın
 | `\|cos(PC1, kontrast vektörü)\|`, her katmanda | 0.79 – 0.96 | 0.91 – 0.95 | güçlü |
 | PC1 varyans oranı | %60.3 | %51.1 | düşük boyutlu |
 | %70 varyans için bileşen sayısı | 2 | 3 | 4-19 |
-| Orta katmanda default persentili | **0.425** | **0.839** | uç noktada |
-| Persentilin derinlikle davranışı | **düz** (0.35-0.49) | artıyor (0.72 → 0.98) | — |
-| Uç desile giren ilk katman | **yok** | L19 (göreli 0.679) | orta katman |
-| **Önceden tescillenmiş A kriteri** | **DÜŞTÜ** | **DÜŞTÜ** | (geçer) |
+| Orta katmanda default persentili | **0.425** | **0.839** | raporlanmıyor (sıra ölçütü yok) |
+| Orta katmanda asistan ucuna aralık uzaklığı (makalenin ölçüsü, §5.3) | 0.13 | 0.05 | 0.03 (model ayrımı yok) |
+| Persentilin derinlikle davranışı | **düz** (0.35-0.49) | genel olarak artıyor (0.72 → 0.98; L27'de 0.87) | — |
+| Uç desile giren ilk katman | **yok** | L19 (göreli 0.679) | desil kullanılmıyor |
+| **Önceden tescillenmiş A kriteri** | **DÜŞTÜ** | **DÜŞTÜ** | uygulanmadı |
 
 Kriter iki modelde de düştü, ama düşme *biçimleri* farklı ve aradaki fark bulgunun kendisi:
 
 ```
-0.6B  →  varsayılan persona uzayının ORTASINDA; hiçbir derinlikte uca yaklaşmıyor
+0.6B  →  varsayılan rol sıralamasının ORTASINDA; hiçbir derinlikte uç desile yaklaşmıyor
 1.7B  →  derinlikle uca doğru kayıyor; L19'da uç desile giriyor
 27B+  →  orta katmanda zaten uçta (makale oradan ölçüyor ve çalışıyor)
 ```
@@ -37,10 +38,10 @@ Kriter iki modelde de düştü, ama düşme *biçimleri* farklı ve aradaki fark
 
 | | A kriteri (gözlemsel) | B kriteri (nedensel) |
 |---|---|---|
-| L14 (orta katman) | **DÜŞTÜ** — varsayılan uçta değil (persentil 0.839) | **GEÇTİ** — en güçlü etki (−0.6'da Assistant %0.4'e iniyor) |
+| L14 (orta katman) | **DÜŞTÜ** — varsayılan uçta değil (persentil 0.839) | **GEÇTİ** — iki katmandan daha güçlü etki (−0.6'da Assistant %0.4'e iniyor) |
 | L19 | (uç desile giren ilk katman) | **GEÇTİ** — ama daha az duyarlı (−0.6'da Assistant %7.6) |
 
-Yani **varsayılanın eksende uçta durduğu katman ile o eksenden müdahalenin en iyi çalıştığı katman aynı değil.** Gözlemsel uç-noktalık, müdahale kolu olarak yararlılığın ne gerek ne de yeter şartı. Bunu ancak iki katmanda birden ölçtüğümüz için görebildik.
+Yani **ölçülen iki katmanda, varsayılanın eksende uçta durduğu katman (L19) ile o eksenden müdahalenin ara güçlerde daha güçlü etki verdiği katman (L14) aynı değil.** Bu veride gözlemsel uç-noktalık, müdahale kolu olarak yararlılığın gerek şartı olmadı ve hangi katmanın daha etkili olacağını da öngörmedi. (Yeter şart olmadığı söylenemez: L19 hem uçta duruyor hem B kriterini +48.0 puanla geçiyor.) Bunu ancak iki katmanda birden ölçtüğümüz için görebildik.
 
 **Ve etki eksene özgü.** Ayrı bir ön-tescille üç kontrol yönü ölçüldü — aynı büyüklükte rastgele bir yön, eksenin koordinat profilini birebir koruyup yönünü bozan bir yön, ve rol vektörlerinin aynı alt uzayında eksene dik bir yön. Üçünün de artışı **negatif** (−14.8, −3.6, −25.7 puan); hiçbiri 25 puanlık eşiğe yaklaşmadı. Dahası, eksen −0.6'da %94 Assistant-dışı üretirken `nonsensical` yalnızca %4.8; aynı alt uzaydaki dik yön ise %28.9 çöp üretiyor — yani eksen boyunca hareket, komşusuna kıyasla modeli çok daha az bozuyor. (Tek katman, tek güç, tek tohum — sınırları §5.5 ve §8'de.)
 
@@ -54,17 +55,19 @@ Sonuca göre kriter ayarlamayı engellemek için **A kriteri deney başlamadan s
 
 > Orta katmanda `|cos(PC1, kontrast vektörü)| > 0.6` **ve** varsayılan Assistant projeksiyonu rol projeksiyonlarının uç desilinde.
 
+Uç desil koşulu makalenin değil, bu replikasyonun kendi sıra temelli ölçütüdür. Makale varsayılanın konumunu rol izdüşümlerinin aralığındaki göreli konumla raporlar; aynı ölçünün iki modeldeki değerleri §5.3'te.
+
 İki koşul **bağlıdır**: `cos` pozitifse üst desil, negatifse alt desil aranır. SVD'nin işareti keyfî olduğu için büyüklük üzerinden değerlendirilir, ama yön bilgisi kaybedilmez. (Bu bağlama, kod ilk yazıldığında yoktu; iki koşul bağımsız test ediliyordu ve geçme bölgesinin yarısı hipotezin *aleyhine* kanıttı. İnceleme yakaladı, sahibi kararıyla düzeltildi ve spec güncellendi.)
 
 İkinci deney — ölçek karşılaştırması — de **sonuç görülmeden** tescillendi (`results/scale_hypothesis_preregistration.json`).
 
-**B kriteri** (Aşama 4) aynı disiplinle, koddan ve ölçümden önce tescillendi (`results/steering_preregistration.json`, commit `1c934ef`):
+**B kriteri** (Aşama 4) ölçümden önce tescillendi (`results/steering_preregistration.json`, commit `caf2800`). Sıra git geçmişinden denetlenebilir: ön-tescil, B kriterini hesaplayan kod (`718fa2e`) ve sweep script'i (`d074cf6`) commit'lendikten sonra, ölçümden (`ae2cbda`) önce commit'lendi. Kriterin 25 puanlık eşiği ise tasarım belgesinde (Bölüm 7) koddan önce sabitlenmişti:
 
 > En negatif güçteki Assistant-dışı persona oranı, steering'siz (0.0) orandan en az **25 puan** yüksek olmalı. Assistant-dışı = `human_role + nonhuman_role + weird_role`. Katman başına ayrı değerlendirilir.
 
 Üç sonuç için üç ayrı tahmin yazıldı: eksen nedenselse ikisi de geçer *ve L19'daki etki daha büyük olur*; etki derinliğe bağlıysa L19 geçer L14 düşer; eksen nedensel değilse ikisi de düşer.
 
-Ön-tescil bir kez **düzeltildi** (`c9f81b7`), yine ölçümden önce: ilk hâlinde duman koşusundan aktarılan "−0.6'da yanıtlar yinelemeye düşüyor" gözlemi vardı ve bu **yanlıştı**. 105 yanıtın tamamı ölçüldüğünde hiçbir güçte çözülme bulunmadı. Yanlış satırlar silinmedi, üzerine `DUZELTME` alanı eklendi — kayıt ancak böyle dürüst kalır. Eşik, taban ve iki katmanlı kurulum değiştirilmedi.
+Ön-tescil bir kez **düzeltildi** (`10702fd`), yine ölçümden önce: ilk hâlinde duman koşusundan aktarılan "−0.6'da yanıtlar yinelemeye düşüyor" gözlemi vardı ve bu **yanlıştı**. 105 yanıtın tamamı ölçüldüğünde hiçbir güçte çözülme bulunmadı. Yanlış satırlar silinmedi, üzerine `DUZELTME` alanı eklendi — kayıt ancak böyle dürüst kalır. Eşik, taban ve iki katmanlı kurulum değiştirilmedi.
 
 ---
 
@@ -114,7 +117,7 @@ Steering'li üretim **yalnızca HF transformers**'tadır. Hook `register_forward
 
 **GPU: RTX 4060, 8188 MiB, masaüstü ~1215 MiB kullanıyor → gerçekte ~7 GB.** Quantization yasak (aktivasyonları bozar, interp ölçümünü geçersiz kılar). Bu, hedef model seçimini doğrudan belirledi ve aktivasyon yakalamanın bellek profilini kritik hale getirdi.
 
-**Hakem: OpenAI uyumlu bir gateway'in arkasındaki bir LLM.** Bu uygulama seçildi çünkü hakem promptlarına müdahale edilmiyor — hakem promptlarına müdahale edilmiyor.
+**Hakem: paylaşımlı bir çıkarım sunucusu üzerinden erişilen bir dil modeli** (kodda `hakem-llm`, §8'de hakem-1). Bu erişim yolu, hakem promptlarını değiştirmeden ilettiği için seçildi.
 
 **Kritik kısıt:** hakem **paylaşımlı bir sunucudur**. Hız sınırlama tamamen istemci tarafındadır. Bu yüzden `src/aax/gateway.py` projedeki tek HTTP noktasıdır ve şunları kapsar:
 
@@ -144,13 +147,13 @@ default persentili   :  0.839      → >= 0.9 gerekiyordu, KALDI (0.061 farkla)
 A KRİTERİ: DÜŞTÜ
 ```
 
-PC1'in uçları makalenin Tablo 1'iyle örtüşüyor:
-- Assistant ucu: `consultant, assistant, planner, validator, specialist, researcher`
+PC1'in uçları makalenin Tablo 1'iyle örtüşüyor (her liste en uçtaki rolden başlar):
+- Assistant ucu: `researcher, specialist, validator, planner, assistant, consultant`
 - Diğer uç: `poet, leviathan, eldritch, bard, romantic, demon`
 
 Orta katmanda varsayılandan yüksek projekte olan **15 rolün tamamı** Assistant benzeri profesyonel rol (`researcher, specialist, validator, planner, assistant, consultant, evaluator, analyst, engineer, generalist, debugger, designer, facilitator, forecaster, economist`). Yani varsayılan, o kümenin *ötesinde* değil *içinde*, alt kenarında.
 
-Katman taraması: kosinüs her katmanda 0.91-0.95; persentil tekdüze artıyor ve **L19'da** (göreli derinlik 0.679) uç desile giriyor.
+Katman taraması: kosinüs her katmanda 0.91-0.95; persentil derinlikle genel olarak artıyor (L0'da 0.72, L14'te 0.84, L24'te en yüksek değer 0.98), ancak tekdüze değil: L17, L21 ve L25'te küçük geri dönüşler var. **L19'da** (göreli derinlik 0.679) uç desile giriyor, L19-L26 arasında uç desilde kalıyor ve son katmanda 0.87'ye geriliyor.
 
 ### 5.2 Qwen3-0.6B
 
@@ -164,25 +167,32 @@ default persentili   :  0.425      → <= 0.1 gerekiyordu (cos negatif), KALDI
 A KRİTERİ: DÜŞTÜ
 ```
 
-PC1'in uçları yine tutarlı:
+PC1'in uçları yine tutarlı (her liste en uçtaki rolden başlar):
 - Assistant ucu: `specialist, researcher, forecaster, planner, economist, validator`
-- Diğer uç: `wind, pirate, wraith, leviathan, revenant, eldritch`
+- Diğer uç: `eldritch, revenant, leviathan, wraith, pirate, wind`
 
 Katman taraması: kosinüs 0.79-0.96 (derinlikle hafif artıyor; en düşük değer L2'de 0.795), **persentil her derinlikte 0.35-0.49 arasında düz**. Hiçbir katman geçmiyor.
 
 ### 5.3 Ölçek karşılaştırması — asıl bulgu
 
-Eksenin kendisi — Assistant benzeri rolleri teatral rollerden ayıran yön — **iki ölçekte de, her derinlikte** güçlü biçimde mevcut. Kosinüs 56 katman ölçümünün tamamında 0.79'un üstünde; en düşük değer 0.6B'nin L2'sinde 0.795, medyan ikisinde de 0.9'un üzerinde. PC1'in semantik uçları iki modelde de makalenin bulduğu ayrımı yeniden üretiyor.
+Eksenin kendisi — Assistant benzeri rolleri teatral rollerden ayıran yön — **iki ölçekte de, her derinlikte** güçlü biçimde mevcut. Kosinüs 56 katman ölçümünün tamamında 0.79'un üstünde; en düşük değer 0.6B'nin L2'sinde 0.795, medyan 1.7B'de 0.94, 0.6B'de 0.87. PC1'in semantik uçları iki modelde de makalenin bulduğu ayrımı yeniden üretiyor.
 
 Ölçeğe bağlı olan şey **varsayılan Assistant'ın o eksen üzerindeki konumu**:
 
-- **0.6B**: persentil ~0.42, derinlikten bağımsız. Varsayılan, persona uzayının ortasında duruyor. Derinlik arttıkça uca doğru bir eğilim bile yok.
-- **1.7B**: persentil derinlikle tekdüze artıyor (0.72 → 0.98) ve L19'da uca giriyor.
+- **0.6B**: persentil ~0.42, derinlikten bağımsız. Varsayılan, rol sıralamasının ortasında duruyor. Derinlik arttıkça uç desile doğru bir eğilim bile yok.
+- **1.7B**: persentil derinlikle genel olarak artıyor (0.72 → 0.98, küçük geri dönüşlerle; son katmanda 0.87) ve L19'da uç desile giriyor.
 - **27-70B (makale)**: orta katmanda zaten uçta.
 
 Ön-tescil "küçük modelde **daha geç** konsolide olur" demişti. Yön tuttu (0.425 < 0.839) ama **mekanizma farklı çıktı**: 0.6B'de konsolidasyon geç olmuyor, *hiç olmuyor*. Ön-tescilin üçüncü ihtimali ("eksen o ölçekte hiç oluşmayabilir") gerçekleşmedi — eksen oluşuyor, varsayılanın konumu farklı.
 
-`results/scale_comparison.json`, `results/models/<slug>/axis/layer_sweep.json`.
+**Makalenin kendi ölçüsüyle.** Makale (§2.3.1) varsayılan aktivasyonun PC1 izdüşümünü, rol izdüşümlerinin en küçüğü (0) ile en büyüğü (1) arasındaki göreli konumla ölçer ve orta katmanda herhangi bir uca en küçük uzaklığı, model ayrımı vermeden, 0.03 olarak raporlar. Aynı aralık ölçüsü iki modelde her katmanda hesaplandı (`scripts/12_aralik_konumu.py`, `results/models/<slug>/axis/range_position.json`). İki modelde de her katmanda varsayılan rol aralığının içinde ve en yakın olduğu uç asistan ucu:
+
+- **1.7B**: L14'te asistan ucuna uzaklık 0.05, L19'da 0.034; L20-L27 arasında her katmanda 0.03'ün altında, en küçük değer L24'te 0.017.
+- **0.6B**: L14'te 0.13; en yakın olduğu L10'da bile 0.11. Hiçbir katmanda 0.03'e yaklaşmıyor.
+
+İki ölçü 0.6B'de belirgin biçimde ayrışıyor: sıra persentili 0.425 (80 rolün 34'ü varsayılandan daha asistan tarafında), aralık uzaklığı 0.13. Asistan benzeri roller asistan ucunda sıkışık, karşı uç (`eldritch`, `leviathan`) uzun bir kuyruk; varsayılan sıra olarak ortada, geometrik olarak aralığın asistan ucundaki %13'lük kesiminde. Aralık ölçüsü her uçtaki tek role bağlı ve buradaki rol vektörü sayısı (93 ve 80) makaledekinin (377 ile 463) dörtte birinden az; bu yüzden değerler makaleninkiyle yan yana verilir, birebir karşılaştırılmaz. Varsayılan ortalaması yalnız yerel `data/` ile yeniden hesaplanabilir; `range_position.json` katman başına izdüşümleri (varsayılan, rol en küçüğü ve en büyüğü) denetlenebilir kanıt olarak taşır.
+
+`results/scale_comparison.json`, `results/models/<slug>/axis/layer_sweep.json`, `results/models/<slug>/axis/range_position.json`.
 
 ### 5.4 Aşama 4 — steering nedensel mi? (B kriteri)
 
@@ -225,8 +235,8 @@ En kritik confound buydu: oran, model *role geçtiği* için mi yükseliyor, yok
 
 Üç şey birden okunuyor:
 
-1. **`assistant` tekdüze çöküyor** — %72.4'ten %0.4'e. Aşama 3'te "varsayılan uçta değil" dediğimiz katmanda, o eksenden itince varsayılan persona neredeyse tamamen kayboluyor.
-2. **Yükü `weird_role` taşıyor** — %0.0'dan %80.8'e. Artışın tamamına yakını bu kategoriden geliyor.
+1. **`assistant` tekdüze çöküyor** — steering'siz tabanda (0.0) %51.2, en uç güçte (−0.6) %0.4; varsayılana doğru en uç güçte (+0.3) %72.4. Aşama 3'te "varsayılan uçta değil" dediğimiz katmanda, o eksenden itince varsayılan persona neredeyse tamamen kayboluyor.
+2. **Yükü `weird_role` taşıyor** — 0.0'da %4.8'den −0.6'da %80.8'e (+76.0 puan). Assistant-dışı oranın net artışı +48.4 puan olduğundan artışın tamamı bu kategoriden geliyor; diğer iki Assistant-dışı kategori aynı aralıkta azalıyor.
 3. **`human_role` ve `nonhuman_role` güçlü steering'de AZALIYOR** (%22.4→%7.2, %18.4→%6.0). Eksen modeli "insan rolü oynamaya" itmiyor; spesifik olarak teatral/ezoterik kayda itiyor. Bu, makalenin `weird_role` tanımıyla birebir örtüşüyor: *bir boşluk ya da kadim bir varlık ağzından, ama hâlâ dijital/makinemsi olana işaret eden.*
 
 Somut örnek — sweep'in kendisinden, aynı rol (`assistant`), aynı katman (L14), aynı soru (*"Are you a large language model?"*), iki uçta:
@@ -245,7 +255,7 @@ Somut örnek — sweep'in kendisinden, aynı rol (`assistant`), aynı katman (L1
 
 Üç tahminden en yakını birincisiydi — *"eksen nedenselse her iki katmanda da B geçer"* — ve geçti. Ama o tahminin alt iddiası **"L19'daki etki L14'tekinden BÜYÜK olur, çünkü eksen orada varsayılanı daha iyi ayırt ediyor"** idi. Bu **yanlış çıktı**, üstelik ters yönde.
 
-Ön-tescilli delta metriğinde iki katman eşit (48.4 vs 48.0). Ama bu eşitlik bir tesadüf: L14'ün tabanı daha yüksek (0.456 vs 0.416) ve tavana daha yakın doyuyor. Metriğin dışına bakıldığında L14 her okumada daha duyarlı:
+Ön-tescilli delta metriğinde iki katman eşit (48.4 vs 48.0). Bu eşitlik ara güçlerdeki duyarlılık farkını gizliyor. İki katmanın 0.0 hücreleri aynı koşulun iki ayrı örneklemidir, çünkü bu güçte eklenen vektör sıfırdır; aralarındaki 4 puanlık fark (0.456 vs 0.416, farkın standart hatası yaklaşık 4.4 puan) bir katman özelliği olarak okunamaz. Metriğin dışına bakıldığında L14 her okumada daha duyarlı:
 
 - **`assistant` kategorisi**, −0.6'da: L14'te %0.4, L19'da %7.6 — 19 kat fark
 - **Assistant-dışı oran**, −0.2'de: L14 çoktan %68.8'e çıkmış, L19 hâlâ %49.6'da
@@ -253,9 +263,11 @@ Somut örnek — sweep'in kendisinden, aynı rol (`assistant`), aynı katman (L1
 
 (İlk madde `assistant` kategorisinin payını, diğer ikisi Assistant-dışı bileşik oranı gösteriyor — iki ayrı seri.)
 
-**Bulgu bu.** A kriterinde varsayılan Assistant **L19'da** uç desile giriyordu, L14'te girmiyordu. Aşama 4 ise en güçlü nedensel kolun **L14'te** olduğunu gösteriyor. Yani:
+**Bulgu bu.** A kriterinde varsayılan Assistant **L19'da** uç desile giriyordu, L14'te girmiyordu. Aşama 4 ise ölçülen iki katmandan ara güçlerde daha güçlü etkinin **L14'te** olduğunu gösteriyor. Yani:
 
-> Bir katmanda persona ekseninde uçta durmak ile o katmandan müdahale edince persona'nın değişmesi **aynı katmanda buluşmuyor.** Gözlemsel uç-noktalık, müdahale kolu olarak yararlılığın ne gerek ne de yeter şartı.
+> Qwen3-1.7B'de ölçülen iki katmanda, varsayılanın eksende uçta durduğu katman (L19) ile steering'in ara güçlerde daha güçlü etki verdiği katman (L14) aynı değildi. Bu veride gözlemsel uç-noktalık, müdahale kolu olarak yararlılığın gerek şartı olmadı ve hangi katmanın daha etkili olacağını da öngörmedi.
+
+Yeter şart olmadığı ise bu veriden çıkmaz: L19 hem uçta duruyor hem B kriterini +48.0 puanla geçiyor.
 
 Makale bu ikisini 27-70B ölçeğinde aynı katmanda buluyor ve ayırt etmesi için bir sebep yok. 1.7B'de ayrışıyorlar. Tek katmanda ölçseydik — makalenin yaptığı gibi orta katmanda — B kriteri geçerdi ve bu ayrışmayı hiç görmezdik.
 
@@ -306,7 +318,7 @@ Kategori kırılımı, tek başına orana bakmanın yanıltacağını gösteriyo
 
 Bu son satır ekseni ayrıca güçlendiriyor. Eksen −0.6'da **%94 Assistant-dışı üretirken `nonsensical` yalnızca %4.8**; aynı alt uzayda ona dik bir yön ise %28.9 çöp üretiyor.
 
-Buradan çıkarılabilecek şeyin sınırını net çizmek gerek: bu **tek bir noktada** (L14, güç −0.6, `rolespan` için tek tohum) yapılmış bir karşılaştırma, ve tutarlılık/tutarsızlık sınırını §8'de tartışılan tek bir hakem çiziyor. Ölçülen şu: *bu* koşulda eksen, dik komşusunun altı katı daha az çöp üretiyor. "Eksen, modelin dağılmadan hareket edebildiği yöndür" daha genel bir iddia olurdu ve bu veri onu tek başına taşımaz — birden çok tohum ve birden çok güç ister.
+Buradan çıkarılabilecek şeyin sınırını net çizmek gerek: bu **tek bir noktada** (L14, güç −0.6, `rolespan` için tek tohum) yapılmış bir karşılaştırma, ve tutarlılık/tutarsızlık sınırını tek bir hakem (hakem-1) çiziyor; kontrol sweep'leri §8'deki üç hakemli uyum örneklemine dahil değil. Ölçülen şu: *bu* koşulda eksen, dik komşusunun altı katı daha az çöp üretiyor. "Eksen, modelin dağılmadan hareket edebildiği yöndür" daha genel bir iddia olurdu ve bu veri onu tek başına taşımaz — birden çok tohum ve birden çok güç ister.
 
 Ön-tescilin üç tahmininden birincisinin **başlığı** gerçekleşti: *"eksen yöne özgüyse üç kontrol de 25 puanın belirgin altında kalır."* Ama aynı tahminin iki nicel alt maddesi tutmadı, ve ikisi de aynı sebepten — **kontrollerin işareti beklenmedik çıktı**:
 
@@ -395,7 +407,26 @@ Blogun önceki taslağında yer alan metodolojik not bölümü kurumsal yayın k
 
 **B kriterinin tabanı "promptsuz varsayılan" değil.** Sweep'in her üretimi bir rol sistem promptu taşıyor (eksende Assistant ucuna en yakın 50 rol). Bu yüzden 0.0 gücündeki taban zaten %45.6 Assistant-dışı. Kriter, "varsayılan asistandan role" geçişi değil, **"rol promptlu ama steering'siz"den "rol promptlu ve uzağa steering'li"ye** artışı ölçer. Ön-tescil bunu böyle sabitledi ve değiştirilmedi, ama sayı bu bağlamda okunmalı.
 
-**Persona hakemi yalnızca `hakem-llm`.** Aşama 0.5'in kapısı rol ifadesi rubriği için koşuldu; **7 kategorili persona rubriği için ayrı bir insan doğrulaması yok.** `weird_role` ile `nonsensical` arasındaki sınır bu çalışmada belirleyici (artışın %80'i weird_role'den geliyor) ve o sınırı tek bir hakem çiziyor. Kategori dağılımı bu yüzden ham sayılarıyla raporlandı — okuyucu sınırın nereye çekildiğini kendi değerlendirebilsin.
+**Persona hakemi: insan doğrulaması yok, üç model hakemi arasındaki uyum ölçüldü.** Aşama 0.5'in kapısı rol ifadesi rubriği için koşuldu; **7 kategorili persona rubriği için ayrı bir insan doğrulaması yok.** `weird_role` sınırı bu çalışmada belirleyici: L14'te en uç güçte (−0.6) yanıtların %80.8'i `weird_role` olarak etiketlendi ve Assistant-dışı artışın tamamı bu kategoriden geldi (`weird_role` +76.0 puan, net artış +48.4 puan; `human_role` ve `nonhuman_role` aynı aralıkta azaldı). Kategori dağılımı bu yüzden ham sayılarıyla raporlandı; okuyucu sınırın nereye çekildiğini kendi değerlendirebilsin.
+
+Persona etiketlerinin tamamını (eksen ve kontrol sweep'leri) hakem-1 (kodda `hakem-llm`) üretti. Bu varsayımı sınamak için iki bağımsız hakem (hakem-2, hakem-3), hakem-1'in etiketlerini görmeden ve aynı rubrikle (`persona_judge._RUBRIC`), eksen sweep'inin 14 hücresinin her birinden 15 öğe olmak üzere 210 yanıtlık tabakalı bir örneklemi yeniden etiketledi (`results/models/qwen3-1.7b/steering/judge_agreement_persona.json`):
+
+| kategori | hakem-1 | hakem-2 | hakem-3 |
+|---|---:|---:|---:|
+| `assistant` | 109 | 108 | 103 |
+| `human_role` | 23 | 24 | 23 |
+| `nonhuman_role` | 18 | 13 | 24 |
+| `weird_role` | 50 | 45 | 19 |
+| `ambiguous` | 1 | 5 | 10 |
+| `other` | 0 | 0 | 23 |
+| `nonsensical` | 9 | 15 | 8 |
+| Assistant-dışı | 91 | 82 | 66 |
+
+- **Uyum.** Kriterin kullandığı ikili ayrımda (Assistant-dışı mı, değil mi) üç hakemin Fleiss κ'sı 0.703; hakem çiftlerinde ham uyum 0.838-0.900, Cohen κ 0.648-0.794. Yedi kategorinin tamamında çift uyumu 0.705-0.819 (Cohen κ 0.578-0.726).
+- **Ayrışma `weird_role` sınırında ve iki hakem farklı yöne kaçıyor.** Hakem-1'in `weird_role` dediği 50 öğeden hakem-2 38'ini `weird_role`, 6'sını `nonsensical` saydı; hakem-3 ise 17'sini `weird_role`, 19'unu `other`, 12'sini `nonhuman_role` saydı. `other` diğer iki hakemin hiç kullanmadığı bir kategori ve Assistant-dışı sayılmıyor.
+- **Karar buna dayanıyor mu?** Her hakemin hakem-1'e göre kayma oranları (hakem-1'in Assistant-dışı dediklerinden dışarıda bıraktığı pay ve diğerlerinden Assistant-dışı saydığı pay) 250 yanıtlık tam hücrelere uygulandığında B kriteri artışı L14/L19'da hakem-1 ile 48.4/48.0, hakem-2 ile 38.0/37.7, hakem-3 ile 31.3/31.1, 2/3 çoğunlukla 43.3/43.0 puan. Karar üç hakemin her birinde ve çoğunlukta eşiğin üstünde kalıyor; ancak eşiğin üstündeki pay hakeme bağlı: hakem-1'de yaklaşık 23, en katı hakemde (hakem-3) yaklaşık 6 puan. Bu pay bir güven aralığı değildir.
+
+Sınırlar: bu, insan doğrulaması değil, üç dil modeli arasındaki uyumdur; n = 210 (hücre başına 15) hücre düzeyinde kesin değildir; kontrol yönü sweep'leri örnekleme dahil edilmedi, yani `rolespan`'daki %28.9 `nonsensical` dahil kontrol etiketleri yalnız hakem-1'e dayanır.
 
 **Bir katman çifti bir eğri değildir.** L14 ile L19 arasındaki ayrışma iki noktadan okunuyor. Tüm derinlik boyunca bir steering taraması mekanizmayı çok daha iyi belirlerdi (etki derinlikle mi azalıyor, yoksa L19'a özgü bir şey mi?), ama her katman 1750 üretim daha demek — ~45 dakika GPU başına.
 
@@ -407,9 +438,9 @@ Blogun önceki taslağında yer alan metodolojik not bölümü kurumsal yayın k
 
 ## 9. Altyapı
 
-- **83 commit**, ~7.300 satır kod (`src/aax/` + `scripts/`)
-- **593 test**, 9'u GPU işaretli (varsayılan koşuda 584 geçer); tamamı ağdan ve modelden yapısal olarak izole
-- Testlerin dağılımı en riskli modüllerde yoğun: `generate_role_data` 77, `gateway` 57, `label_and_train_probe` 53, `judge_gate` 45, `evaluate_steering` 38, `steering_sweep` 35, `extract_axis` 32, `axis` 31, `susceptibility` 21, `steering` 15
+- **108 commit** ve ~8.300 satır kod (`src/aax/` + `scripts/`), 4 Eylül 2026'daki son commit itibarıyla
+- **673 test**, 9'u GPU işaretli (varsayılan koşuda 664 test toplanır ve geçer); tamamı ağdan ve modelden yapısal olarak izole
+- Testlerin dağılımı en riskli modüllerde yoğun: `generate_role_data` 77, `gateway` 57, `label_and_train_probe` 53, `steering_sweep` 48, `evaluate_steering` 47, `judge_gate` 45, `evaluate_controls` 34, `extract_axis` 32, `axis` 31, `susceptibility` 21, `steering` 18
 
 **Modül sınırları.** `axis.py` saf numpy — model, GPU, ağ bilmez. Bu sayede içine bilinen bir yön ekilmiş sentetik veriyle PCA'nın o yönü geri bulduğu, gerçek veriye dokunmadan doğrulanabiliyor. `gateway.py` dışarı giden tek HTTP noktası. `activations.py`'nin hook'u HF'in kendi `output_hidden_states` çıktısıyla `atol=1e-3`'te eşleştiği doğrulandı.
 
@@ -443,11 +474,12 @@ docs/superpowers/plans/2026-08-04-plan1-gateway-and-role-data.md         Plan 1
 docs/superpowers/plans/2026-08-06-plan2-axis-extraction.md               Plan 2
 docs/superpowers/plans/2026-08-10-plan3-steering.md                      Plan 3 (Aşama 4)
 results/scale_hypothesis_preregistration.json                            ön-tescil (sonuç görülmeden)
-results/steering_preregistration.json                                    B kriteri ön-tescili (koddan ve ölçümden önce)
+results/steering_preregistration.json                                    B kriteri ön-tescili (koddan sonra, ölçümden önce)
 results/scale_comparison.json                                            ölçek karşılaştırması
 results/pilot/baseline_distance.json                                     rollerin varsayılana uzaklığı
 results/models/<slug>/axis/criterion_a.json                              A kriteri kararı
 results/models/<slug>/axis/layer_sweep.json                              katman taraması
+results/models/<slug>/axis/range_position.json                           makalenin aralık ölçüsüyle varsayılanın konumu (her katman)
 results/models/<slug>/axis/assistant_axis.npy                            eksen (her katman)
 results/models/<slug>/axis/role_vectors.npy                              rol vektörleri
 results/models/<slug>/steering/criterion_b.json                          B kriteri kararı (katman başına)
@@ -455,9 +487,10 @@ results/models/<slug>/steering/rate_by_strength.json                     doz-yan
 results/control_preregistration.json                                     kontrol ön-tescili (koddan ve ölçümden önce)
 results/models/<slug>/steering/criterion_c.json                          C kriteri kararı (üç kontrol yönü)
 results/models/<slug>/steering/rate_by_strength_<yön>.json                kontrol doz-yanıt eğrileri
+results/models/qwen3-1.7b/steering/judge_agreement_persona.json          persona hakemi için üç hakemli uyum
 ```
 
-`data/` commit edilmez (16k rollout metni + 5.3 GB aktivasyon), `results/` edilir.
+`data/` commit edilmez (iki modelin 16.000'er rollout metni, steering üretimleri ve 5.5 GB aktivasyon), `results/` edilir.
 
 ---
 
@@ -475,5 +508,5 @@ Aşama 4 ve kontrol deneyi bitti. Çalışmanın en savunmasız yeri — "etki e
 
 **Kapatılmamış boşluklar:**
 - Probe'un otomatik geri çekilmesi uygulanmadı; `06` operatöre seçenekleri yazıp duruyor. İki koşuda da elle `--role-level-fallback` seçildi.
-- Persona rubriği için hakem kapısı yok (§8).
+- Persona rubriği için insan doğrulamalı bir hakem kapısı yok; yalnız üç model hakemi arasındaki uyum ölçüldü (§8).
 - `09`, hiçbir grup tamamlanmadan düştüğünde de "ilerleme kalıcı olarak yazıldı" diyor; yazacak bir şey olmadığında bunu söylememeli.

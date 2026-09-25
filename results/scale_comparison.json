@@ -43,11 +43,11 @@
     }
   },
   "bulgu": {
-    "eksen_her_iki_olcekte_de_var": "|cos(PC1, kontrast)| her katmanda 0.82-0.96. Eksen — Assistant benzeri rolleri teatral rollerden ayiran yon — iki olcekte de guclu ve derinlikten bagimsiz mevcut.",
+    "eksen_her_iki_olcekte_de_var": "|cos(PC1, kontrast)| her katmanda 0.79-0.96 (en dusuk 0.795, 0.6B L2; iki modelin cos_araligi birlikte). Eksen — Assistant benzeri rolleri teatral rollerden ayiran yon — iki olcekte de guclu ve derinlikten bagimsiz mevcut.",
     "olcege_bagli_olan_sey": "Varsayilan Assistant in O EKSEN UZERINDEKI UC NOKTALIGI.",
-    "qwen3_0_6b": "Persentil her derinlikte 0.35-0.49 arasinda DUZ. Derinlikle artmiyor. Hicbir katmanda uc desile ulasmiyor. Varsayilan, persona uzayinin ORTASINDA.",
-    "qwen3_1_7b": "Persentil derinlikle tekduze artiyor (0.72 -> 0.84 @L14 -> 0.98 @L24), L19 da (goreli 0.679) uc desile giriyor.",
-    "makale_27_70B": "Orta katmanda zaten uc noktada (makale oradan olcuyor ve calisiyor).",
+    "qwen3_0_6b": "Persentil her derinlikte 0.35-0.49 arasinda DUZ. Derinlikle artmiyor. Hicbir katmanda uc desile ulasmiyor. Varsayilan, rol siralamasinin ORTASINDA.",
+    "qwen3_1_7b": "Persentil derinlikle genel olarak artiyor (0.72 -> 0.84 @L14 -> 0.98 @L24; tekduze degil, L17, L21, L25 te kucuk geri donusler ve L27 de 0.87), L19 da (goreli 0.679) uc desile giriyor.",
+    "makale_27_70B": "Makalenin aralik olcusuyle (arXiv:2601.10387v1 §2.3.1) orta katmanda uca yakin: herhangi bir uca en kucuk uzaklik 0.03, model ayrimi verilmeden. Uc desil bu replikasyonun on kayitli sira olcusu; makale desil bildirmiyor. Ayni aralik olcusu bu replikasyonda: 1.7B L14 0.051, L20-L27 <= 0.027; 0.6B L14 0.130 (range_position.json).",
     "uc_noktali_olcek_hikayesi": "0.6B: hic uc degil -> 1.7B: gec katmanlarda uc -> 27B+: orta katmanda uc."
   },
   "on_tescile_gore": {

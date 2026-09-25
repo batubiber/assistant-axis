@@ -3,9 +3,9 @@
   "tarih": "2026-09-04",
   "esik_puan": 25,
   "hakemler": {
-    "hakem1": "hakem-1 (calismanin tum etiketlerini ureten hakem, temperature=0)",
+    "hakem1": "hakem-1 (calismanin tum etiketlerini ureten hakem)",
     "hakem2": "hakem-2 (kor, dort ayri dilim)",
-    "hakem3": "hakem-3 (kor; etiketleri belirlenimci degil)"
+    "hakem3": "hakem-3 (kor)"
   },
   "korluk": "hakem-1 etiketleri etiketleyicilerin calisma dizininden fiziksel olarak cikarildi. Ucu de ayni rubrigi (persona_judge._RUBRIC) gordu.",
   "ornek": {
@@ -122,7 +122,7 @@
   "sinirlar": [
     "Insan dogrulamasi DEGIL; uc dil modeli arasindaki uyum.",
     "n=210, hucre basina 15 — hucre duzeyinde kesin degil.",
-    "hakem3 belirlenimci degil; tekrar kosumda birkac etiket oynayabilir.",
+    "Hakemlerin tekrar kosumdaki etiket kararliligi bu ornekte olculmedi.",
     "Kontrol yonu sweep'leri bu ornekleme dahil edilmedi."
   ]
 }
