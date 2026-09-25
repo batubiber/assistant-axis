@@ -17,7 +17,7 @@ Dayanıklılık (2026-08-10 düzeltmesi; bkz.
 `.superpowers/sdd/p3-task-5-supplement.md`, madde E1): `classify_personas`
 uzunluk uyuşmazlığında `JudgeParseError` fırlatır — bu KASITLI ve doğru,
 modülün işi kurtarma değil. Kurtarma bu script'in işi. `06_label_and_train_
-probe.py`'nin ("Etiketleme geçişi DAYANIKLIDIR" paragrafı, commit 44dd90e)
+probe.py`'nin ("Etiketleme geçişi DAYANIKLIDIR" paragrafı, commit 25ea779)
 AYNI deseni burada da uygulanıyor:
 
   - `data/models/<slug>/steering_labels.json` her hakem BATCH'inden sonra

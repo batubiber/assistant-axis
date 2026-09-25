@@ -61,13 +61,15 @@ Uç desil koşulu makalenin değil, bu replikasyonun kendi sıra temelli ölçü
 
 İkinci deney — ölçek karşılaştırması — de **sonuç görülmeden** tescillendi (`results/scale_hypothesis_preregistration.json`).
 
-**B kriteri** (Aşama 4) ölçümden önce tescillendi (`results/steering_preregistration.json`, commit `caf2800`). Sıra git geçmişinden denetlenebilir: ön-tescil, B kriterini hesaplayan kod (`718fa2e`) ve sweep script'i (`d074cf6`) commit'lendikten sonra, ölçümden (`ae2cbda`) önce commit'lendi. Kriterin 25 puanlık eşiği ise tasarım belgesinde (Bölüm 7) koddan önce sabitlenmişti:
+**B kriteri** (Aşama 4) ölçümden önce tescillendi (`results/steering_preregistration.json`, commit `85c1840`). Ön-tescildeki kriter metni:
 
-> En negatif güçteki Assistant-dışı persona oranı, steering'siz (0.0) orandan en az **25 puan** yüksek olmalı. Assistant-dışı = `human_role + nonhuman_role + weird_role`. Katman başına ayrı değerlendirilir.
+> En negatif güçteki Assistant-dışı persona oranı, steering'siz (0.0) orandan en az **25 puan** yüksek olmalı. Assistant-dışı = `human_role + nonhuman_role + weird_role`.
+
+Kriter iki katmanda (L14 ve L19) ayrı ayrı değerlendirilir. Sıra git geçmişinden denetlenebilir: ön-tescil, B kriterini hesaplayan kod (`5a39869`) ve sweep script'i (`1281870`) commit'lendikten sonra, ölçümden (`03eeac7`) önce commit'lendi. Kriterin 25 puanlık eşiği ise tasarım belgesinde (Bölüm 7) koddan önce sabitlenmişti.
 
 Üç sonuç için üç ayrı tahmin yazıldı: eksen nedenselse ikisi de geçer *ve L19'daki etki daha büyük olur*; etki derinliğe bağlıysa L19 geçer L14 düşer; eksen nedensel değilse ikisi de düşer.
 
-Ön-tescil bir kez **düzeltildi** (`10702fd`), yine ölçümden önce: ilk hâlinde duman koşusundan aktarılan "−0.6'da yanıtlar yinelemeye düşüyor" gözlemi vardı ve bu **yanlıştı**. 105 yanıtın tamamı ölçüldüğünde hiçbir güçte çözülme bulunmadı. Yanlış satırlar silinmedi, üzerine `DUZELTME` alanı eklendi — kayıt ancak böyle dürüst kalır. Eşik, taban ve iki katmanlı kurulum değiştirilmedi.
+Ön-tescil bir kez **düzeltildi** (`9be5c1f`), yine ölçümden önce: ilk hâlinde duman koşusundan aktarılan "−0.6'da yanıtlar yinelemeye düşüyor" gözlemi vardı ve bu **yanlıştı**. 105 yanıtın tamamı ölçüldüğünde hiçbir güçte çözülme bulunmadı. Yanlış satırlar silinmedi, üzerine `DUZELTME` alanı eklendi — kayıt ancak böyle dürüst kalır. Eşik, taban ve iki katmanlı kurulum değiştirilmedi.
 
 ---
 

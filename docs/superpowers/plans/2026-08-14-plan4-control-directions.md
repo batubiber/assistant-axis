@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Ön-tescil: `results/control_preregistration.json` (commit `4d69a57`, ölçümden önce). Eşik, katman, güçler, roller ve üç yönün tanımı **oradan** gelir ve değiştirilmez.
+- Ön-tescil: `results/control_preregistration.json` (commit `411203c`, ölçümden önce). Eşik, katman, güçler, roller ve üç yönün tanımı **oradan** gelir ve değiştirilmez.
 - Hedef model `Qwen/Qwen3-1.7B`, L14, güçler `(-0.6, -0.4, -0.2)`. 0.0 tabanı Aşama 4'ten yeniden kullanılır.
 - Her kontrol yönü **birim norma** normalize edilir ve L14'ün kendi ortalama residual normuyla ölçeklenir — eksenle birebir aynı büyüklük.
 - Yönler **tohumlu ve tekrarlanabilir**; üretilen vektörün sha256'sı meta artefaktına yazılır.
@@ -255,7 +255,7 @@ AAX_TARGET_MODEL="Qwen/Qwen3-1.7B" uv run python scripts/10_evaluate_controls.py
 
 ## Plan 4 Tamamlanma Kriterleri
 
-- [ ] `results/control_preregistration.json` ölçümden önce commit'lendi ✅ (`4d69a57`)
+- [ ] `results/control_preregistration.json` ölçümden önce commit'lendi ✅ (`411203c`)
 - [ ] Mevcut 584 test bozulmadan geçiyor
 - [ ] Varsayılan (`axis`) koşunun artefakt adları ve davranışı değişmedi
 - [ ] `criterion_c.json` üç yön için de karar içeriyor

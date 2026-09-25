@@ -2237,9 +2237,9 @@ Dayanıklılık düzeltmesi (Fix Round 1; bkz.
 GÖZETİMSİZ koşturuyor — 3500 üretimlik bir sweep'in 3400'ünde bir CUDA OOM
 ya da geçici cihaz hatası (ikisi de `RuntimeError` alt sınıfı), düzeltme
 öncesi hiçbir artefakt yazmadan `main()`'den dışarı çıkıyordu. Bu, tam
-olarak `06_label_and_train_probe.py`'de commit 44dd90e ile çözülen sınıfın
+olarak `06_label_and_train_probe.py`'de commit 25ea779 ile çözülen sınıfın
 aynısı (bkz. o dosyanın "Etiketleme geçişi DAYANIKLIDIR" paragrafı) ama bu
-script bu dersi plan metninden (3ddb783) SONRA öğrendiği için ilk sürüme
+script bu dersi plan metninden (eef52ba) SONRA öğrendiği için ilk sürüme
 yansımamıştı. Artık:
 
   - üretim döngüsü her `PROGRESS_PERIOD` (100) üretimde bir `records`'ı
@@ -2255,7 +2255,7 @@ yansımamıştı. Artık:
     kill/OOM-kill/disk dolması sırasında geçerli bir `.jsonl`'in yanına
     budanmış bir meta bırakabiliyordu;
   - `select_assistant_end_roles` ve `planned_generation_count`'un attığı
-    `ValueError`'lar (taban commit cec3483, plan metninden SONRA eklendi)
+    `ValueError`'lar (taban commit 9143d29, plan metninden SONRA eklendi)
     artık sarmalı — sarmasız hâlleri traceback + çıkış kodu 1 veriyordu,
     oysa bu projede 1 "kriter değerlendirildi ve düştü" demek, bir kullanım
     hatası (ör. `--n-roles` mevcut rol sayısından büyük) değil;
@@ -2491,7 +2491,7 @@ def _run(argv: list[str] | None = None) -> int:
     #
     # `select_assistant_end_roles` (`src/aax/susceptibility.py`) `n < 1`,
     # `n > len(names)` ve isim/vektör uzunluk uyuşmazlığında Türkçe
-    # `ValueError` atıyor (taban commit cec3483). Sarmasız bırakılırsa bu
+    # `ValueError` atıyor (taban commit 9143d29). Sarmasız bırakılırsa bu
     # traceback + çıkış kodu 1 verir — bu projede 1 "kriter değerlendirildi
     # ve düştü" demek, `--n-roles`'a mevcut rol sayısından büyük bir değer
     # verilmesi gibi bir kullanım hatası değil.
@@ -2702,7 +2702,7 @@ def main(argv: list[str] | None = None) -> int:
     Python traceback basıp çıkış kodu 1 ile döner — ve bu projede 1 "kriter
     değerlendirildi ve düştü" demek (bkz. modül docstring'i, Fix Round 2 /
     M1). Bir I/O hatasının böyle yorumlanması kabul edilemez: aynı sınıftan
-    bir hata `06_label_and_train_probe.py`'de commit 44dd90e ile ve
+    bir hata `06_label_and_train_probe.py`'de commit 25ea779 ile ve
     `07_extract_axis.py:609-637`'de zaten düzeltilmişti; bu script aynı
     dersi bu turda alıyor ve AYNI deseni uyguluyor.
 
@@ -3979,7 +3979,7 @@ Dayanıklılık (2026-08-10 düzeltmesi; bkz.
 `.superpowers/sdd/p3-task-5-supplement.md`, madde E1): `classify_personas`
 uzunluk uyuşmazlığında `JudgeParseError` fırlatır — bu KASITLI ve doğru,
 modülün işi kurtarma değil. Kurtarma bu script'in işi. `06_label_and_train_
-probe.py`'nin ("Etiketleme geçişi DAYANIKLIDIR" paragrafı, commit 44dd90e)
+probe.py`'nin ("Etiketleme geçişi DAYANIKLIDIR" paragrafı, commit 25ea779)
 AYNI deseni burada da uygulanıyor:
 
   - `data/models/<slug>/steering_labels.json` her hakem BATCH'inden sonra
